@@ -1,0 +1,8 @@
+# macOS: the fuser crate (pulled in by acyclic-fs-mount) resolves libfuse via
+# pkg-config; the fs repo ships a FUSE-T compatibility .pc for it.
+[env]
+PKG_CONFIG_PATH = { value = "../fs/scripts/pkgconfig/fuse-t", relative = true }
+
+# FUSE-T installs libfuse-t.dylib under /usr/local/lib and links via @rpath.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]
