@@ -1,0 +1,18 @@
+[package]
+name = "acyclic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Agent-native state engine: checkpoints, rewind, and blast-radius diff for coding-agent sessions"
+
+[dependencies]
+acyclic-engine = { path = "../acyclic-engine" }
+acyclic-proto = { path = "../acyclic-proto" }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"

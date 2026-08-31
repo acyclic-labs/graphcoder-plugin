@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FUSE_T_VERSION: 1.2.7
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: graphcoder-plugin
+
+      # The engine is a path dependency on the sibling fs repo; the checkout
+      # layout is a build input. FS_CHECKOUT_TOKEN must grant read access to
+      # acyclic-labs/fs.
+      - name: Checkout fs (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: acyclic-labs/fs
+          path: fs
+          token: ${{ secrets.FS_CHECKOUT_TOKEN }}
+
+      - name: Install FUSE-T (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 \
+            "https://github.com/macos-fuse-t/fuse-t/releases/download/${FUSE_T_VERSION}/fuse-t-macos-installer-${FUSE_T_VERSION}.pkg" \
+            --output /tmp/fuse-t.pkg
+          sudo installer -pkg /tmp/fuse-t.pkg -target /
+          test -d /usr/local/include/fuse3
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            graphcoder-plugin/target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('graphcoder-plugin/Cargo.lock') }}
+
+      - name: Unit and integration tests
+        working-directory: graphcoder-plugin
+        run: cargo test --workspace
+
+      - name: Release build (acceptance + latency gate run against it)
+        working-directory: graphcoder-plugin
+        run: cargo build --release
+
+      - name: Acceptance suite
+        working-directory: graphcoder-plugin
+        env:
+          ACYCLIC_BIN: ${{ github.workspace }}/graphcoder-plugin/target/release/acyclic
+          ACYCLIC_QUAL: ${{ github.workspace }}/graphcoder-plugin/target/release/acyclic-qual
+          # Smaller corpus keeps CI wall-clock sane; the budget is unchanged.
+          ACYCLIC_LAT_FILES: "5000"
+          ACYCLIC_LAT_MB: "64"
+          ACYCLIC_SOAK_ROUNDS: "30"
+        run: bash tests/acceptance/run-all.sh
