@@ -27,6 +27,15 @@ pub struct CheckpointRow {
     pub error: Option<String>,
 }
 
+impl CheckpointRow {
+    /// Whether this row's generation is a state a rewind may restore.
+    /// `failed` rows carry the generation from BEFORE the failed capture —
+    /// restoring one would claim a state the row does not represent.
+    pub fn is_restorable(&self) -> bool {
+        self.kind != CheckpointKind::Failed
+    }
+}
+
 /// Why a checkpoint exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointKind {
@@ -193,8 +202,8 @@ impl Index {
                 params![id],
                 row_to_checkpoint,
             )
-            .optional()?
-            .transpose()
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Most recent checkpoint a user would rewind to: real snapshots only,
@@ -209,8 +218,8 @@ impl Index {
                 [],
                 row_to_checkpoint,
             )
-            .optional()?
-            .transpose()
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Most recent checkpoint of any non-failed kind.
@@ -224,8 +233,8 @@ impl Index {
                 [],
                 row_to_checkpoint,
             )
-            .optional()?
-            .transpose()
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Newest-first listing, optionally scoped to one session.
@@ -240,7 +249,7 @@ impl Index {
         let rows = statement.query_map(params![session_id, limit], row_to_checkpoint)?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(row??);
+            result.push(row?);
         }
         Ok(result)
     }
@@ -256,8 +265,8 @@ impl Index {
                 params![session_id],
                 row_to_checkpoint,
             )
-            .optional()?
-            .transpose()
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn session_started(&mut self, session_id: &str, host: &str) -> Result<()> {
@@ -277,29 +286,33 @@ impl Index {
     }
 }
 
-type SqlRow<'a, 'b> = &'a rusqlite::Row<'b>;
-
-fn row_to_checkpoint(row: SqlRow) -> rusqlite::Result<Result<CheckpointRow>> {
+fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
+    let corrupt = |message: &str| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            message.to_string().into(),
+        )
+    };
     let generation_bytes: Vec<u8> = row.get(1)?;
+    let bytes: [u8; 32] = generation_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| corrupt("generation digest is not 32 bytes"))?;
     let kind_text: String = row.get(3)?;
-    Ok((|| {
-        let bytes: [u8; 32] = generation_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| EngineError::Store("generation digest is not 32 bytes".into()))?;
-        Ok(CheckpointRow {
-            id: row.get(0)?,
-            generation: GenerationId::new(Digest::from_bytes(bytes)),
-            created_at: row.get(2)?,
-            kind: CheckpointKind::parse(&kind_text)?,
-            published: row.get::<_, i64>(4)? != 0,
-            session_id: row.get(5)?,
-            tool_call_id: row.get(6)?,
-            tool_name: row.get(7)?,
-            label: row.get(8)?,
-            error: row.get(9)?,
-        })
-    })())
+    Ok(CheckpointRow {
+        id: row.get(0)?,
+        generation: GenerationId::new(Digest::from_bytes(bytes)),
+        created_at: row.get(2)?,
+        kind: CheckpointKind::parse(&kind_text)
+            .map_err(|error| corrupt(&error.to_string()))?,
+        published: row.get::<_, i64>(4)? != 0,
+        session_id: row.get(5)?,
+        tool_call_id: row.get(6)?,
+        tool_name: row.get(7)?,
+        label: row.get(8)?,
+        error: row.get(9)?,
+    })
 }
 
 fn now() -> i64 {
@@ -355,5 +368,33 @@ mod tests {
             .expect("session start")
             .expect("some");
         assert_eq!(start.id, post_id);
+    }
+
+    #[test]
+    fn latest_target_skips_bookkeeping_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut index = Index::open(&dir.path().join("index.db")).expect("open");
+        let a = Attribution::default();
+        index.record(generation(1), CheckpointKind::Baseline, &a).expect("row");
+        let post = index.record(generation(2), CheckpointKind::Post, &a).expect("row");
+        index.record(generation(2), CheckpointKind::Noop, &a).expect("row");
+        index.record(generation(2), CheckpointKind::PreRewind, &a).expect("row");
+        index.record(generation(3), CheckpointKind::Recovered, &a).expect("row");
+        index.record_failure(generation(3), "boom", &a).expect("row");
+
+        let target = index.latest_target().expect("query").expect("some");
+        assert_eq!(target.id, post);
+        assert_eq!(target.kind, CheckpointKind::Post);
+    }
+
+    #[test]
+    fn failed_rows_are_not_restorable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut index = Index::open(&dir.path().join("index.db")).expect("open");
+        let a = Attribution::default();
+        let ok = index.record(generation(1), CheckpointKind::Post, &a).expect("row");
+        let bad = index.record_failure(generation(1), "boom", &a).expect("row");
+        assert!(index.by_id(ok).expect("q").expect("s").is_restorable());
+        assert!(!index.by_id(bad).expect("q").expect("s").is_restorable());
     }
 }

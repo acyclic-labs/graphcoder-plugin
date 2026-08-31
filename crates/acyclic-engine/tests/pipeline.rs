@@ -123,3 +123,47 @@ fn checkpoint_rewind_journey() {
     assert!(by_name.contains(&("generated.bin".into(), ChangeKind::Added)));
     assert!(by_name.contains(&(".env".into(), ChangeKind::Removed)));
 }
+
+/// The hook contract: an acknowledged enqueue is admitted to the FIFO before
+/// the ack, so a shutdown issued immediately after still processes it.
+#[test]
+fn enqueued_checkpoint_survives_immediate_shutdown() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("file.txt"), b"before\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let (handle, thread) = pipeline::spawn(store, index, fast_config());
+
+    runtime.block_on(async {
+        // Sync on Ready first: a write issued during the startup baseline is
+        // captured by it, and the enqueued checkpoint would be a noop.
+        let status = handle.status().await.expect("status");
+        assert_eq!(status.state, pipeline::State::Ready);
+        std::fs::write(repo.path().join("file.txt"), b"after\n").expect("edit");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle
+            .checkpoint_enqueued(
+                CheckpointKind::Post,
+                Attribution {
+                    tool_name: Some("Edit".into()),
+                    ..Attribution::default()
+                },
+            )
+            .await
+            .expect("enqueue");
+        // No settling sleep: shutdown races the capture on purpose.
+        handle.shutdown().await.expect("shutdown");
+    });
+    thread.join().expect("pipeline thread");
+
+    let index = Index::open(&paths.index_db()).expect("reopen index");
+    let latest = index.latest().expect("query").expect("row");
+    assert_eq!(latest.kind, CheckpointKind::Post);
+    assert!(latest.published, "shutdown commit must cover the enqueued row");
+}

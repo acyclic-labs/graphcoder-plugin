@@ -159,15 +159,20 @@ impl Server {
                         kind: outcome.kind.as_str().to_string(),
                     }))
                 } else {
-                    // Enqueue-ack: the hook path. The capture runs behind us
-                    // in FIFO order; failures land in the index as `failed`.
-                    let handle = self.handle.clone();
-                    tokio::spawn(async move {
-                        let _ = handle.checkpoint(kind, attribution).await;
-                        if durable {
+                    // Enqueue-ack: the hook path. Admission into the FIFO
+                    // happens BEFORE the ack, so a stop arriving after the
+                    // ack queues behind the capture instead of dropping it.
+                    // Failures land in the index as `failed`.
+                    self.handle
+                        .checkpoint_enqueued(kind, attribution)
+                        .await
+                        .map_err(stringify)?;
+                    if durable {
+                        let handle = self.handle.clone();
+                        tokio::spawn(async move {
                             let _ = handle.commit().await;
-                        }
-                    });
+                        });
+                    }
                     Ok(proto::Reply::Enqueued)
                 }
             }
@@ -272,7 +277,14 @@ impl Server {
                 index.session_start(&session).map_err(stringify)?
             }
         };
-        row.ok_or_else(|| "no matching checkpoint".to_string())
+        let row = row.ok_or_else(|| "no matching checkpoint".to_string())?;
+        if !row.is_restorable() {
+            return Err(format!(
+                "checkpoint #{} records a failed capture, not a tree state; pick another from `acyclic timeline`",
+                row.id
+            ));
+        }
+        Ok(row)
     }
 
     /// Default diff base: the most recent session's first checkpoint, falling

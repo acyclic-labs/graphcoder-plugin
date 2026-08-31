@@ -191,7 +191,7 @@ fn restore_gen(args: &[String]) -> Result<(), Failure> {
 }
 
 fn hex_decode(text: &str) -> Result<Vec<u8>, Failure> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
     (0..text.len())

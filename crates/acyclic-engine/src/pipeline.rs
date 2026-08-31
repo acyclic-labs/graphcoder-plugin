@@ -117,6 +117,27 @@ impl PipelineHandle {
         request!(self, Checkpoint { kind: kind, attribution: attribution })?
     }
 
+    /// Enqueues a checkpoint and returns as soon as the pipeline has
+    /// admitted it (FIFO), without waiting for the capture. Admission before
+    /// acknowledgement is the guarantee the hook path relies on: a stop that
+    /// arrives after the ack is queued behind the capture, never before it.
+    pub async fn checkpoint_enqueued(
+        &self,
+        kind: CheckpointKind,
+        attribution: Attribution,
+    ) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        drop(receiver); // outcome is recorded in the index, not awaited
+        self.sender
+            .send(Request::Checkpoint {
+                kind,
+                attribution,
+                reply,
+            })
+            .await
+            .map_err(|_| EngineError::Store("pipeline is gone".into()))
+    }
+
     pub async fn commit(&self) -> Result<()> {
         request!(self, Commit {})?
     }
@@ -279,6 +300,10 @@ impl Pipeline {
     /// rescan, publish. Used at startup and after RescanRequired/rewind.
     async fn baseline(&mut self, kind: CheckpointKind) -> Result<()> {
         self.state = State::Baselining;
+        // A baseline requires a clean checkout. Mid-session (watcher
+        // invalidation, rewind) the overlay holds uncommitted captures:
+        // publish them first. At startup this is a no-op.
+        self.commit_engine().await?;
         capture_baseline(
             &mut self.store.checkout,
             &self.options,
@@ -400,10 +425,10 @@ impl Pipeline {
         attribution: &Attribution,
     ) -> Result<CheckpointOutcome> {
         if self.state != State::Ready {
-            return Err(EngineError::Capture(format!(
-                "pipeline not ready ({:?})",
-                self.state
-            )));
+            // A failed recovery leaves state at Baselining; a request is the
+            // natural moment to retry rather than staying down forever.
+            self.reset_watch().await?;
+            self.baseline(CheckpointKind::Recovered).await?;
         }
         let changed = self.drain_watcher().await?;
         let (generation, kind) = if changed {
@@ -461,10 +486,11 @@ impl Pipeline {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
                 WatchBatch::RescanRequired { .. } => {
-                    // Watcher overflow or invalidation: rebuild from scratch.
-                    self.watch
-                        .begin_rescan()
-                        .map_err(EngineError::fs("begin rescan"))?;
+                    // Watcher overflow or invalidation: rebuild from scratch
+                    // with a FRESH watcher. Reusing the invalidated one is a
+                    // trap — if the baseline fails after begin_rescan, the
+                    // old watcher stays wedged in RescanInProgress forever.
+                    self.reset_watch().await?;
                     self.baseline(CheckpointKind::Recovered).await?;
                     return Ok(true);
                 }
@@ -505,20 +531,17 @@ impl Pipeline {
                     "unexpected commit outcome (single-writer invariant broken): {other:?}"
                 ))),
             },
-            Err(failure) => {
-                let text = format!("{failure:?}");
-                if text.contains("NoPendingMutations") {
-                    // Nothing new to publish means every recorded row's
-                    // generation is already covered by the last publish —
-                    // noop and quiet pre_rewind rows included.
-                    if let Some(row) = self.last_checkpoint_row {
-                        self.index.mark_published(row)?;
-                    }
-                    self.checkpoints_since_commit = 0;
-                    return Ok(());
+            Err(failure) if matches!(failure.error, acyclic_fs::FsError::NoPendingMutations) => {
+                // Nothing new to publish means every recorded row's
+                // generation is already covered by the last publish — noop
+                // and quiet pre_rewind rows included.
+                if let Some(row) = self.last_checkpoint_row {
+                    self.index.mark_published(row)?;
                 }
-                Err(EngineError::Fs(format!("commit: {text}")))
+                self.checkpoints_since_commit = 0;
+                Ok(())
             }
+            Err(failure) => Err(EngineError::Fs(format!("commit: {failure:?}"))),
         }
     }
 

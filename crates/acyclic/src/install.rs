@@ -72,9 +72,7 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
         let entries = entries
             .as_array_mut()
             .ok_or_else(|| format!("hooks.{event} is not an array"))?;
-        entries.retain(|entry| {
-            !entry.to_string().contains("acyclic hook")
-        });
+        entries.retain(|entry| !is_ours(entry));
         let mut entry = json!({
             "hooks": [{ "type": "command", "command": command }]
         });
@@ -87,6 +85,20 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&settings).map_err(stringify)?;
     std::fs::write(settings_path, text + "\n").map_err(stringify)?;
     Ok(())
+}
+
+/// An entry is ours iff one of its commands invokes `acyclic hook`.
+/// Structural, not substring-over-JSON: a user hook that merely mentions
+/// the phrase in an argument is left alone.
+fn is_ours(entry: &Value) -> bool {
+    entry["hooks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .any(|command| {
+            command == "acyclic" || command.starts_with("acyclic hook")
+        })
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
@@ -175,3 +187,81 @@ included) is snapshotted by a local daemon. Useful commands:
 Before a risky change, checkpoint. After a failed attempt, rewind instead
 of hand-reverting. Before finishing, review `acyclic diff`.
 "#;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_preserves_user_settings_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{
+              "permissions": {"allow": ["Bash(ls:*)"]},
+              "hooks": {
+                "PreToolUse": [
+                  {"matcher": "Bash",
+                   "hooks": [{"type": "command", "command": "echo acyclic hook mention"}]}
+                ]
+              }
+            }"#,
+        )
+        .expect("seed");
+
+        merge_hooks(&settings).expect("first merge");
+        merge_hooks(&settings).expect("second merge");
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).expect("read"))
+                .expect("json");
+        // User content survives — including a hook that merely MENTIONS the
+        // phrase "acyclic hook" in an argument.
+        assert_eq!(value["permissions"]["allow"][0], "Bash(ls:*)");
+        let pre = value["hooks"]["PreToolUse"].as_array().expect("array");
+        assert!(pre.iter().any(|entry| {
+            entry["hooks"][0]["command"] == "echo acyclic hook mention"
+        }));
+        // Exactly one of ours per event, no duplicates after re-install.
+        let ours = |event: &str| {
+            value["hooks"][event]
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter(|entry| is_ours(entry))
+                .count()
+        };
+        for event in ["PreToolUse", "PostToolUse", "SessionStart", "SessionEnd"] {
+            assert_eq!(ours(event), 1, "{event}");
+        }
+    }
+
+    #[test]
+    fn merge_creates_settings_from_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        merge_hooks(&settings).expect("merge");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).expect("read"))
+                .expect("json");
+        assert_eq!(
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "acyclic hook post-tool"
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["matcher"],
+            "Edit|Write|MultiEdit|NotebookEdit|Bash"
+        );
+    }
+
+    #[test]
+    fn agents_md_appends_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("AGENTS.md"), "# Existing\n").expect("seed");
+        agents_md(dir.path()).expect("first");
+        agents_md(dir.path()).expect("second");
+        let text = std::fs::read_to_string(dir.path().join("AGENTS.md")).expect("read");
+        assert!(text.starts_with("# Existing\n"));
+        assert_eq!(text.matches("## Acyclic checkpoints").count(), 1);
+    }
+}

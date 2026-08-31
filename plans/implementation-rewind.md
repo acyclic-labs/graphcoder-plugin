@@ -105,7 +105,7 @@ Built as `acyclic hook <event>` + `acyclic install <host>` (the installer embeds
 - `acyclic install agents-md` appends the CLI cheatsheet block to `AGENTS.md` for any shell-capable agent.
 
 **Exit gate:** one live session reproducing the full journey — destructive migration, `/rewind` restores gitignored + generated files, agent self-rolls-back mid-task.
-**Status (2026-08-31):** hook flow verified against simulated Claude Code payloads end-to-end (session attribution in the timeline, pre waits, post enqueues, silent no-daemon path); install verified idempotent. The live-session gate remains — run a real Claude Code session in an initialized repo.
+**Status: GATE MET (2026-08-31).** `tests/acceptance/claude-e2e.sh` drives a real Claude Code session through the installed adapter (opt-in `ACYCLIC_E2E=1`; skips without the CLI): hooks fire with session + tool attribution, the agent's edit and Bash side effects are checkpointed, blast-radius diff names them, and `rewind --session-start` restores the pre-session tree exactly. The first live run also exposed and fixed a production wedge: watcher invalidation mid-session → recovery baseline hit `DirtyCheckout` (uncommitted overlay) → daemon stuck in `RescanInProgress` permanently. Fixes: publish before any re-baseline, recover with a fresh watcher (a wedged one can never persist), and retry recovery on the next request instead of staying down.
 
 ---
 

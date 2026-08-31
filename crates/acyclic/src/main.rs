@@ -240,7 +240,9 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 tool_call_id,
                 tool_name,
                 label: message,
-                wait,
+                // A durable checkpoint is a publish barrier: fire-and-forget
+                // would let a stop race the commit, so it always waits.
+                wait: wait || durable,
                 durable,
             })?;
             match reply {

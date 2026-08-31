@@ -40,7 +40,15 @@ acy rewind --last --yes >/dev/null || fail "rewind --last"
 
 # Publish everything; nothing left unpublished.
 acy commit >/dev/null || fail "commit"
-acy status | grep -q "unpublished:   0" || fail "unpublished after commit"
+STATUS="$(acy status)"
+if ! echo "$STATUS" | grep -q "unpublished:   0"; then
+  echo "--- status as seen by the check:" >&2
+  echo "$STATUS" >&2
+  echo "--- rows:" >&2
+  sqlite3 "$STORES"/*/index.db \
+    "SELECT id, kind, published FROM checkpoints ORDER BY id;" >&2 || true
+  fail "unpublished after commit"
+fi
 
 # Cross-session persistence: stop the daemon, autospawn a fresh one, and the
 # timeline (with session attribution) survives.

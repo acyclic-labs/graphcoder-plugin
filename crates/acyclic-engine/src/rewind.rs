@@ -192,6 +192,58 @@ fn prune_trash(trash_root: &Path, ttl_days: u32) {
     }
 }
 
+/// Atomically exchanges two directories on the same filesystem.
+#[cfg(target_os = "macos")]
+fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
+        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
+    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
+        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
+    // SAFETY: both are live NUL-terminated paths; RENAME_SWAP exchanges them
+    // atomically on APFS.
+    let result = unsafe {
+        libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP)
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(EngineError::Restore(format!(
+            "renamex_np: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+
+#[cfg(target_os = "linux")]
+fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
+        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
+    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
+        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
+    // SAFETY: both are live NUL-terminated paths; RENAME_EXCHANGE swaps them
+    // atomically on filesystems that support it.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a_c.as_ptr(),
+            libc::AT_FDCWD,
+            b_c.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(EngineError::Restore(format!(
+            "renameat2: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,57 +304,5 @@ mod tests {
         assert!(recover(&work.path().join("missing.json"))
             .expect("recover")
             .is_none());
-    }
-}
-
-/// Atomically exchanges two directories on the same filesystem.
-#[cfg(target_os = "macos")]
-fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    // SAFETY: both are live NUL-terminated paths; RENAME_SWAP exchanges them
-    // atomically on APFS.
-    let result = unsafe {
-        libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP)
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(EngineError::Restore(format!(
-            "renamex_np: {}",
-            std::io::Error::last_os_error()
-        )))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    // SAFETY: both are live NUL-terminated paths; RENAME_EXCHANGE swaps them
-    // atomically on filesystems that support it.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            a_c.as_ptr(),
-            libc::AT_FDCWD,
-            b_c.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(EngineError::Restore(format!(
-            "renameat2: {}",
-            std::io::Error::last_os_error()
-        )))
     }
 }

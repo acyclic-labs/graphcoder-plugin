@@ -51,7 +51,7 @@ impl StorePaths {
         let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
         let short = &digest.to_hex()[..16];
         Ok(Self {
-            root: base.join(short.to_string()),
+            root: base.join(short),
         })
     }
 
