@@ -55,6 +55,13 @@ impl Client {
         })
     }
 
+    /// Bounds how long a single call may wait for its reply. Used by the
+    /// pre-tool hook: an exact boundary is worth milliseconds, not seconds.
+    pub fn set_deadline(&mut self, deadline: std::time::Duration) {
+        let _ = self.stream.get_ref().set_read_timeout(Some(deadline));
+        let _ = self.stream.get_ref().set_write_timeout(Some(deadline));
+    }
+
     pub fn call(&mut self, op: proto::Op) -> Result<proto::Reply, String> {
         let id = self.next_id;
         self.next_id += 1;

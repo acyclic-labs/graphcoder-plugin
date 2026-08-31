@@ -98,12 +98,14 @@ Single-file restore (`rewind --path`): copy the one file out of the target check
 
 **Goal:** the same product inside Claude Code. Deliberately thin.
 
-- `hooks.json`: PreToolUse/PostToolUse on `Edit|Write|MultiEdit|NotebookEdit|Bash` → `acyclic checkpoint …` (always exit 0); SessionStart/End → session markers. *Verify the current hook payload contract against Claude Code docs first — known unverified-host-API risk.*
-- `commands/rewind.md`: timeline → pick → confirm → rewind → "reload your editor".
-- `skills/self-rollback/`: teaches checkpoint-before-risky-attempt, rewind-on-failure, diff-before-done.
-- `acyclic install claude-code` wires it up; `--agents-md` covers every other host.
+Built as `acyclic hook <event>` + `acyclic install <host>` (the installer embeds the adapter content — no separate `adapters/` dir to drift):
+
+- `acyclic hook pre-tool|post-tool|session-start|session-end` reads the host's JSON payload from stdin (session id, tool name, tool_use_id) and maps to engine ops. Contract: always exit 0, never spawn a daemon, pre-tool waits are bounded (2s deadline), missing daemon is silent.
+- `acyclic install claude-code` merges the four hook entries into the repo's `.claude/settings.json` (idempotent, preserves existing settings), and writes `.claude/commands/rewind.md` + `.claude/skills/acyclic-self-rollback/SKILL.md`. Checked-in ⇒ team-shared.
+- `acyclic install agents-md` appends the CLI cheatsheet block to `AGENTS.md` for any shell-capable agent.
 
 **Exit gate:** one live session reproducing the full journey — destructive migration, `/rewind` restores gitignored + generated files, agent self-rolls-back mid-task.
+**Status (2026-08-31):** hook flow verified against simulated Claude Code payloads end-to-end (session attribution in the timeline, pre waits, post enqueues, silent no-daemon path); install verified idempotent. The live-session gate remains — run a real Claude Code session in an initialized repo.
 
 ---
 

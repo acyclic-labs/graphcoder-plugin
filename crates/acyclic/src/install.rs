@@ -1,0 +1,177 @@
+//! `acyclic install <host>` — wires the adapter into the current repo.
+//!
+//! claude-code: merges hook entries into the repo's `.claude/settings.json`
+//! and drops the `/rewind` command and self-rollback skill into `.claude/`.
+//! Checked-in files, so the whole team inherits the wiring.
+//! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
+//! shell-capable agent.
+
+use std::path::Path;
+
+use serde_json::{json, Value};
+
+pub fn run(repo: &Path, host: &str) -> Result<(), String> {
+    match host {
+        "claude-code" => claude_code(repo),
+        "agents-md" | "--agents-md" => agents_md(repo),
+        other => Err(format!(
+            "unknown host {other:?} (expected claude-code | agents-md)"
+        )),
+    }
+}
+
+fn claude_code(repo: &Path) -> Result<(), String> {
+    let claude_dir = repo.join(".claude");
+    std::fs::create_dir_all(claude_dir.join("commands")).map_err(stringify)?;
+    std::fs::create_dir_all(claude_dir.join("skills/acyclic-self-rollback"))
+        .map_err(stringify)?;
+
+    merge_hooks(&claude_dir.join("settings.json"))?;
+    std::fs::write(claude_dir.join("commands/rewind.md"), REWIND_COMMAND).map_err(stringify)?;
+    std::fs::write(
+        claude_dir.join("skills/acyclic-self-rollback/SKILL.md"),
+        SELF_ROLLBACK_SKILL,
+    )
+    .map_err(stringify)?;
+
+    println!("claude-code adapter installed into {}", claude_dir.display());
+    println!("  hooks:    .claude/settings.json (pre/post tool + session)");
+    println!("  command:  /rewind");
+    println!("  skill:    acyclic-self-rollback");
+    println!("check these files in so the whole team inherits checkpointing.");
+    Ok(())
+}
+
+/// Merges our hook entries into settings.json without disturbing anything
+/// else in the file. Idempotent: an entry whose command mentions
+/// `acyclic hook` is replaced, never duplicated.
+fn merge_hooks(settings_path: &Path) -> Result<(), String> {
+    let mut settings: Value = match std::fs::read_to_string(settings_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", settings_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.to_string()),
+    };
+
+    let events: [(&str, Option<&str>, &str); 4] = [
+        ("PreToolUse", Some("Edit|Write|MultiEdit|NotebookEdit|Bash"), "acyclic hook pre-tool"),
+        ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit|Bash"), "acyclic hook post-tool"),
+        ("SessionStart", None, "acyclic hook session-start"),
+        ("SessionEnd", None, "acyclic hook session-end"),
+    ];
+
+    let hooks = settings
+        .as_object_mut()
+        .ok_or("settings.json is not an object")?
+        .entry("hooks")
+        .or_insert(json!({}));
+    let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
+
+    for (event, matcher, command) in events {
+        let entries = hooks.entry(event).or_insert(json!([]));
+        let entries = entries
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.{event} is not an array"))?;
+        entries.retain(|entry| {
+            !entry.to_string().contains("acyclic hook")
+        });
+        let mut entry = json!({
+            "hooks": [{ "type": "command", "command": command }]
+        });
+        if let Some(matcher) = matcher {
+            entry["matcher"] = json!(matcher);
+        }
+        entries.push(entry);
+    }
+
+    let text = serde_json::to_string_pretty(&settings).map_err(stringify)?;
+    std::fs::write(settings_path, text + "\n").map_err(stringify)?;
+    Ok(())
+}
+
+fn agents_md(repo: &Path) -> Result<(), String> {
+    let path = repo.join("AGENTS.md");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains("## Acyclic checkpoints") {
+        println!("AGENTS.md already carries the acyclic block");
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(AGENTS_MD_BLOCK);
+    std::fs::write(&path, content).map_err(stringify)?;
+    println!("acyclic block appended to {}", path.display());
+    Ok(())
+}
+
+fn stringify<E: std::fmt::Display>(error: E) -> String {
+    error.to_string()
+}
+
+const REWIND_COMMAND: &str = r#"---
+description: Restore the working tree to an earlier checkpoint (untracked and gitignored files included)
+---
+
+Restore this repo to an earlier acyclic checkpoint. Follow exactly:
+
+1. Run `acyclic timeline` and show the user the recent checkpoints.
+2. Ask which checkpoint to restore (or confirm if they already named one:
+   $ARGUMENTS).
+3. Run `acyclic rewind <id> --yes`.
+4. Tell the user: the tree is restored exactly (including generated and
+   gitignored files); a safety checkpoint of the pre-rewind state was taken
+   automatically; and they should reload their editor, since open buffers
+   still show the replaced tree.
+5. Do not run any other write operations until the rewind completes.
+"#;
+
+const SELF_ROLLBACK_SKILL: &str = r#"---
+name: acyclic-self-rollback
+description: Use acyclic checkpoints to try risky changes safely - checkpoint before an attempt, rewind cleanly on failure instead of hand-reverting, and show a blast-radius diff before finishing. Use when a task is risky (migrations, refactors, codegen, dependency changes), when a failed attempt needs undoing, or before declaring multi-file work done.
+---
+
+# Self-rollback with acyclic
+
+This repo checkpoints automatically around your tool calls (an acyclic
+daemon snapshots the working tree, including untracked and gitignored
+files). You can also use it deliberately:
+
+## Before a risky attempt
+Run `acyclic checkpoint --wait -m "before <attempt>"`. Note the printed
+checkpoint id.
+
+## When an attempt fails
+Do NOT hand-revert edits (more edits poison the tree). Instead:
+1. `acyclic timeline` - find the checkpoint from before the attempt.
+2. `acyclic rewind <id> --yes` - the tree is back exactly, including
+   generated files and Bash side effects.
+3. Try the next approach from the clean state.
+
+## Before declaring work done
+Run `acyclic diff --stat` and review the blast radius: every file the
+session changed, including what scripts and generators wrote. Mention
+anything unexpected to the user.
+
+## Rules
+- Rewind restores file contents and modes, not mtimes: expect rebuilds.
+- After a rewind, the user's editor may show stale buffers - say so.
+- If `acyclic` reports the daemon is not running, checkpointing is off;
+  tell the user to run `acyclic init` rather than working around it.
+"#;
+
+const AGENTS_MD_BLOCK: &str = r#"
+## Acyclic checkpoints
+
+This repo uses acyclic: the working tree (untracked + gitignored files
+included) is snapshotted by a local daemon. Useful commands:
+
+    acyclic checkpoint --wait -m "msg"   snapshot now, note the id
+    acyclic timeline                     recent checkpoints
+    acyclic rewind <id> --yes            restore the tree exactly
+    acyclic diff --stat                  everything changed this session
+
+Before a risky change, checkpoint. After a failed attempt, rewind instead
+of hand-reverting. Before finishing, review `acyclic diff`.
+"#;

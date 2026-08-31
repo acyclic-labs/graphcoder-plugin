@@ -1,6 +1,8 @@
 //! `acyclic` — checkpoints, rewind, and blast-radius diff for agent sessions.
 
 mod client;
+mod hook;
+mod install;
 mod server;
 
 use std::path::{Path, PathBuf};
@@ -85,6 +87,18 @@ enum Command {
     Commit,
     /// Stop this repo's daemon.
     Stop,
+    /// Host-hook entrypoint: reads the hook's JSON payload from stdin and
+    /// performs the matching engine action. Always exits 0 (never blocks the
+    /// agent); a missing daemon is a silent no-op.
+    Hook {
+        /// pre-tool | post-tool | session-start | session-end
+        event: String,
+    },
+    /// Wire a host's adapter into the current repo.
+    Install {
+        /// claude-code | agents-md
+        host: String,
+    },
     /// Record a host session starting (hook use).
     #[command(hide = true)]
     SessionStart {
@@ -125,6 +139,14 @@ fn run(cli: Cli, repo: &Path) -> i32 {
             }
         },
         Command::Init => init(repo),
+        Command::Hook { event } => hook::run(repo, &event),
+        Command::Install { host } => match install::run(repo, &host) {
+            Ok(()) => 0,
+            Err(message) => {
+                eprintln!("acyclic install: {message}");
+                1
+            }
+        },
         command => {
             let spawn = if cli.hook { Spawn::Never } else { Spawn::Allowed };
             let mut client = match connect(repo, spawn) {
@@ -347,7 +369,9 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             client.call(proto::Op::SessionEnd { session_id })?;
             Ok(())
         }
-        Command::Init | Command::Daemon { .. } => unreachable!("handled in run()"),
+        Command::Init | Command::Daemon { .. } | Command::Hook { .. } | Command::Install { .. } => {
+            unreachable!("handled in run()")
+        }
     }
 }
 

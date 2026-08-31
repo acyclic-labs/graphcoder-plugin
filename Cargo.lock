@@ -9,6 +9,7 @@ dependencies = [
  "acyclic-engine",
  "acyclic-proto",
  "clap",
+ "serde",
  "serde_json",
  "tokio",
 ]
