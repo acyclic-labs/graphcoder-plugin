@@ -197,6 +197,22 @@ impl Index {
             .transpose()
     }
 
+    /// Most recent checkpoint a user would rewind to: real snapshots only,
+    /// skipping bookkeeping rows (noop, pre_rewind, recovered, failed).
+    pub fn latest_target(&self) -> Result<Option<CheckpointRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, generation, created_at, kind, published,
+                        session_id, tool_call_id, tool_name, label, error
+                 FROM checkpoints WHERE kind IN ('baseline','pre','post','manual')
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                row_to_checkpoint,
+            )
+            .optional()?
+            .transpose()
+    }
+
     /// Most recent checkpoint of any non-failed kind.
     pub fn latest(&self) -> Result<Option<CheckpointRow>> {
         self.connection

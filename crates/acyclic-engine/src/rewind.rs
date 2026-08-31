@@ -192,6 +192,69 @@ fn prune_trash(trash_root: &Path, ttl_days: u32) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn journal(repo: &Path, tmp: &Path, phase: Phase) -> Journal {
+        Journal {
+            target_generation: "00".repeat(32),
+            repo_root: repo.to_path_buf(),
+            tmp: tmp.to_path_buf(),
+            phase,
+        }
+    }
+
+    fn write(path: &Path, value: &Journal) {
+        std::fs::write(path, serde_json::to_string(value).expect("encode")).expect("write");
+    }
+
+    #[test]
+    fn recover_finishes_interrupted_two_step_swap() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir(&tmp).expect("tmp");
+        std::fs::write(tmp.join("file.txt"), b"restored").expect("seed");
+        let journal_path = work.path().join("journal.json");
+        write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
+
+        recover(&journal_path).expect("recover");
+        assert_eq!(
+            std::fs::read(repo.join("file.txt")).expect("read"),
+            b"restored"
+        );
+        assert!(!tmp.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn recover_discards_partial_materialization() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::write(repo.join("keep.txt"), b"live").expect("seed");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir(&tmp).expect("tmp");
+        std::fs::write(tmp.join("partial.txt"), b"half").expect("seed");
+        let journal_path = work.path().join("journal.json");
+        write(&journal_path, &journal(&repo, &tmp, Phase::Materializing));
+
+        recover(&journal_path).expect("recover");
+        assert_eq!(std::fs::read(repo.join("keep.txt")).expect("read"), b"live");
+        assert!(!tmp.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn recover_with_no_journal_is_a_noop() {
+        let work = tempfile::tempdir().expect("tempdir");
+        assert!(recover(&work.path().join("missing.json"))
+            .expect("recover")
+            .is_none());
+    }
+}
+
 /// Atomically exchanges two directories on the same filesystem.
 #[cfg(target_os = "macos")]
 fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {

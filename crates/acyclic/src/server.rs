@@ -267,7 +267,7 @@ impl Server {
         let index = self.open_index()?;
         let row = match target {
             proto::RewindTarget::Checkpoint(id) => index.by_id(id).map_err(stringify)?,
-            proto::RewindTarget::Last => index.latest().map_err(stringify)?,
+            proto::RewindTarget::Last => index.latest_target().map_err(stringify)?,
             proto::RewindTarget::SessionStart(session) => {
                 index.session_start(&session).map_err(stringify)?
             }

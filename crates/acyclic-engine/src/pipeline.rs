@@ -508,6 +508,12 @@ impl Pipeline {
             Err(failure) => {
                 let text = format!("{failure:?}");
                 if text.contains("NoPendingMutations") {
+                    // Nothing new to publish means every recorded row's
+                    // generation is already covered by the last publish —
+                    // noop and quiet pre_rewind rows included.
+                    if let Some(row) = self.last_checkpoint_row {
+                        self.index.mark_published(row)?;
+                    }
                     self.checkpoints_since_commit = 0;
                     return Ok(());
                 }

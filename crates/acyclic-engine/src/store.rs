@@ -248,12 +248,16 @@ impl Store {
 }
 
 /// Short per-user directory for daemon sockets. Created 0700 on first use.
+///
+/// Deliberately NOT `std::env::temp_dir()`: that honors `TMPDIR`, which can
+/// be arbitrarily deep, and `sun_path` is capped (~104 bytes on macOS). The
+/// path must be short and identical across every process of this user.
 pub fn runtime_dir() -> PathBuf {
     #[cfg(unix)]
     let dir = {
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        std::env::temp_dir().join(format!("acyclic-{uid}"))
+        PathBuf::from(format!("/tmp/acyclic-{uid}"))
     };
     #[cfg(not(unix))]
     let dir = std::env::temp_dir().join("acyclic");

@@ -149,18 +149,18 @@ fn run(cli: Cli, repo: &Path) -> i32 {
     }
 }
 
-fn socket_for(repo: &Path) -> Result<PathBuf, String> {
+fn store_paths(repo: &Path) -> Result<acyclic_engine::store::StorePaths, String> {
     let config =
         acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-    let paths = acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
-        .map_err(|error| error.to_string())?;
-    Ok(paths.socket())
+    acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
-    let socket = socket_for(repo).map_err(ConnectError::Other)?;
-    Client::connect(&socket, repo, spawn)
+    let paths = store_paths(repo).map_err(ConnectError::Other)?;
+    let log = paths.root.join("daemon.log");
+    Client::connect(&paths.socket(), repo, &log, spawn)
 }
 
 fn init(repo: &Path) -> i32 {

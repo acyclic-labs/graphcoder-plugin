@@ -27,15 +27,20 @@ pub enum ConnectError {
 }
 
 impl Client {
-    pub fn connect(socket: &Path, repo_root: &Path, spawn: Spawn) -> Result<Self, ConnectError> {
+    pub fn connect(
+        socket: &Path,
+        repo_root: &Path,
+        log_path: &Path,
+        spawn: Spawn,
+    ) -> Result<Self, ConnectError> {
         if let Ok(stream) = UnixStream::connect(socket) {
             return Self::from_stream(stream);
         }
         match spawn {
             Spawn::Never => Err(ConnectError::NoDaemon),
             Spawn::Allowed => {
-                spawn_daemon(repo_root)?;
-                wait_for_socket(socket)
+                let child = spawn_daemon(repo_root, log_path)?;
+                wait_for_socket(socket, child, log_path)
             }
         }
     }
@@ -77,22 +82,28 @@ impl Client {
     }
 }
 
-fn spawn_daemon(repo_root: &Path) -> Result<(), ConnectError> {
+fn spawn_daemon(repo_root: &Path, log_path: &Path) -> Result<std::process::Child, ConnectError> {
     let exe = std::env::current_exe().map_err(|error| ConnectError::Other(error.to_string()))?;
+    let log = std::fs::File::create(log_path)
+        .map_err(|error| ConnectError::Other(format!("daemon log: {error}")))?;
     std::process::Command::new(exe)
         .arg("__daemon")
         .arg(repo_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(log)
         .spawn()
-        .map(|_| ())
         .map_err(|error| ConnectError::Other(format!("spawn daemon: {error}")))
 }
 
-/// Waits for the daemon socket; the first baseline of a big repo can take a
-/// while, so this is generous and prints progress.
-fn wait_for_socket(socket: &Path) -> Result<Client, ConnectError> {
+/// Waits for the daemon socket. The first baseline of a big repo can take a
+/// while, so success is patient — but a daemon that exits without binding
+/// fails fast with its log.
+fn wait_for_socket(
+    socket: &Path,
+    mut child: std::process::Child,
+    log_path: &Path,
+) -> Result<Client, ConnectError> {
     let started = Instant::now();
     let deadline = Duration::from_secs(30 * 60);
     let mut reported = false;
@@ -104,10 +115,18 @@ fn wait_for_socket(socket: &Path) -> Result<Client, ConnectError> {
                 }
             }
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = std::fs::read_to_string(log_path).unwrap_or_default();
+            let tail: String = log.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
+            return Err(ConnectError::Other(format!(
+                "daemon exited ({status}) before serving: {tail}"
+            )));
+        }
         if started.elapsed() > deadline {
-            return Err(ConnectError::Other(
-                "daemon did not become ready (see store logs)".into(),
-            ));
+            return Err(ConnectError::Other(format!(
+                "daemon did not become ready (log: {})",
+                log_path.display()
+            )));
         }
         if started.elapsed() > Duration::from_secs(2) && !reported {
             eprintln!("acyclic: daemon starting (building the first snapshot of the tree)...");
