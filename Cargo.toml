@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/acyclic-engine", "crates/acyclic-qual"]
+members = [
+  "crates/acyclic",
+  "crates/acyclic-engine",
+  "crates/acyclic-proto",
+  "crates/acyclic-qual",
+]
 
 [workspace.package]
 version = "0.0.1"

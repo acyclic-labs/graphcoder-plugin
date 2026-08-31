@@ -1,7 +1,8 @@
-# macOS: the fuser crate (pulled in by acyclic-fs-mount) resolves libfuse via
-# pkg-config; the fs repo ships a FUSE-T compatibility .pc for it.
+# macOS: acyclic-fs-mount's build script probes pkg-config for `fuse3`
+# (FUSE-T's libfuse3 compat surface). Some FUSE-T installs omit fuse3.pc, so
+# we carry a shim pointing at the standard /usr/local FUSE-T layout.
 [env]
-PKG_CONFIG_PATH = { value = "../fs/scripts/pkgconfig/fuse-t", relative = true }
+PKG_CONFIG_PATH = { value = "pkgconfig", relative = true }
 
 # FUSE-T installs libfuse-t.dylib under /usr/local/lib and links via @rpath.
 [target.'cfg(target_os = "macos")']

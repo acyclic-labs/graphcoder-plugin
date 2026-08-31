@@ -33,6 +33,7 @@ fn main() {
         Some("roundtrip") => roundtrip(&args[1..]),
         Some("corpus") => corpus(&args[1..]),
         Some("bench") => bench(&args[1..]),
+        Some("restore-gen") => restore_gen(&args[1..]),
         _ => Err(
             "usage: acyclic-qual fixture <dir> [--with-fifo] | roundtrip <src> <work> \
              | corpus <dir> <files> <mb> | bench <src> <work> [rounds]"
@@ -112,6 +113,91 @@ fn fixture(args: &[String]) -> Result<(), Failure> {
 
     println!("fixture written to {}", root.display());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// restore-gen: materialize one generation from an existing store
+// ---------------------------------------------------------------------------
+
+fn restore_gen(args: &[String]) -> Result<(), Failure> {
+    let store_dir = PathBuf::from(args.first().ok_or("restore-gen: missing <store/store>")?);
+    let volume_hex = args.get(1).ok_or("restore-gen: missing <volume-uuid>")?;
+    let generation_hex = args.get(2).ok_or("restore-gen: missing <gen-hex>")?;
+    let destination = PathBuf::from(args.get(3).ok_or("restore-gen: missing <dest>")?);
+    fs::create_dir_all(&destination)?;
+
+    let volume_uuid: [u8; 16] = {
+        let clean: String = volume_hex.chars().filter(|c| *c != '-').collect();
+        let bytes = hex_decode(&clean)?;
+        bytes.as_slice().try_into().map_err(|_| "volume uuid must be 16 bytes")?
+    };
+    let digest: [u8; 32] = hex_decode(generation_hex)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "generation must be 32 bytes")?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        let fs_engine =
+            LocalFs::local(LocalOptions::new(&store_dir)).map_err(engine_err("open store"))?;
+        let volume = fs_engine
+            .open_volume(
+                VolumeId::from_bytes(volume_uuid),
+                WorkCounters::UNBOUNDED,
+                &cancel,
+            )
+            .await
+            .map_err(engine_err("open volume"))?
+            .value;
+        let mut checkout = volume
+            .checkout(
+                GenerationSelector::Exact(GenerationId::new(acyclic_fs::Digest::from_bytes(
+                    digest,
+                ))),
+                CheckoutMode {
+                    access: AccessMode::ReadOnly,
+                    consistency: ConsistencyMode::Pinned,
+                    mutations: MutationMode::None,
+                },
+                WorkCounters::UNBOUNDED,
+                &cancel,
+            )
+            .await
+            .map_err(engine_err("checkout exact"))?
+            .value;
+        let receipt = materialize_checkout(
+            &mut checkout,
+            &MaterializeOptions {
+                destination: destination.clone(),
+                maximum_directory_entries: 1_024,
+                maximum_extent_spans: 65_536,
+                transfer_bytes: 8 * 1024 * 1024,
+            },
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
+        .await
+        .map_err(engine_err("materialize"))?
+        .value;
+        println!(
+            "materialized {} files / {} dirs into {}",
+            receipt.files,
+            receipt.directories,
+            destination.display()
+        );
+        Ok(())
+    })
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, Failure> {
+    if text.len() % 2 != 0 {
+        return Err("odd hex length".into());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| format!("{e}").into()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

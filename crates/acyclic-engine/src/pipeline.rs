@@ -17,6 +17,7 @@ use acyclic_fs_mount::{capture_baseline, capture_root_identity, capture_watch_ba
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
+use crate::diff::{self, FileChange};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RewindOutcome};
 use crate::store::Store;
@@ -64,6 +65,11 @@ enum Request {
     Rewind {
         target: CheckpointRow,
         reply: oneshot::Sender<Result<RewindOutcome>>,
+    },
+    Diff {
+        before: GenerationId,
+        after: GenerationId,
+        reply: oneshot::Sender<Result<Vec<FileChange>>>,
     },
     Status {
         reply: oneshot::Sender<StatusReport>,
@@ -117,6 +123,14 @@ impl PipelineHandle {
 
     pub async fn rewind(&self, target: CheckpointRow) -> Result<RewindOutcome> {
         request!(self, Rewind { target: target })?
+    }
+
+    pub async fn diff(
+        &self,
+        before: GenerationId,
+        after: GenerationId,
+    ) -> Result<Vec<FileChange>> {
+        request!(self, Diff { before: before, after: after })?
     }
 
     pub async fn status(&self) -> Result<StatusReport> {
@@ -206,6 +220,7 @@ fn fail_request(request: Request, message: &str) {
         Request::Checkpoint { reply, .. } => drop(reply.send(Err(error()))),
         Request::Commit { reply } => drop(reply.send(Err(error()))),
         Request::Rewind { reply, .. } => drop(reply.send(Err(error()))),
+        Request::Diff { reply, .. } => drop(reply.send(Err(error()))),
         Request::Status { reply } => drop(reply.send(StatusReport {
             state: State::Baselining,
             last_checkpoint: None,
@@ -328,6 +343,14 @@ impl Pipeline {
             }
             Request::Rewind { target, reply } => {
                 let _ = reply.send(self.rewind(target).await);
+                false
+            }
+            Request::Diff {
+                before,
+                after,
+                reply,
+            } => {
+                let _ = reply.send(diff::diff(&self.store, before, after).await);
                 false
             }
             Request::Status { reply } => {

@@ -19,6 +19,13 @@ pub mod store;
 
 use thiserror::Error;
 
+pub use acyclic_fs::GenerationId;
+
+/// Canonical hex form of a generation id for display and wire use.
+pub fn generation_hex(generation: GenerationId) -> String {
+    hex::encode(generation.digest().as_bytes())
+}
+
 /// Engine-level failures surfaced to the daemon/CLI layer.
 #[derive(Debug, Error)]
 pub enum EngineError {

@@ -61,8 +61,16 @@ impl StorePaths {
     pub fn index_db(&self) -> PathBuf {
         self.root.join("index.db")
     }
+    /// The daemon socket lives in a short per-user runtime directory, NOT in
+    /// the store: `sun_path` is capped (~104 bytes on macOS) and store roots
+    /// can be arbitrarily deep.
     pub fn socket(&self) -> PathBuf {
-        self.root.join("daemon.sock")
+        let store_key = self
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "default".into());
+        runtime_dir().join(format!("{store_key}.sock"))
     }
     pub fn pidfile(&self) -> PathBuf {
         self.root.join("daemon.pid")
@@ -237,6 +245,25 @@ impl Store {
             .map_err(EngineError::fs("checkout exact"))?
             .value)
     }
+}
+
+/// Short per-user directory for daemon sockets. Created 0700 on first use.
+pub fn runtime_dir() -> PathBuf {
+    #[cfg(unix)]
+    let dir = {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        std::env::temp_dir().join(format!("acyclic-{uid}"))
+    };
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir().join("acyclic");
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {

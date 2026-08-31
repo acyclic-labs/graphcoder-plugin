@@ -1,0 +1,380 @@
+//! `acyclic` — checkpoints, rewind, and blast-radius diff for agent sessions.
+
+mod client;
+mod server;
+
+use std::path::{Path, PathBuf};
+
+use acyclic_proto as proto;
+use clap::{Parser, Subcommand};
+
+use client::{Client, ConnectError, Spawn};
+
+/// Exit codes: 0 ok · 1 failure · 2 daemon-unavailable no-op (hook path).
+const EXIT_NO_DAEMON: i32 = 2;
+
+#[derive(Parser)]
+#[command(name = "acyclic", version, about)]
+struct Cli {
+    /// Repo root (defaults to the current directory).
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
+    /// Hook mode: never spawn a daemon; exit 2 quietly if one isn't running.
+    #[arg(long, global = true, env = "ACYCLIC_HOOK")]
+    hook: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Initialize the store for this repo and start checkpointing.
+    Init,
+    /// Snapshot now (hooks do this automatically).
+    Checkpoint {
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Wait for the checkpoint to land (default replies on enqueue).
+        #[arg(long)]
+        wait: bool,
+        /// Also publish to the durable authority (coarse boundary).
+        #[arg(long)]
+        durable: bool,
+        /// Checkpoint kind recorded in the timeline.
+        #[arg(long, default_value = "manual")]
+        kind: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        tool_call_id: Option<String>,
+        #[arg(long)]
+        tool_name: Option<String>,
+    },
+    /// List checkpoints, newest first.
+    Timeline {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Restore the tree to a checkpoint (untracked files included).
+    Rewind {
+        /// Checkpoint id from `acyclic timeline`.
+        target: Option<i64>,
+        /// Rewind to the most recent checkpoint.
+        #[arg(long)]
+        last: bool,
+        /// Rewind to the first checkpoint of a session.
+        #[arg(long)]
+        session_start: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Blast radius: what changed between two checkpoints.
+    Diff {
+        before: Option<i64>,
+        after: Option<i64>,
+        /// One line per file (the default output already is).
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Daemon and store health.
+    Status,
+    /// Publish pending checkpoints to the durable authority now.
+    Commit,
+    /// Stop this repo's daemon.
+    Stop,
+    /// Record a host session starting (hook use).
+    #[command(hide = true)]
+    SessionStart {
+        session_id: String,
+        #[arg(long, default_value = "")]
+        host: String,
+    },
+    /// Record a host session ending (hook use).
+    #[command(hide = true)]
+    SessionEnd { session_id: String },
+    /// Internal: the per-repo daemon process.
+    #[command(name = "__daemon", hide = true)]
+    Daemon { repo_root: PathBuf },
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let repo = cli
+        .repo
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .canonicalize()
+        .unwrap_or_else(|error| {
+            eprintln!("acyclic: bad repo path: {error}");
+            std::process::exit(1);
+        });
+    let code = run(cli, &repo);
+    std::process::exit(code);
+}
+
+fn run(cli: Cli, repo: &Path) -> i32 {
+    match cli.command {
+        Command::Daemon { repo_root } => match server::run(&repo_root) {
+            Ok(()) => 0,
+            Err(message) => {
+                eprintln!("acyclic daemon: {message}");
+                1
+            }
+        },
+        Command::Init => init(repo),
+        command => {
+            let spawn = if cli.hook { Spawn::Never } else { Spawn::Allowed };
+            let mut client = match connect(repo, spawn) {
+                Ok(client) => client,
+                Err(ConnectError::NoDaemon) => {
+                    eprintln!("acyclic: daemon not running; checkpoint skipped");
+                    return EXIT_NO_DAEMON;
+                }
+                Err(ConnectError::Other(message)) => {
+                    eprintln!("acyclic: {message}");
+                    return 1;
+                }
+            };
+            match execute(&mut client, command) {
+                Ok(()) => 0,
+                Err(message) => {
+                    eprintln!("acyclic: {message}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn socket_for(repo: &Path) -> Result<PathBuf, String> {
+    let config =
+        acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+    let stores_root = config.store_dir.as_ref().map(PathBuf::from);
+    let paths = acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(paths.socket())
+}
+
+fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
+    let socket = socket_for(repo).map_err(ConnectError::Other)?;
+    Client::connect(&socket, repo, spawn)
+}
+
+fn init(repo: &Path) -> i32 {
+    let result = (|| -> Result<(), String> {
+        let config =
+            acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+        let stores_root = config.store_dir.as_ref().map(PathBuf::from);
+        let paths = acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+            .map_err(|error| error.to_string())?;
+        if !paths.meta().exists() {
+            let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+            runtime
+                .block_on(acyclic_engine::store::Store::init(repo, paths.clone()))
+                .map_err(|error| error.to_string())?;
+            println!("store created at {}", paths.root.display());
+        } else {
+            println!("store already exists at {}", paths.root.display());
+        }
+        // Spawning the daemon builds (or refreshes) the baseline.
+        let mut client = connect(repo, Spawn::Allowed).map_err(|error| match error {
+            ConnectError::NoDaemon => "daemon failed to start".to_string(),
+            ConnectError::Other(message) => message,
+        })?;
+        client.call(proto::Op::Ping)?;
+        println!("daemon ready — checkpointing is on");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(message) => {
+            eprintln!("acyclic init: {message}");
+            1
+        }
+    }
+}
+
+fn execute(client: &mut Client, command: Command) -> Result<(), String> {
+    match command {
+        Command::Checkpoint {
+            message,
+            wait,
+            durable,
+            kind,
+            session_id,
+            tool_call_id,
+            tool_name,
+        } => {
+            let kind = match kind.as_str() {
+                "pre" | "post" | "manual" => kind,
+                other => return Err(format!("unknown kind {other:?}")),
+            };
+            let reply = client.call(proto::Op::Checkpoint {
+                kind,
+                session_id,
+                tool_call_id,
+                tool_name,
+                label: message,
+                wait,
+                durable,
+            })?;
+            match reply {
+                proto::Reply::Enqueued => println!("checkpoint queued"),
+                proto::Reply::Checkpoint(info) => {
+                    println!("checkpoint #{} ({})", info.row_id, info.kind);
+                }
+                other => return Err(format!("unexpected reply {other:?}")),
+            }
+            Ok(())
+        }
+        Command::Timeline { session, limit } => {
+            let reply = client.call(proto::Op::Timeline {
+                session_id: session,
+                limit,
+            })?;
+            let proto::Reply::Timeline(entries) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if entries.is_empty() {
+                println!("no checkpoints yet");
+                return Ok(());
+            }
+            for entry in entries {
+                let label = entry
+                    .label
+                    .or(entry.tool_name)
+                    .or(entry.error.map(|error| format!("error: {error}")))
+                    .unwrap_or_default();
+                println!(
+                    "#{:<5} {:<10} {:<9} {}{}",
+                    entry.id,
+                    age(entry.created_at),
+                    entry.kind,
+                    label,
+                    if entry.published { "" } else { "  (unpublished)" },
+                );
+            }
+            Ok(())
+        }
+        Command::Rewind {
+            target,
+            last,
+            session_start,
+            yes,
+        } => {
+            let target = match (target, last, session_start) {
+                (Some(id), false, None) => proto::RewindTarget::Checkpoint(id),
+                (None, true, None) => proto::RewindTarget::Last,
+                (None, false, Some(session)) => proto::RewindTarget::SessionStart(session),
+                _ => return Err("pass exactly one of <id>, --last, --session-start".into()),
+            };
+            if !yes {
+                eprint!("rewind will replace the working tree (a safety checkpoint is taken first). Continue? [y/N] ");
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| error.to_string())?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    println!("aborted");
+                    return Ok(());
+                }
+            }
+            let reply = client.call(proto::Op::Rewind { target, path: None })?;
+            let proto::Reply::Rewind(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            println!("restored checkpoint #{}", info.restored_checkpoint);
+            println!("old tree kept at {}", info.old_tree);
+            println!("note: {}", info.warning);
+            Ok(())
+        }
+        Command::Diff { before, after, .. } => {
+            let reply = client.call(proto::Op::Diff { before, after })?;
+            let proto::Reply::Diff(entries) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if entries.is_empty() {
+                println!("no changes");
+                return Ok(());
+            }
+            for entry in &entries {
+                let tag = match entry.change.as_str() {
+                    "added" => "A",
+                    "removed" => "D",
+                    "modified" => "M",
+                    _ => "m",
+                };
+                println!("{tag} {}", entry.path);
+            }
+            println!("{} paths changed", entries.len());
+            Ok(())
+        }
+        Command::Status => {
+            let reply = client.call(proto::Op::Status)?;
+            let proto::Reply::Status(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            println!("repo:          {}", info.repo_root);
+            println!("state:         {}", info.state);
+            println!(
+                "last checkpoint: {}",
+                info.last_checkpoint
+                    .map(|id| format!("#{id}"))
+                    .unwrap_or_else(|| "none".into())
+            );
+            println!("unpublished:   {}", info.unpublished);
+            println!("store size:    {}", human_bytes(info.store_bytes));
+            Ok(())
+        }
+        Command::Commit => {
+            client.call(proto::Op::Commit)?;
+            println!("published");
+            Ok(())
+        }
+        Command::Stop => {
+            client.call(proto::Op::Stop)?;
+            println!("daemon stopping");
+            Ok(())
+        }
+        Command::SessionStart { session_id, host } => {
+            client.call(proto::Op::SessionStart { session_id, host })?;
+            Ok(())
+        }
+        Command::SessionEnd { session_id } => {
+            client.call(proto::Op::SessionEnd { session_id })?;
+            Ok(())
+        }
+        Command::Init | Command::Daemon { .. } => unreachable!("handled in run()"),
+    }
+}
+
+fn age(created_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let delta = (now - created_at).max(0);
+    if delta < 60 {
+        format!("{delta}s ago")
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86_400)
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
