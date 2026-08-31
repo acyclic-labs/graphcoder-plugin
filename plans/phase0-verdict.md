@@ -40,7 +40,9 @@ Release-build numbers on a 1 GiB / 20k-file corpus:
 1. `crates/mount/src/capture.rs` — symlinks are captured with fully-`Unavailable` metadata (`unrestorable_metadata()`), and the prior-metadata preserve step is skipped for links. Root cause: capture recorded mode/timestamps that `apply_host_metadata` can never apply to a link, so every tree containing a symlink failed restore fail-closed.
 2. `crates/mount/src/materialize.rs` + `crates/mount/src/host_root.rs` — permission application for special files (FIFO etc.) uses a new `HostRoot::set_permissions_without_open` (`fchmodat`) instead of cap-std's open-based `set_permissions`. Opening a FIFO for chmod blocks until a peer appears — materialize of any tree containing a FIFO deadlocked forever.
 
-Both patches pass the fs repo's own suites: `acyclic-fs` 460/460, `acyclic-fs-mount` 18/18.
+Both patches pass the fs repo's own suites: `acyclic-fs` 460/460, `acyclic-fs-mount` 18/18. (Both were subsequently folded into the fs branch.)
+
+3. `crates/sdk/src/watch.rs` (+ its test) — **silent stale-content capture on macOS**, found by a 60-cycle CLI soak: FSEvents coalesces per-path flags, so notify can surface a data write as `Modify(Metadata)`; fs mapped that to `MetadataChanged`, whose capture intent deliberately skips restaging content. Under rapid same-file edits this froze captured content permanently while checkpoints kept succeeding (worst failure class: silent corruption of history). Fix mirrors fs's existing Darwin `Create` downgrade: on macOS a metadata hint degrades to `Modified`. Soak: 30/60 checkpoints wrong before, 0/60 after (both `--wait` and queued modes); fs suites 573+21 green.
 
 ## Fixture round-trip timings (20 paths, ~8.4 MiB, debug build)
 
