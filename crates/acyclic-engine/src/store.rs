@@ -115,7 +115,7 @@ fn volume_config() -> VolumeConfig {
     config
 }
 
-fn writable_head() -> CheckoutMode {
+pub(crate) fn writable_head() -> CheckoutMode {
     CheckoutMode {
         access: AccessMode::ReadWrite,
         consistency: ConsistencyMode::TrackingSafe,

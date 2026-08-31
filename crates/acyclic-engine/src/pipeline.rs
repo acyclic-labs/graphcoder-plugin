@@ -16,8 +16,11 @@ use acyclic_fs::model::VolumeLimits;
 use acyclic_fs_mount::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
 use tokio::sync::{mpsc, oneshot};
 
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::diff::{self, FileChange};
+use crate::fork::{ForkSeed, PromoteOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RewindOutcome};
 use crate::store::Store;
@@ -70,6 +73,15 @@ enum Request {
         before: GenerationId,
         after: GenerationId,
         reply: oneshot::Sender<Result<Vec<FileChange>>>,
+    },
+    Fork {
+        reply: oneshot::Sender<Result<ForkSeed>>,
+    },
+    Promote {
+        shared: Arc<SharedLocalCheckout>,
+        base: GenerationId,
+        label: String,
+        reply: oneshot::Sender<Result<PromoteOutcome>>,
     },
     Status {
         reply: oneshot::Sender<StatusReport>,
@@ -152,6 +164,19 @@ impl PipelineHandle {
         after: GenerationId,
     ) -> Result<Vec<FileChange>> {
         request!(self, Diff { before: before, after: after })?
+    }
+
+    pub async fn fork(&self) -> Result<ForkSeed> {
+        request!(self, Fork {})?
+    }
+
+    pub async fn promote(
+        &self,
+        shared: Arc<SharedLocalCheckout>,
+        base: GenerationId,
+        label: String,
+    ) -> Result<PromoteOutcome> {
+        request!(self, Promote { shared: shared, base: base, label: label })?
     }
 
     pub async fn status(&self) -> Result<StatusReport> {
@@ -242,6 +267,8 @@ fn fail_request(request: Request, message: &str) {
         Request::Commit { reply } => drop(reply.send(Err(error()))),
         Request::Rewind { reply, .. } => drop(reply.send(Err(error()))),
         Request::Diff { reply, .. } => drop(reply.send(Err(error()))),
+        Request::Fork { reply } => drop(reply.send(Err(error()))),
+        Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
         Request::Status { reply } => drop(reply.send(StatusReport {
             state: State::Baselining,
             last_checkpoint: None,
@@ -376,6 +403,19 @@ impl Pipeline {
                 reply,
             } => {
                 let _ = reply.send(diff::diff(&self.store, before, after).await);
+                false
+            }
+            Request::Fork { reply } => {
+                let _ = reply.send(self.fork().await);
+                false
+            }
+            Request::Promote {
+                shared,
+                base,
+                label,
+                reply,
+            } => {
+                let _ = reply.send(self.promote(shared, base, &label).await);
                 false
             }
             Request::Status { reply } => {
@@ -581,6 +621,148 @@ impl Pipeline {
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         outcome
+    }
+
+    /// Mints one fork: publish the current state (the fork base), then cut a
+    /// fresh writable Head checkout whose overlay the daemon will mount.
+    async fn fork(&mut self) -> Result<ForkSeed> {
+        if self.state != State::Ready {
+            return Err(EngineError::Capture(format!(
+                "pipeline not ready ({:?})",
+                self.state
+            )));
+        }
+        self.drain_watcher().await?;
+        let base = self.checkpoint_engine().await?;
+        let row = self.index.record(
+            base,
+            CheckpointKind::Manual,
+            &Attribution {
+                label: Some("fork base".into()),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = base;
+        self.last_checkpoint_row = Some(row);
+        self.commit_engine().await?;
+
+        let checkout = self
+            .store
+            .volume
+            .checkout(
+                acyclic_fs::model::GenerationSelector::Head,
+                crate::store::writable_head(),
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("fork checkout"))?
+            .value;
+        let config = checkout.volume_config();
+        let volume_id = checkout.volume_id();
+        Ok(ForkSeed {
+            shared: Arc::new(SharedLocalCheckout::new(checkout)),
+            config,
+            volume_id,
+            base,
+        })
+    }
+
+    /// Promotes a fork: publish the fork's overlay (legible conflict if the
+    /// mainline moved past its base), then land the winning generation in
+    /// the real tree via the rewind swap.
+    async fn promote(
+        &mut self,
+        shared: Arc<SharedLocalCheckout>,
+        base: GenerationId,
+        label: &str,
+    ) -> Result<PromoteOutcome> {
+        // Safety net + publish the mainline. If anything real changed since
+        // the fork base, the head moves and the fork's commit conflicts.
+        self.drain_watcher().await?;
+        let safety = self.checkpoint_engine().await?;
+        let safety_row = self.index.record(
+            safety,
+            CheckpointKind::PreRewind,
+            &Attribution {
+                label: Some(format!("before {label}")),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = safety;
+        self.last_checkpoint_row = Some(safety_row);
+        self.commit_engine().await?;
+
+        let outcome = {
+            let mut guard = shared.lock().await;
+            if !guard.has_pending_mutations() {
+                // Nothing was written in the fork: the tree already equals
+                // the base — nothing to land.
+                return Ok(PromoteOutcome::Promoted {
+                    generation: base,
+                    old_tree: None,
+                });
+            }
+            guard
+                .commit(OperationId::new(), WorkCounters::UNBOUNDED, &self.cancel)
+                .await
+                .map_err(EngineError::fs("fork commit"))?
+                .value
+        };
+        let generation = match outcome {
+            CheckoutCommitOutcome::Committed { generation_id, .. }
+            | CheckoutCommitOutcome::AlreadyCommitted { generation_id, .. } => generation_id,
+            CheckoutCommitOutcome::Conflict { .. } | CheckoutCommitOutcome::Fenced { .. } => {
+                return Ok(PromoteOutcome::Conflict {
+                    message: format!(
+                        "the working tree moved past the fork's base \
+                         ({}); promote in v1 requires an unmoved mainline — \
+                         rewind to the base or re-fork and re-apply",
+                        crate::generation_hex(base)
+                    ),
+                });
+            }
+            other => {
+                return Err(EngineError::Fs(format!(
+                    "unexpected fork commit outcome: {other:?}"
+                )))
+            }
+        };
+
+        // The head advanced under our checkout: replace it, then land the
+        // winner with the same journaled swap a rewind uses.
+        self.state = State::Rewinding;
+        self.store.checkout = self
+            .store
+            .volume
+            .checkout(
+                acyclic_fs::model::GenerationSelector::Head,
+                crate::store::writable_head(),
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("refresh checkout"))?
+            .value;
+        let row = self.index.record(
+            generation,
+            CheckpointKind::Manual,
+            &Attribution {
+                label: Some(label.to_string()),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = generation;
+        self.last_checkpoint_row = Some(row);
+
+        let swap = rewind::execute(&self.store, generation, self.config.trash_ttl_days).await;
+        self.reset_watch().await?;
+        self.baseline(CheckpointKind::Recovered).await?;
+        let swap = swap?;
+        Ok(PromoteOutcome::Promoted {
+            generation,
+            old_tree: Some(swap.old_tree),
+        })
     }
 
     /// Reopens the watcher and recomputes the capture root identity — needed

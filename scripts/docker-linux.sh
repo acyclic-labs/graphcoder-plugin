@@ -12,7 +12,15 @@ PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FS="$(cd "$PLUGIN/../fs" && pwd)"
 IMAGE="${1:-rust:1-bookworm}"
 
+# FUSE inside the container (fork mounts): pass the device + cap when the
+# host offers them; forks.sh skips gracefully otherwise.
+FUSE_FLAGS=()
+if [ -e /dev/fuse ] || [ "$(uname -s)" = "Darwin" ]; then
+  FUSE_FLAGS=(--device /dev/fuse --cap-add SYS_ADMIN)
+fi
+
 docker run --rm \
+  "${FUSE_FLAGS[@]}" \
   -v "$FS:/src/fs:ro" \
   -v "$PLUGIN:/src/graphcoder-plugin:ro" \
   -v acyclic-linux-cargo:/cargo \

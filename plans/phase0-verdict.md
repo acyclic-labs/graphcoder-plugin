@@ -59,6 +59,10 @@ Both patches pass the fs repo's own suites: `acyclic-fs` 460/460, `acyclic-fs-mo
 - Single-file capture+commit: **p95 ≈ 2.57s (debug)** — far over budget; release-build split (capture vs commit) pending to attribute. If release commit stays ~seconds, per-checkpoint cost scales with tree size, not delta size — upstream conversation required.
 - Baseline capture 434s + commit 7.6s (debug).
 
+## Launch 3 mount gate (F0, 2026-08-31)
+
+✅ **GO on native mounts for the fork engine** (`acyclic-qual mount-smoke`, macOS FUSE-T via the fs C bridge): probe reports available+writable; mount of a captured checkout attaches in **86ms**; first small read 2.6ms; 8MB lazy hydration 38ms; symlink targets exact; overlay writes/edits visible through the mount and fully isolated from the source tree; clean detach. Reflink fallback not needed.
+
 ## Crash and growth checks
 
 - ✅ **kill -9 mid-baseline-capture**: store reopens clean; subsequent capture + restore in the same store succeeds.

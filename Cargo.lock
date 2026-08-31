@@ -7,6 +7,7 @@ name = "acyclic"
 version = "0.0.1"
 dependencies = [
  "acyclic-engine",
+ "acyclic-fs-mount",
  "acyclic-proto",
  "clap",
  "serde",
@@ -22,6 +23,7 @@ dependencies = [
  "acyclic-fs",
  "acyclic-fs-mount",
  "blake3",
+ "bytes",
  "hex",
  "libc",
  "rusqlite",

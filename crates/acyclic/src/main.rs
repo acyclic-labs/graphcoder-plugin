@@ -81,6 +81,17 @@ enum Command {
         #[arg(long)]
         stat: bool,
     },
+    /// Fork the working tree N ways (writable overlay mounts; O(1), no copy).
+    Fork {
+        #[arg(short = 'n', long, default_value_t = 1)]
+        count: u32,
+    },
+    /// List live forks.
+    Forks,
+    /// Discard a fork (its changes evaporate).
+    ForkDrop { id: String },
+    /// Land a fork's changes in the real working tree.
+    Promote { id: String },
     /// Daemon and store health.
     Status,
     /// Publish pending checkpoints to the durable authority now.
@@ -334,6 +345,60 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 println!("{tag} {}", entry.path);
             }
             println!("{} paths changed", entries.len());
+            Ok(())
+        }
+        Command::Fork { count } => {
+            let reply = client.call(proto::Op::Fork { count })?;
+            let proto::Reply::Forks(entries) = reply else {
+                return Err("unexpected reply".into());
+            };
+            for entry in &entries {
+                println!("fork {}  {}", entry.id, entry.path);
+            }
+            println!(
+                "{} fork(s) ready — work in them freely; `acyclic promote <id>` keeps a winner",
+                entries.len()
+            );
+            Ok(())
+        }
+        Command::Forks => {
+            let reply = client.call(proto::Op::ForkList)?;
+            let proto::Reply::Forks(entries) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if entries.is_empty() {
+                println!("no live forks (forks do not survive daemon restarts)");
+                return Ok(());
+            }
+            for entry in entries {
+                println!(
+                    "{}  {}  {}  base {}",
+                    entry.id,
+                    age(entry.created_at),
+                    entry.path,
+                    &entry.base[..12]
+                );
+            }
+            Ok(())
+        }
+        Command::ForkDrop { id } => {
+            client.call(proto::Op::ForkDrop { id })?;
+            println!("fork dropped; its changes evaporated");
+            Ok(())
+        }
+        Command::Promote { id } => {
+            let reply = client.call(proto::Op::Promote { id })?;
+            let proto::Reply::Promote(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            match info.old_tree {
+                Some(old_tree) => {
+                    println!("promoted: working tree now at {}", &info.generation[..12]);
+                    println!("old tree kept at {old_tree}");
+                    println!("note: {}", info.warning);
+                }
+                None => println!("fork had no changes; nothing to land"),
+            }
             Ok(())
         }
         Command::Status => {
