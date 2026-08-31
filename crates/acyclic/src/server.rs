@@ -10,19 +10,30 @@ use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
-use acyclic_fs_mount::{mount_native, CheckoutMountSource, NativeMountRequest, NativeMountSession};
+use acyclic_fs_mount::{
+    mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
+    RoutedMountSource,
+};
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 
-/// One live fork: its mount session (Drop unmounts), the shared checkout the
-/// mount writes into, and its wire-visible facts.
+/// One live fork: the shared checkout its route serves plus wire facts.
+/// Forks are routes inside ONE native mount session (see [`ForkMount`]):
+/// FUSE-T serves a single session per burst reliably, and one session is
+/// all the routed design ever needs.
 struct ForkState {
-    session: NativeMountSession,
     shared: Arc<SharedLocalCheckout>,
     base: acyclic_engine::GenerationId,
     entry: proto::ForkEntry,
+}
+
+/// The one native session projecting every fork through the router.
+/// Mounted lazily on the first fork, unmounted when the last route goes.
+struct ForkMount {
+    router: Arc<RoutedMountSource>,
+    session: Option<NativeMountSession>,
 }
 
 pub fn run(repo_root: &Path) -> Result<(), String> {
@@ -62,6 +73,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         repo_root,
         shutdown: shutdown.clone(),
         forks: Arc::new(Mutex::new(HashMap::new())),
+        fork_mount: Arc::new(Mutex::new(ForkMount {
+            router: Arc::new(RoutedMountSource::new()),
+            session: None,
+        })),
     };
 
     runtime.block_on(async move {
@@ -93,6 +108,7 @@ struct Server {
     repo_root: PathBuf,
     shutdown: Arc<Notify>,
     forks: Arc<Mutex<HashMap<String, ForkState>>>,
+    fork_mount: Arc<Mutex<ForkMount>>,
 }
 
 impl Server {
@@ -274,12 +290,16 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Stop => {
-                // Drop fork mounts before the pipeline goes away: their
+                // Detach the fork session before the pipeline goes away: its
                 // callback runtimes reach into the shared checkouts.
-                let mut forks = self.forks.lock().await;
-                for (_, mut fork) in forks.drain() {
-                    let _ = tokio::task::block_in_place(|| fork.session.stop());
-                    let _ = std::fs::remove_dir_all(entry_dir(&fork.entry));
+                self.forks.lock().await.clear();
+                let mut mount = self.fork_mount.lock().await;
+                if let Some(mut session) = mount.session.take() {
+                    let _ = tokio::task::block_in_place(|| session.stop());
+                }
+                drop(mount);
+                if let Some(root) = fork::forks_mount_root(&self.repo_root) {
+                    let _ = std::fs::remove_dir_all(root);
                 }
                 self.shutdown.notify_one();
                 Ok(proto::Reply::Unit)
@@ -288,49 +308,67 @@ impl Server {
                 if count == 0 || count > 16 {
                     return Err("fork count must be 1..=16".into());
                 }
-                let root = fork::forks_root(&self.repo_root)
+                let root = fork::forks_mount_root(&self.repo_root)
                     .ok_or("repo root has no parent for fork workspaces")?;
                 let mut created = Vec::new();
                 for _ in 0..count {
                     let seed = self.handle.fork().await.map_err(stringify)?;
                     let id = short_id();
-                    let directory = root.join(&id);
-                    if directory.exists() {
-                        return Err(format!("fork workspace collision at {id}; retry"));
-                    }
-                    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-                    // Mount drivers block on their own runtimes; never
-                    // run them on this async worker directly.
+                    // Mount-source construction spins up a callback runtime;
+                    // keep it (and any mount syscall) off async workers.
                     let shared = Arc::clone(&seed.shared);
                     let config = seed.config;
-                    let volume_id = seed.volume_id;
-                    let dest = directory.clone();
-                    let session = tokio::task::block_in_place(move || {
-                        let source = Arc::new(
-                            CheckoutMountSource::new(shared, config)
-                                .map_err(|error| format!("mount source: {error:?}"))?,
-                        );
-                        mount_native(
-                            NativeMountRequest {
-                                mount_id: acyclic_engine::MountId::new(),
-                                volume_id,
-                                destination: dest,
-                                writable: true,
-                            },
-                            source,
-                        )
-                        .map_err(|error| format!("mount: {error:?}"))
+                    let source = tokio::task::block_in_place(move || {
+                        CheckoutMountSource::new(shared, config)
+                            .map_err(|error| format!("mount source: {error:?}"))
                     })?;
+                    let mut mount = self.fork_mount.lock().await;
+                    mount
+                        .router
+                        .add_route(
+                            id.clone().into_bytes(),
+                            Arc::new(source) as Arc<dyn MountFilesystem>,
+                        )
+                        .map_err(|error| format!("route: {error:?}"))?;
+                    // The ONE session, mounted lazily on the first fork. A
+                    // route insert is all later forks pay.
+                    if mount.session.is_none() {
+                        let _ = std::fs::remove_dir_all(&root);
+                        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+                        let router =
+                            Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
+                        let volume_id = seed.volume_id;
+                        let dest = root.clone();
+                        let session = tokio::task::block_in_place(move || {
+                            mount_native(
+                                NativeMountRequest {
+                                    mount_id: acyclic_engine::MountId::new(),
+                                    volume_id,
+                                    destination: dest,
+                                    writable: true,
+                                },
+                                router,
+                            )
+                            .map_err(|error| format!("mount: {error:?}"))
+                        });
+                        match session {
+                            Ok(session) => mount.session = Some(session),
+                            Err(error) => {
+                                mount.router.remove_route(id.as_bytes());
+                                return Err(error);
+                            }
+                        }
+                    }
+                    drop(mount);
                     let entry = proto::ForkEntry {
                         id: id.clone(),
-                        path: directory.display().to_string(),
+                        path: root.join(&id).display().to_string(),
                         base: acyclic_engine::generation_hex(seed.base),
                         created_at: unix_now(),
                     };
                     self.forks.lock().await.insert(
                         id,
                         ForkState {
-                            session,
                             shared: seed.shared,
                             base: seed.base,
                             entry: clone_entry(&entry),
@@ -349,19 +387,18 @@ impl Server {
             }
             proto::Op::ForkDrop { id } => {
                 let mut forks = self.forks.lock().await;
-                let mut fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
-                tokio::task::block_in_place(|| fork.session.stop())
-                    .map_err(|error| format!("unmount: {error:?}"))?;
-                let _ = std::fs::remove_dir_all(entry_dir(&fork.entry));
+                forks.remove(&id).ok_or(format!("no fork {id}"))?;
+                drop(forks);
+                self.detach_route(&id).await?;
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Promote { id } => {
                 let mut forks = self.forks.lock().await;
-                let mut fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
-                // Detach the mount first: no more writes can race the commit.
-                tokio::task::block_in_place(|| fork.session.stop())
-                    .map_err(|error| format!("unmount: {error:?}"))?;
+                let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
+                // Detach the route first: new writes stop reaching the
+                // overlay before its commit (in-flight handles detach).
+                self.detach_route(&id).await?;
 
                 let outcome = self
                     .handle
@@ -372,7 +409,6 @@ impl Server {
                     )
                     .await
                     .map_err(stringify)?;
-                let _ = std::fs::remove_dir_all(entry_dir(&fork.entry));
                 match outcome {
                     PromoteOutcome::Promoted { generation, old_tree } => {
                         Ok(proto::Reply::Promote(proto::PromoteInfo {
@@ -387,6 +423,23 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Removes one fork's route; the session unmounts (and the mount root
+    /// disappears) when the last route goes, freeing the FUSE-T pool slot.
+    async fn detach_route(&self, id: &str) -> Result<(), String> {
+        let mut mount = self.fork_mount.lock().await;
+        mount.router.remove_route(id.as_bytes());
+        if mount.router.is_empty() {
+            if let Some(mut session) = mount.session.take() {
+                tokio::task::block_in_place(|| session.stop())
+                    .map_err(|error| format!("unmount: {error:?}"))?;
+            }
+            if let Some(root) = fork::forks_mount_root(&self.repo_root) {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+        Ok(())
     }
 
     fn open_index(&self) -> Result<Index, String> {
@@ -456,9 +509,6 @@ fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
     }
 }
 
-fn entry_dir(entry: &proto::ForkEntry) -> PathBuf {
-    PathBuf::from(&entry.path)
-}
 
 fn stringify(error: EngineError) -> String {
     error.to_string()

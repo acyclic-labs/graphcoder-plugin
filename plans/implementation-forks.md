@@ -98,6 +98,40 @@ Remaining, in order:
 9. Docs: fork verbs in README/skill; verdict + memory updates; commit
    plugin repo; fs changes reviewed/committed by owner.
 
+## Second-mount stall: audit verdict (2026-08-31)
+
+Two independent audits + live experiments: **not a plugin bug.** Every
+plugin layer cleared (two LocalFs per store share a *shared* flock; SQLite
+busy-timeout bounds at 5s; block_in_place wiring is stricter than fsd's own;
+mount callbacks never reach our code — the second session dies during
+FUSE_INIT). Primary evidence (`~/Library/Logs/fuse-t/fuse-t.log`): the
+second `go-nfsv4` helper prints `Failed to listen: 52100` and **never
+advances to 52101**, while helpers contending with pre-existing established
+mounts walk the whole pool — a port-walk race in the vendor helper when two
+sessions start from one process in a burst. A disassembly-level suspect also
+exists one layer down (libfuse-t serializes all transport reads behind one
+process-global mutex held in blocking recv), but the poke-mount-0 unstick
+test did not confirm it as the operative mechanism here.
+
+Latent fs issues surfaced for upstream: (1) libfuse-t's `_cpid`/
+`_monitor_fd`/`_mount_wait_thread` are single globals — second mount
+clobbers them, making FIRST-session teardown unsound with two mounts;
+(2) `is_mounted` is an unbounded `stat` that can hang forever against a
+dead hard NFS mount, defeating the 10s deadline; (3) `transport_capacity_
+check` counts visible mounts, not port-holding helpers, so its "unlikely to
+be pool exhaustion" message is confidently wrong in exactly the failing
+case; (4) fs has **zero** tests mounting two sessions in one process — the
+registry fix was validated only to "second session starts", not "becomes
+visible".
+
+Decisive next fs experiment: pre-bind 52100 with an unrelated listener and
+run a SINGLE mount — if the helper walks to 52101, the walk only breaks
+against same-burst siblings (helper race); if it stalls, the pool is
+effectively one-port-per-burst and the concurrency story reframes.
+Fallbacks if vendor-limited: serialize+stagger session starts in
+`FuseTSession::start`, or helper-process-per-fork on macOS (Linux FUSE
+unaffected).
+
 ## Known risks
 
 - Writable FUSE-T semantics under agent workloads (editors, git, build

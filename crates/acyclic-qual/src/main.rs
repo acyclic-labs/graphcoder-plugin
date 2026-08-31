@@ -35,6 +35,7 @@ fn main() {
         Some("bench") => bench(&args[1..]),
         Some("restore-gen") => restore_gen(&args[1..]),
         Some("mount-smoke") => mount_smoke(&args[1..]),
+        Some("mount-smoke2") => mount_smoke2(&args[1..]),
         _ => Err(
             "usage: acyclic-qual fixture <dir> [--with-fifo] | roundtrip <src> <work> \
              | corpus <dir> <files> <mb> | bench <src> <work> [rounds]"
@@ -329,6 +330,94 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     stopped.map_err(engine_err("unmount"))?;
 
     println!("MOUNT SMOKE OK: writable native mount serves, isolates, and detaches");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mount-smoke2: TWO simultaneous native mounts from ONE process — the
+// minimal repro for the fork engine's N>1 requirement.
+// ---------------------------------------------------------------------------
+
+fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
+    use acyclic_fs_mount::{
+        mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout,
+    };
+    use std::sync::Arc;
+
+    let source = PathBuf::from(args.first().ok_or("mount-smoke2: missing <src>")?)
+        .canonicalize()?;
+    let work = PathBuf::from(args.get(1).ok_or("mount-smoke2: missing <work>")?);
+    let store_dir = work.join("store");
+    fs::create_dir_all(&store_dir)?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (volume_id, _generation) = runtime.block_on(capture_and_commit(&source, &store_dir))?;
+    let config = volume_config();
+
+    let mut sessions = Vec::new();
+    for index in 0..2u32 {
+        let mount_dir = work.join(format!("mnt{index}"));
+        fs::create_dir_all(&mount_dir)?;
+        let checkout = runtime.block_on(async {
+            let cancel = CancellationToken::new();
+            let fs_engine = LocalFs::local(LocalOptions::new(&store_dir))
+                .map_err(engine_err("open store"))?;
+            let volume = fs_engine
+                .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
+                .await
+                .map_err(engine_err("open volume"))?
+                .value;
+            let checkout = volume
+                .checkout(
+                    GenerationSelector::Head,
+                    CheckoutMode {
+                        access: AccessMode::ReadWrite,
+                        consistency: ConsistencyMode::TrackingSafe,
+                        mutations: MutationMode::PrivateOverlay,
+                    },
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
+                .await
+                .map_err(engine_err("checkout"))?
+                .value;
+            std::mem::forget(fs_engine); // keep engine alive for the mount
+            Ok::<_, Failure>(checkout)
+        })?;
+        let shared = Arc::new(SharedCheckout::new(checkout));
+        let mount_source = Arc::new(
+            CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?,
+        );
+        let started = Instant::now();
+        let session = mount_native(
+            NativeMountRequest {
+                mount_id: acyclic_fs::MountId::new(),
+                volume_id,
+                destination: mount_dir.clone(),
+                writable: true,
+            },
+            mount_source,
+        )
+        .map_err(engine_err(if index == 0 {
+            "FIRST mount"
+        } else {
+            "SECOND mount"
+        }))?;
+        println!(
+            "mount {index} attached at {} in {:?}",
+            mount_dir.display(),
+            started.elapsed()
+        );
+        let listing = fs::read_dir(&mount_dir)?.count();
+        println!("mount {index} lists {listing} entries");
+        sessions.push(session);
+    }
+
+    for (index, mut session) in sessions.into_iter().enumerate() {
+        session.stop().map_err(engine_err("unmount"))?;
+        println!("mount {index} detached");
+    }
+    println!("MOUNT SMOKE2 OK: two simultaneous sessions in one process");
     Ok(())
 }
 

@@ -12,9 +12,10 @@ now; the **M-series** (mount behavior) runs the moment mounts are back.
 - **Fork base `B`** — the published generation at fork creation. `fork`
   publishes pending state first, so every fork in one `fork -n N` call
   shares one base.
-- **Fork workspace** — a writable native mount of a fresh Head checkout at
-  `<repo-parent>/.<repo>.forks/<id>/`; writes accumulate in that checkout's
-  private overlay.
+- **Fork workspace** — a routed subdirectory `<repo-parent>/.<repo>.forks/mnt/<id>/`
+  of ONE shared native session (fs `RoutedMountSource`), backed by a fresh
+  Head checkout; writes accumulate in that checkout's private overlay. One
+  kernel mount total, regardless of N — forks are route inserts.
 - **Moved mainline** — a *published generation* other than `B` exists at
   promote time. Publishing identical content (noop commits) does not move
   the mainline: movement is judged by fs's optimistic commit against the
@@ -81,7 +82,7 @@ remove) at next start, before the store opens.
 | P3: moved mainline → legible conflict, tree untouched | `tests/fork.rs::promote_conflicts_when_mainline_moved` — real edit + durable checkpoint between fork and promote | engine integration | ✅ |
 | P4: noop mainline publishes don't fake conflicts | `tests/fork.rs::noop_commits_do_not_move_mainline` — `commit` with no changes between fork and promote, promote succeeds | engine integration | ✅ |
 | P5: fork base rows recorded; promote row recorded (I6) | asserted inside P1 | engine integration | ✅ |
-| M1: `fork -n 3` attaches 3 mounts <1s each (I7) | `forks.sh` step 1 (+ `mount` table count) | acceptance | ❌ |
+| M1: `fork -n 3` yields 3 routed workspaces under ONE mount, fast (I7) | `forks.sh` step 1 (+ `mount` table count == 1) | acceptance | ❌ |
 | M2: divergent writes isolated (I1, I2) | `forks.sh` step 2 — different content per fork, mainline + siblings unchanged | acceptance | ❌ |
 | M3: mainline usable while forks live (I3) | `forks.sh` step 3 — checkpoint + diff succeed with mounts up | acceptance | ❌ |
 | M4: promote journey end-to-end (I4, I6) | `forks.sh` step 4 — promote A, byte-verify, losers dropped, timeline row | acceptance | ❌ |

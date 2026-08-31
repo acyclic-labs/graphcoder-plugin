@@ -13,6 +13,17 @@ skip() {
   exit 0
 }
 
+# Environment hygiene: a kill -9'd daemon anywhere orphans its go-nfsv4
+# helper, and orphaned helpers wedge FUSE-T's tiny shared NFS port pool for
+# every future mount on the host. Reap acyclic helpers + mounts up front.
+if [ "$(uname -s)" = "Darwin" ]; then
+  pkill -f 'go-nfsv4.*acyclic-fs' 2>/dev/null || true
+  sleep 0.5
+  mount | awk '/fuse-t:\/acyclic-fs/{print $3}' | while read -r M; do
+    umount -f "$M" 2>/dev/null || true
+  done
+fi
+
 setup_repo
 printf 'MAINLINE\n' > "$R/src/app.txt"
 acy init >/dev/null || fail "init"
@@ -29,12 +40,14 @@ IDS=($(echo "$FORK_OUT" | awk '/^fork /{print $2}'))
 [ "${#IDS[@]}" -eq 3 ] || fail "expected 3 forks, got ${#IDS[@]}: $FORK_OUT"
 python3 -c "import sys; sys.exit(0 if float('$ELAPSED') < 5.0 else 1)" \
   || fail "3 forks took ${ELAPSED}s (>5s budget incl. base commits)"
+# Routed design: every fork is a subdirectory of ONE native session.
 MOUNTS="$(mount | grep -c "$FORKS_ROOT" || true)"
-[ "$MOUNTS" -eq 3 ] || fail "mount table shows $MOUNTS fork mounts, want 3"
+[ "$MOUNTS" -eq 1 ] || fail "mount table shows $MOUNTS fork mounts, want exactly 1 (routed)"
 
-A="$FORKS_ROOT/${IDS[0]}"
-B="$FORKS_ROOT/${IDS[1]}"
-C="$FORKS_ROOT/${IDS[2]}"
+MNT="$FORKS_ROOT/mnt"
+A="$MNT/${IDS[0]}"
+B="$MNT/${IDS[1]}"
+C="$MNT/${IDS[2]}"
 
 # --- M2: divergent writes, isolated ---------------------------------------
 printf 'FORK-A\n' > "$A/src/app.txt" || fail "write into fork A"
@@ -68,7 +81,7 @@ acy fork-drop "${IDS[0]}" >/dev/null || fail "drop stale A"
 acy fork-drop "${IDS[1]}" >/dev/null || fail "drop stale B"
 FORK_OUT="$(acy fork -n 2)" || fail "re-fork"
 IDS=($(echo "$FORK_OUT" | awk '/^fork /{print $2}'))
-A="$FORKS_ROOT/${IDS[0]}"; B="$FORKS_ROOT/${IDS[1]}"
+A="$MNT/${IDS[0]}"; B="$MNT/${IDS[1]}"
 printf 'WINNER\n' > "$A/src/app.txt" || fail "write winner"
 printf 'LOSER\n' > "$B/src/app.txt" || fail "write loser"
 

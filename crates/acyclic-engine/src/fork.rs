@@ -48,6 +48,11 @@ pub fn forks_root(repo_root: &Path) -> Option<PathBuf> {
     Some(parent.join(format!(".{name}.forks")))
 }
 
+/// The single mountpoint projecting every fork as a routed subdirectory.
+pub fn forks_mount_root(repo_root: &Path) -> Option<PathBuf> {
+    Some(forks_root(repo_root)?.join("mnt"))
+}
+
 /// Best-effort cleanup of fork dirs left by a dead daemon: unmount anything
 /// still attached, then remove the directories. Mount sessions do not
 /// survive the daemon in v1.
@@ -58,10 +63,23 @@ pub fn sweep_stale_forks(repo_root: &Path) {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
+    // FUSE-T's go-nfsv4 helpers outlive a killed daemon and wedge the
+    // vendor's tiny shared NFS port pool for every future mount on the
+    // host — reap any helper serving one of OUR workspaces first.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(format!("go-nfsv4.*{}", root.display()))
+            .status();
+    }
     for entry in entries.flatten() {
         let path = entry.path();
         #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("umount").arg(&path).status();
+        let _ = std::process::Command::new("umount")
+            .arg("-f")
+            .arg(&path)
+            .status();
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("fusermount")
