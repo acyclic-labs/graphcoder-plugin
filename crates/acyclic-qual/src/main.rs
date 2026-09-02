@@ -36,6 +36,8 @@ fn main() {
         Some("restore-gen") => restore_gen(&args[1..]),
         Some("mount-smoke") => mount_smoke(&args[1..]),
         Some("mount-smoke2") => mount_smoke2(&args[1..]),
+        Some("mount-hold") => mount_hold(&args[1..]),
+        Some("source-probe") => source_probe(&args[1..]),
         _ => Err(
             "usage: acyclic-qual fixture <dir> [--with-fifo] | roundtrip <src> <work> \
              | corpus <dir> <files> <mb> | bench <src> <work> [rounds]"
@@ -330,6 +332,144 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     stopped.map_err(engine_err("unmount"))?;
 
     println!("MOUNT SMOKE OK: writable native mount serves, isolates, and detaches");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mount-hold: attach one mount and hold it for <seconds> so failing
+// operations can be probed interactively from a shell.
+// ---------------------------------------------------------------------------
+
+fn mount_hold(args: &[String]) -> Result<(), Failure> {
+    use acyclic_fs_mount::{
+        mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout,
+    };
+    use std::sync::Arc;
+
+    let source = PathBuf::from(args.first().ok_or("mount-hold: missing <src>")?)
+        .canonicalize()?;
+    let work = PathBuf::from(args.get(1).ok_or("mount-hold: missing <work>")?);
+    let seconds: u64 = args.get(2).map_or(Ok(60), |value| value.parse())?;
+    let store_dir = work.join("store");
+    let mount_dir = work.join("mnt");
+    fs::create_dir_all(&store_dir)?;
+    fs::create_dir_all(&mount_dir)?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (volume_id, _generation) = runtime.block_on(capture_and_commit(&source, &store_dir))?;
+    let config = volume_config();
+    let checkout = runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        let fs_engine =
+            LocalFs::local(LocalOptions::new(&store_dir)).map_err(engine_err("open store"))?;
+        let volume = fs_engine
+            .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
+            .await
+            .map_err(engine_err("open volume"))?
+            .value;
+        let checkout = volume
+            .checkout(
+                GenerationSelector::Head,
+                CheckoutMode {
+                    access: AccessMode::ReadWrite,
+                    consistency: ConsistencyMode::TrackingSafe,
+                    mutations: MutationMode::PrivateOverlay,
+                },
+                WorkCounters::UNBOUNDED,
+                &cancel,
+            )
+            .await
+            .map_err(engine_err("checkout"))?
+            .value;
+        std::mem::forget(fs_engine);
+        Ok::<_, Failure>(checkout)
+    })?;
+    let shared = Arc::new(SharedCheckout::new(checkout));
+    let mount_source = Arc::new(
+        CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?,
+    );
+    let mut session = mount_native(
+        NativeMountRequest {
+            mount_id: acyclic_fs::MountId::new(),
+            volume_id,
+            destination: mount_dir.clone(),
+            writable: true,
+        },
+        mount_source,
+    )
+    .map_err(engine_err("mount"))?;
+    println!("HELD: {} for {seconds}s", mount_dir.display());
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    session.stop().map_err(engine_err("unmount"))?;
+    println!("released");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// source-probe: exercise MountFilesystem directly (no kernel, no NFS) to
+// pinpoint which callback fails and with what typed error.
+// ---------------------------------------------------------------------------
+
+fn source_probe(args: &[String]) -> Result<(), Failure> {
+    use acyclic_fs_mount::{CheckoutMountSource, MountFilesystem, MountPath, SharedCheckout};
+    use std::sync::Arc;
+
+    let source = PathBuf::from(args.first().ok_or("source-probe: missing <src>")?)
+        .canonicalize()?;
+    let work = PathBuf::from(args.get(1).ok_or("source-probe: missing <work>")?);
+    let store_dir = work.join("store");
+    fs::create_dir_all(&store_dir)?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (volume_id, _generation) = runtime.block_on(capture_and_commit(&source, &store_dir))?;
+    let config = volume_config();
+    let checkout = runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        let fs_engine =
+            LocalFs::local(LocalOptions::new(&store_dir)).map_err(engine_err("open store"))?;
+        let volume = fs_engine
+            .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
+            .await
+            .map_err(engine_err("open volume"))?
+            .value;
+        let checkout = volume
+            .checkout(
+                GenerationSelector::Head,
+                CheckoutMode {
+                    access: AccessMode::ReadWrite,
+                    consistency: ConsistencyMode::TrackingSafe,
+                    mutations: MutationMode::PrivateOverlay,
+                },
+                WorkCounters::UNBOUNDED,
+                &cancel,
+            )
+            .await
+            .map_err(engine_err("checkout"))?
+            .value;
+        std::mem::forget(fs_engine);
+        Ok::<_, Failure>(checkout)
+    })?;
+    let shared = Arc::new(SharedCheckout::new(checkout));
+    let mount_source =
+        CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?;
+
+    let readme = MountPath::root().child(b"README.md".to_vec());
+    println!("lookup(/):          {:?}", mount_source.lookup(&MountPath::root()).map(|l| l.map(|l| l.node.kind)));
+    println!("lookup(README.md):  {:?}", mount_source.lookup(&readme).map(|l| l.map(|l| (l.node.kind, l.node.logical_bytes))));
+    println!(
+        "read_directory(/):  {:?}",
+        mount_source
+            .read_directory(&MountPath::root(), None, 16)
+            .map(|p| p.entries.len())
+    );
+    match mount_source.open_file(&readme) {
+        Ok(file) => {
+            println!("open_file(README):  Ok");
+            println!("  handle.lookup():  {:?}", file.lookup().map(|l| l.node.logical_bytes));
+            println!("  read_range(0,13): {:?}", file.read_range(0, 13).map(|b| String::from_utf8_lossy(&b).into_owned()));
+        }
+        Err(error) => println!("open_file(README):  ERR {error:?}"),
+    }
     Ok(())
 }
 
@@ -640,8 +780,13 @@ fn roundtrip(args: &[String]) -> Result<(), Failure> {
 }
 
 fn volume_config() -> VolumeConfig {
+    // QUAL_PROFILE=portable switches the profile for differential debugging.
+    let profile = match std::env::var("QUAL_PROFILE").as_deref() {
+        Ok("portable") => FilesystemProfile::Portable,
+        _ => FilesystemProfile::Posix,
+    };
     let mut config = VolumeConfig {
-        profile: FilesystemProfile::Posix,
+        profile,
         ..VolumeConfig::portable(Lifecycle::Durable)
     };
     // A baseline capture is one atomic authored transaction covering every

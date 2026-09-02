@@ -10,6 +10,7 @@ dependencies = [
  "acyclic-fs-mount",
  "acyclic-proto",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

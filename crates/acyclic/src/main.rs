@@ -127,6 +127,18 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
+    // CLI verbs behave like Unix tools when a pager/grep closes the pipe
+    // early: die silently on SIGPIPE instead of panicking on stdout errors.
+    // The DAEMON must keep Rust's ignore-SIGPIPE default — mount teardown
+    // can write to closed descriptors, and default disposition would kill
+    // the whole daemon silently.
+    #[cfg(unix)]
+    if !matches!(cli.command, Command::Daemon { .. }) {
+        // SAFETY: SIG_DFL restores default disposition; no handler runs.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let repo = cli
         .repo
         .clone()

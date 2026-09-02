@@ -33,8 +33,11 @@ now; the **M-series** (mount behavior) runs the moment mounts are back.
   tree, reports a legible conflict leaving the tree untouched, or fails
   with an error leaving the tree untouched. No fourth outcome.
 - **I5 (evaporation):** dropping a fork (or stopping the daemon) leaves no
-  mount, no workspace directory, and no store garbage that a later GC
-  story couldn't collect; the mainline is byte-unchanged.
+  serving route, no mount (once the last route goes), and no store garbage
+  a later GC story couldn't collect; the mainline is byte-unchanged.
+  Caveat: the kernel may cache a dropped route's NAME as a phantom empty
+  directory until it re-validates (FSKit holds positives); the route serves
+  nothing and is unlisted — verified as `route_dead` in forks.sh.
 - **I6 (attribution):** every promote is a timeline row; a rewind can undo
   a promote like any other change.
 - **I7 (identity):** fork ids never collide with a live fork; workspace

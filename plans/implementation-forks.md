@@ -132,6 +132,49 @@ Fallbacks if vendor-limited: serialize+stagger session starts in
 `FuseTSession::start`, or helper-process-per-fork on macOS (Linux FUSE
 unaffected).
 
+## EPERM-on-open investigation (2026-08-31, handed to fs)
+
+Symptom: through any FUSE-T mount of current fs (`cc10803`+), `stat`
+works but `open` (files and dirs) fails EPERM. Bounded by elimination:
+- `acyclic-qual source-probe`: every Rust `MountFilesystem` callback
+  (lookup/readdir/open_file/read_range) returns correct data — the break
+  is between the kernel NFS client and go-nfsv4.
+- Wire: client sends LOOKUP+GETATTR (healthy: mode 0644 uid 501), then
+  NEVER sends OPEN/ACCESS — a local client-side deny keyed off something
+  advertised at mount/root time.
+- Cleared: harness config (matches fs's own tests; Portable fails the
+  same as Posix), FUSE-T binaries (unchanged since June), the router
+  (single-source identical), dot-path EPERM guard (ancient).
+- Note: earlier "passing" run was a stale pre-cc10803 binary — the
+  cc10803 mount stack has no clean pass on record.
+- Leads: go-nfsv4 cached attrs show `fileType:0`, `permissions:3`; mount
+  ROOT getattr now serves all-zero times/Gid:0 where the Aug-2 working
+  trace had real root metadata; cc10803's fuse_t.rs (+180) changed the
+  mount/attr surface.
+- Decisive next (fs-side): worktree at `cc10803^`, same mount + cat,
+  field-diff the fuse-t.log getattr/mount-option lines.
+Repro tools in acyclic-qual: mount-hold, source-probe, mount-smoke
+(oracle). Gate command once fixed:
+`ACYCLIC_FORKS_REQUIRED=1 bash tests/acceptance/forks.sh`.
+
+## GATE CLOSED (2026-09-02): forks.sh + full suite GREEN
+
+Root cause of the EPERM saga: the FUSE-T **NFS transport** is broken on
+this host (client-side deny of every open, machine-level, survives reboot,
+code-independent — proven via pre-regression worktree). The FUSE-T
+**fskit transport** works fully and is faster (8MB hydration 18ms vs 38ms).
+fs gained an `ACYCLIC_FS_FUSE_T_BACKEND` env toggle (default still nfs —
+endpoint/API decision pending upstream); the acceptance suite defaults to
+fskit. Also landed en route: `NativeMountSession::invalidate` (bridge
+`fuse_invalidate_path`), router root revision-bumping on route changes,
+daemon SIGPIPE exemption (CLI defaults SIGPIPE for pipe-friendliness; the
+daemon must not), wire-field rename (`fork` vs envelope `id`), and
+dead-route semantics in the spec (FSKit phantom-name caveat).
+
+Full suite: journey, soak 40/40, crash, latency p95 8.9ms, forks (3-way,
+isolation, promote byte-verified, legible conflict, evaporation, sweep) —
+all green on the routed single-session design.
+
 ## Known risks
 
 - Writable FUSE-T semantics under agent workloads (editors, git, build

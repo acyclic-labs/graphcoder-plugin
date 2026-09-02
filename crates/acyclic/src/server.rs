@@ -354,7 +354,9 @@ impl Server {
                         match session {
                             Ok(session) => mount.session = Some(session),
                             Err(error) => {
-                                mount.router.remove_route(id.as_bytes());
+                                tokio::task::block_in_place(|| {
+                                    mount.router.remove_route(id.as_bytes())
+                                });
                                 return Err(error);
                             }
                         }
@@ -429,7 +431,17 @@ impl Server {
     /// disappears) when the last route goes, freeing the FUSE-T pool slot.
     async fn detach_route(&self, id: &str) -> Result<(), String> {
         let mut mount = self.fork_mount.lock().await;
-        mount.router.remove_route(id.as_bytes());
+        // Dropping a route drops its CheckoutMountSource, which owns a tokio
+        // runtime — runtimes must never be dropped on an async worker.
+        tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+        // The kernel may hold a positive entry cache for the removed name
+        // (FSKit caches until told otherwise): invalidate it eagerly.
+        if let Some(session) = mount.session.as_ref() {
+            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes()))
+            {
+                eprintln!("acyclic daemon: invalidate {id}: {error:?}");
+            }
+        }
         if mount.router.is_empty() {
             if let Some(mut session) = mount.session.take() {
                 tokio::task::block_in_place(|| session.stop())

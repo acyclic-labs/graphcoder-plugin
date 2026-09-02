@@ -76,9 +76,12 @@ pub enum Op {
     },
     ForkList,
     ForkDrop {
+        /// Named `fork` on the wire: the envelope already owns `id`.
+        #[serde(rename = "fork")]
         id: String,
     },
     Promote {
+        #[serde(rename = "fork")]
         id: String,
     },
 }

@@ -24,6 +24,17 @@ if [ "$(uname -s)" = "Darwin" ]; then
   done
 fi
 
+
+# A removed route is DEAD even while the kernel's entry cache still shows
+# its name (FSKit caches positives until it decides otherwise): dead means
+# no content is served and no fork is listed. The phantom name is a
+# documented cosmetic caveat (spec I5).
+route_dead() {
+  [ -z "$(ls "$1" 2>/dev/null)" ] || return 1
+  acy forks | grep -q "$2" && return 1
+  return 0
+}
+
 setup_repo
 printf 'MAINLINE\n' > "$R/src/app.txt"
 acy init >/dev/null || fail "init"
@@ -63,13 +74,15 @@ printf 'extra\n' > "$C/only-in-c.txt" || fail "write into fork C"
 printf 'MAINLINE-NOTE\n' > "$R/note.txt"
 sleep 0.4
 acy checkpoint --wait --kind post >/dev/null || fail "I3: mainline checkpoint"
-rm "$R/note.txt"
+# A durable checkpoint PUBLISHES the change: the mainline has now truly
+# moved past every fork's base (spec: movement = published generation).
+printf 'MAINLINE-NOTE-2\n' > "$R/note.txt"
 sleep 0.4
-acy checkpoint --wait --kind post >/dev/null || fail "I3: second checkpoint"
+acy checkpoint --wait --durable >/dev/null || fail "I3: durable checkpoint"
 
 # --- M5 first (so M4's promote still applies cleanly): conflict path ------
-# The two checkpoints above moved the mainline past every fork's base, so
-# promoting C now must conflict legibly and touch nothing.
+# The published movement above means promoting C must conflict legibly and
+# touch nothing.
 if OUT="$(acy promote "${IDS[2]}" 2>&1)"; then
   fail "M5: promote after mainline moved should conflict: $OUT"
 fi
@@ -89,12 +102,13 @@ printf 'LOSER\n' > "$B/src/app.txt" || fail "write loser"
 acy promote "${IDS[0]}" >/dev/null || fail "M4: promote"
 [ "$(cat "$R/src/app.txt")" = "WINNER" ] || fail "M4: promoted content missing"
 [ "$(cat "$R/.env")" = "SECRET=1" ] || fail "M4: gitignored state lost"
-acy timeline | grep -q "promote fork ${IDS[0]}" || fail "M4/I6: no promote row"
-[ ! -d "$A" ] || fail "M4: promoted workspace not removed"
+TL="$(acy timeline)"
+echo "$TL" | grep -q "promote fork ${IDS[0]}" || fail "M4/I6: no promote row: $TL"
+route_dead "$A" "${IDS[0]}" || fail "M4: promoted fork still serves"
 
 # --- M6: evaporation + crash sweep ---------------------------------------
 acy fork-drop "${IDS[1]}" >/dev/null || fail "M6: fork-drop"
-[ ! -d "$B" ] || fail "M6: dropped workspace remains"
+route_dead "$B" "${IDS[1]}" || fail "M6: dropped fork still serves"
 [ "$(mount | grep -c "$FORKS_ROOT" || true)" -eq 0 ] || fail "M6: mounts remain"
 
 FORK_OUT="$(acy fork -n 1)" || fail "M6: fork for crash test"
