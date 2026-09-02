@@ -13,11 +13,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-acyclic-fs = { path = "../fs/crates/sdk", features = ["local", "native-watch"] }
-acyclic-fs-mount = { path = "../fs/crates/mount" }
+acyclic-fs = { path = "../fs/crates/sdk", features = ["local", "native-watch", "native-mount"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 
-# Mirror the fs workspace's fuser patch (FUSE-T wire dialect on macOS) so the
-# imported mount crate builds against the same fuser it was qualified with.
-[patch.crates-io]
-fuser = { path = "../fs/vendor/fuser" }

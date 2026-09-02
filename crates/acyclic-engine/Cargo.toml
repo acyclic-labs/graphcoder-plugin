@@ -8,7 +8,6 @@ description = "Rewind engine: capture pipeline, checkpoint index, rewind, and di
 
 [dependencies]
 acyclic-fs.workspace = true
-acyclic-fs-mount.workspace = true
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

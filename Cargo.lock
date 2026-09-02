@@ -7,7 +7,7 @@ name = "acyclic"
 version = "0.0.1"
 dependencies = [
  "acyclic-engine",
- "acyclic-fs-mount",
+ "acyclic-fs",
  "acyclic-proto",
  "clap",
  "libc",
@@ -22,7 +22,6 @@ name = "acyclic-engine"
 version = "0.0.1"
 dependencies = [
  "acyclic-fs",
- "acyclic-fs-mount",
  "blake3",
  "bytes",
  "hex",
@@ -44,34 +43,19 @@ dependencies = [
  "bytes",
  "cap-primitives",
  "cap-std",
+ "cc",
  "fs2",
+ "fuser",
  "hex",
  "libc",
  "notify",
+ "pkg-config",
  "rusqlite",
  "serde",
  "thiserror",
  "tokio",
  "unicode-normalization",
  "uuid",
- "windows",
-]
-
-[[package]]
-name = "acyclic-fs-mount"
-version = "0.1.0-rc.1"
-dependencies = [
- "acyclic-fs",
- "bytes",
- "cap-primitives",
- "cap-std",
- "cc",
- "fuser",
- "hex",
- "libc",
- "pkg-config",
- "thiserror",
- "tokio",
  "windows",
 ]
 
@@ -88,7 +72,6 @@ name = "acyclic-qual"
 version = "0.0.1"
 dependencies = [
  "acyclic-fs",
- "acyclic-fs-mount",
  "tokio",
 ]
 
@@ -380,6 +363,8 @@ dependencies = [
 [[package]]
 name = "fuser"
 version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb29a3ae32279fe3e79a958fe01899f5fb23eadccee919cf88e145b54ed9367"
 dependencies = [
  "libc",
  "log",

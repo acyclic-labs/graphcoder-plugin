@@ -8,7 +8,7 @@ description = "Agent-native state engine: checkpoints, rewind, and blast-radius 
 
 [dependencies]
 acyclic-engine = { path = "../acyclic-engine" }
-acyclic-fs-mount.workspace = true
+acyclic-fs.workspace = true
 acyclic-proto = { path = "../acyclic-proto" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

@@ -10,7 +10,7 @@ use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
-use acyclic_fs_mount::{
+use acyclic_fs::{
     mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
     RoutedMountSource,
 };

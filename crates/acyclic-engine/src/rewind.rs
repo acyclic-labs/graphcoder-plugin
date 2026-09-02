@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
-use acyclic_fs_mount::{materialize_checkout, MaterializeOptions};
+use acyclic_fs::{materialize_checkout, MaterializeOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::store::Store;

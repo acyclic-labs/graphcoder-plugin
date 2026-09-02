@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use acyclic_fs::{GenerationId, LocalAuthorityBackend, LocalObjectBackend, VolumeId};
 use acyclic_fs::model::VolumeConfig;
-use acyclic_fs_mount::SharedCheckout;
+use acyclic_fs::SharedCheckout;
 
 /// The mount-safe checkout wrapper for the local backend.
 pub type SharedLocalCheckout = SharedCheckout<LocalAuthorityBackend, LocalObjectBackend>;

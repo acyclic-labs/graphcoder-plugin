@@ -21,7 +21,7 @@ use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, LocalFs, LocalOptions, OperationId,
     VolumeId, WorkCounters,
 };
-use acyclic_fs_mount::{
+use acyclic_fs::{
     capture_baseline, capture_root_identity, materialize_checkout, CaptureOptions,
     MaterializeOptions,
 };
@@ -209,7 +209,7 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_smoke(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs_mount::{
+    use acyclic_fs::{
         mount_native, probe_native_mount, CheckoutMountSource, NativeMountRequest, SharedCheckout,
     };
     use std::sync::Arc;
@@ -341,7 +341,7 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_hold(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs_mount::{
+    use acyclic_fs::{
         mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout,
     };
     use std::sync::Arc;
@@ -411,7 +411,7 @@ fn mount_hold(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn source_probe(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs_mount::{CheckoutMountSource, MountFilesystem, MountPath, SharedCheckout};
+    use acyclic_fs::{CheckoutMountSource, MountFilesystem, MountPath, SharedCheckout};
     use std::sync::Arc;
 
     let source = PathBuf::from(args.first().ok_or("source-probe: missing <src>")?)
@@ -479,7 +479,7 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs_mount::{
+    use acyclic_fs::{
         mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout,
     };
     use std::sync::Arc;
@@ -698,7 +698,7 @@ async fn bench_inner(source: &Path, store_dir: &Path, rounds: usize) -> Result<(
         event_latency.push(mutated_at.elapsed());
 
         let capture_started = Instant::now();
-        acyclic_fs_mount::capture_watch_batch(
+        acyclic_fs::capture_watch_batch(
             &mut checkout,
             batch,
             &options,

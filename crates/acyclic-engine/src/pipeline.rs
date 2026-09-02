@@ -13,7 +13,7 @@ use acyclic_fs::{
     OperationId, WatchBatch, WorkCounters,
 };
 use acyclic_fs::model::VolumeLimits;
-use acyclic_fs_mount::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
+use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
 use tokio::sync::{mpsc, oneshot};
 
 use std::sync::Arc;
