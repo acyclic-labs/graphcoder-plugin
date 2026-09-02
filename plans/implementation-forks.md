@@ -157,6 +157,15 @@ Repro tools in acyclic-qual: mount-hold, source-probe, mount-smoke
 (oracle). Gate command once fixed:
 `ACYCLIC_FORKS_REQUIRED=1 bash tests/acceptance/forks.sh`.
 
+## FS MAINLINE LANDED (2026-09-02): qualified against fs main @ 10941bf
+
+The complete mount feature set (RoutedMountSource incl. Windows
+portability, NativeMountSession::invalidate, ACYCLIC_FS_FUSE_T_BACKEND,
+qualification counts) is on fs main via its own qualified PRs (#34-#36);
+the parallel branch PR #4 was closed as superseded. Plugin revalidated
+against main unmodified: workspace tests + full acceptance suite green.
+This commit is the fs rev the milestone is qualified against.
+
 ## GATE CLOSED (2026-09-02): forks.sh + full suite GREEN
 
 Root cause of the EPERM saga: the FUSE-T **NFS transport** is broken on
