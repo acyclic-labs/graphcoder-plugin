@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod diff;
+pub mod fork;
 pub mod index;
 pub mod pipeline;
 pub mod rewind;
@@ -19,7 +20,7 @@ pub mod store;
 
 use thiserror::Error;
 
-pub use acyclic_fs::GenerationId;
+pub use acyclic_fs::{GenerationId, MountId};
 
 /// Canonical hex form of a generation id for display and wire use.
 pub fn generation_hex(generation: GenerationId) -> String {

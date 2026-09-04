@@ -5,6 +5,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ACYCLIC_BIN:-$REPO_ROOT/target/debug/acyclic}"
+# The FUSE-T NFS transport is broken on some hosts (persistent client-side
+# EPERM on open, surviving reboot); the fskit transport works and is faster.
+# Tests default to fskit; override to exercise nfs explicitly.
+export ACYCLIC_FS_FUSE_T_BACKEND="${ACYCLIC_FS_FUSE_T_BACKEND:-fskit}"
 QUAL="${ACYCLIC_QUAL:-$REPO_ROOT/target/debug/acyclic-qual}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/acyclic-acceptance.XXXXXX")"
