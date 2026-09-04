@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Linux validation without leaving the Mac: build and run the full test +
-# acceptance suite inside a Linux container. Sources are mounted read-only
-# in the sibling layout the path deps expect; all build artifacts and test
-# state stay on container-local filesystems (which is also what exercises
-# renameat2(RENAME_EXCHANGE) and inotify on a Linux kernel for real).
+# acceptance suite inside a Linux container. acyclic-fs is fetched from its
+# own public git repo (see Cargo.toml), not a sibling checkout; all build
+# artifacts and test state stay on container-local filesystems (which is
+# also what exercises renameat2(RENAME_EXCHANGE) and inotify on a Linux
+# kernel for real).
 #
 # Usage: scripts/docker-linux.sh [image]
 set -euo pipefail
 
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FS="$(cd "$PLUGIN/../fs" && pwd)"
 IMAGE="${1:-rust:1-bookworm}"
 
 # FUSE inside the container (fork mounts): pass the device + cap when the
@@ -21,12 +21,12 @@ fi
 
 docker run --rm \
   "${FUSE_FLAGS[@]}" \
-  -v "$FS:/src/fs:ro" \
   -v "$PLUGIN:/src/graphcoder-plugin:ro" \
   -v acyclic-linux-cargo:/cargo \
   -v acyclic-linux-target:/build \
   -e CARGO_HOME=/cargo \
   -e CARGO_TARGET_DIR=/build/target \
+  -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
   "$IMAGE" bash -eu -o pipefail -c '
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null
