@@ -73,6 +73,9 @@ pub enum Op {
     Fork {
         #[serde(default = "default_fork_count")]
         count: u32,
+        /// Owning session, for scratch-tree auto-drop on session end.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     ForkList,
     ForkDrop {
@@ -83,6 +86,26 @@ pub enum Op {
     Promote {
         #[serde(rename = "fork")]
         id: String,
+    },
+    /// Safe Mode: forks one checkout and mounts it directly at the repo
+    /// root for the session's duration (see `dry_run` in `.acyclic/config.toml`).
+    SessionFork {
+        session_id: String,
+    },
+    /// Safe Mode: unmounts the session's shadow mount, commits its overlay,
+    /// and returns the resulting diff without touching the real tree yet.
+    /// The fork is held pending `SessionApply`/`SessionDiscard`.
+    SessionResolve {
+        session_id: String,
+    },
+    /// Safe Mode: applies a `SessionResolve`d session's changes to the real
+    /// tree (the deferred half of promote).
+    SessionApply {
+        session_id: String,
+    },
+    /// Safe Mode: discards a `SessionResolve`d session without applying it.
+    SessionDiscard {
+        session_id: String,
     },
 }
 
@@ -130,6 +153,14 @@ pub enum Reply {
     Diff(Vec<DiffEntry>),
     Forks(Vec<ForkEntry>),
     Promote(PromoteInfo),
+    /// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`.
+    SessionPending(SessionPendingInfo),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionPendingInfo {
+    pub session_id: String,
+    pub diff: Vec<DiffEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +170,9 @@ pub struct ForkEntry {
     /// Hex of the published generation the fork was cut from.
     pub base: String,
     pub created_at: i64,
+    /// Owning session, if this is a scratch tree tied to one.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

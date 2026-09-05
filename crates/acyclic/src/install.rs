@@ -23,8 +23,7 @@ pub fn run(repo: &Path, host: &str) -> Result<(), String> {
 fn claude_code(repo: &Path) -> Result<(), String> {
     let claude_dir = repo.join(".claude");
     std::fs::create_dir_all(claude_dir.join("commands")).map_err(stringify)?;
-    std::fs::create_dir_all(claude_dir.join("skills/acyclic-self-rollback"))
-        .map_err(stringify)?;
+    std::fs::create_dir_all(claude_dir.join("skills/acyclic-self-rollback")).map_err(stringify)?;
 
     merge_hooks(&claude_dir.join("settings.json"))?;
     std::fs::write(claude_dir.join("commands/rewind.md"), REWIND_COMMAND).map_err(stringify)?;
@@ -34,7 +33,10 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     )
     .map_err(stringify)?;
 
-    println!("claude-code adapter installed into {}", claude_dir.display());
+    println!(
+        "claude-code adapter installed into {}",
+        claude_dir.display()
+    );
     println!("  hooks:    .claude/settings.json (pre/post tool + session)");
     println!("  command:  /rewind");
     println!("  skill:    acyclic-self-rollback");
@@ -54,8 +56,16 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
     };
 
     let events: [(&str, Option<&str>, &str); 4] = [
-        ("PreToolUse", Some("Edit|Write|MultiEdit|NotebookEdit|Bash"), "acyclic hook pre-tool"),
-        ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit|Bash"), "acyclic hook post-tool"),
+        (
+            "PreToolUse",
+            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            "acyclic hook pre-tool",
+        ),
+        (
+            "PostToolUse",
+            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            "acyclic hook post-tool",
+        ),
         ("SessionStart", None, "acyclic hook session-start"),
         ("SessionEnd", None, "acyclic hook session-end"),
     ];
@@ -96,9 +106,7 @@ fn is_ours(entry: &Value) -> bool {
         .into_iter()
         .flatten()
         .filter_map(|hook| hook["command"].as_str())
-        .any(|command| {
-            command == "acyclic" || command.starts_with("acyclic hook")
-        })
+        .any(|command| command == "acyclic" || command.starts_with("acyclic hook"))
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
@@ -213,15 +221,14 @@ mod tests {
         merge_hooks(&settings).expect("second merge");
 
         let value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).expect("read"))
-                .expect("json");
+            serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
         // User content survives — including a hook that merely MENTIONS the
         // phrase "acyclic hook" in an argument.
         assert_eq!(value["permissions"]["allow"][0], "Bash(ls:*)");
         let pre = value["hooks"]["PreToolUse"].as_array().expect("array");
-        assert!(pre.iter().any(|entry| {
-            entry["hooks"][0]["command"] == "echo acyclic hook mention"
-        }));
+        assert!(pre
+            .iter()
+            .any(|entry| { entry["hooks"][0]["command"] == "echo acyclic hook mention" }));
         // Exactly one of ours per event, no duplicates after re-install.
         let ours = |event: &str| {
             value["hooks"][event]
@@ -242,8 +249,7 @@ mod tests {
         let settings = dir.path().join("settings.json");
         merge_hooks(&settings).expect("merge");
         let value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).expect("read"))
-                .expect("json");
+            serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
         assert_eq!(
             value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             "acyclic hook post-tool"

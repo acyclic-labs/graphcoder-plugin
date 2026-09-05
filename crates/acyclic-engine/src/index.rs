@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use acyclic_fs::{Digest, GenerationId};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{EngineError, Result};
 
@@ -73,7 +73,11 @@ impl CheckpointKind {
             "recovered" => Self::Recovered,
             "failed" => Self::Failed,
             "noop" => Self::Noop,
-            other => return Err(EngineError::Store(format!("unknown checkpoint kind {other}"))),
+            other => {
+                return Err(EngineError::Store(format!(
+                    "unknown checkpoint kind {other}"
+                )))
+            }
         })
     }
 }
@@ -304,8 +308,7 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow>
         id: row.get(0)?,
         generation: GenerationId::new(Digest::from_bytes(bytes)),
         created_at: row.get(2)?,
-        kind: CheckpointKind::parse(&kind_text)
-            .map_err(|error| corrupt(&error.to_string()))?,
+        kind: CheckpointKind::parse(&kind_text).map_err(|error| corrupt(&error.to_string()))?,
         published: row.get::<_, i64>(4)? != 0,
         session_id: row.get(5)?,
         tool_call_id: row.get(6)?,
@@ -341,7 +344,11 @@ mod tests {
             ..Attribution::default()
         };
         index
-            .record(generation(1), CheckpointKind::Baseline, &Attribution::default())
+            .record(
+                generation(1),
+                CheckpointKind::Baseline,
+                &Attribution::default(),
+            )
             .expect("baseline");
         let post_id = index
             .record(generation(2), CheckpointKind::Post, &attribution)
@@ -375,12 +382,24 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut index = Index::open(&dir.path().join("index.db")).expect("open");
         let a = Attribution::default();
-        index.record(generation(1), CheckpointKind::Baseline, &a).expect("row");
-        let post = index.record(generation(2), CheckpointKind::Post, &a).expect("row");
-        index.record(generation(2), CheckpointKind::Noop, &a).expect("row");
-        index.record(generation(2), CheckpointKind::PreRewind, &a).expect("row");
-        index.record(generation(3), CheckpointKind::Recovered, &a).expect("row");
-        index.record_failure(generation(3), "boom", &a).expect("row");
+        index
+            .record(generation(1), CheckpointKind::Baseline, &a)
+            .expect("row");
+        let post = index
+            .record(generation(2), CheckpointKind::Post, &a)
+            .expect("row");
+        index
+            .record(generation(2), CheckpointKind::Noop, &a)
+            .expect("row");
+        index
+            .record(generation(2), CheckpointKind::PreRewind, &a)
+            .expect("row");
+        index
+            .record(generation(3), CheckpointKind::Recovered, &a)
+            .expect("row");
+        index
+            .record_failure(generation(3), "boom", &a)
+            .expect("row");
 
         let target = index.latest_target().expect("query").expect("some");
         assert_eq!(target.id, post);
@@ -392,8 +411,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut index = Index::open(&dir.path().join("index.db")).expect("open");
         let a = Attribution::default();
-        let ok = index.record(generation(1), CheckpointKind::Post, &a).expect("row");
-        let bad = index.record_failure(generation(1), "boom", &a).expect("row");
+        let ok = index
+            .record(generation(1), CheckpointKind::Post, &a)
+            .expect("row");
+        let bad = index
+            .record_failure(generation(1), "boom", &a)
+            .expect("row");
         assert!(index.by_id(ok).expect("q").expect("s").is_restorable());
         assert!(!index.by_id(bad).expect("q").expect("s").is_restorable());
     }

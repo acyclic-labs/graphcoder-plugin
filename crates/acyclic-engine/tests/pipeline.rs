@@ -21,6 +21,7 @@ fn fast_config() -> Config {
         commit_idle_ms: 60_000,
         trash_ttl_days: 1,
         store_dir: None,
+        ..Config::default()
     }
 }
 
@@ -49,8 +50,7 @@ fn checkpoint_rewind_journey() {
 
         // Simulate an agent turn: edit + new gitignored artifact + delete.
         let repo_root = repo.path();
-        std::fs::write(repo_root.join("src/main.rs"), b"fn main() { changed(); }\n")
-            .expect("edit");
+        std::fs::write(repo_root.join("src/main.rs"), b"fn main() { changed(); }\n").expect("edit");
         std::fs::write(repo_root.join("generated.bin"), vec![7u8; 4096]).expect("generate");
         std::fs::remove_file(repo_root.join(".env")).expect("delete");
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -106,18 +106,15 @@ fn checkpoint_rewind_journey() {
     thread.join().expect("pipeline thread");
 
     // Diff runs against the reopened store (no daemon needed).
-    let store = runtime.block_on(Store::open(paths.clone())).expect("reopen");
+    let store = runtime
+        .block_on(Store::open(paths.clone()))
+        .expect("reopen");
     let changes = runtime
         .block_on(diff::diff(&store, pre_generation, post_generation))
         .expect("diff");
     let by_name: Vec<(String, ChangeKind)> = changes
         .iter()
-        .map(|change| {
-            (
-                change.path.to_string_lossy().into_owned(),
-                change.change,
-            )
-        })
+        .map(|change| (change.path.to_string_lossy().into_owned(), change.change))
         .collect();
     assert!(by_name.contains(&("src/main.rs".into(), ChangeKind::Modified)));
     assert!(by_name.contains(&("generated.bin".into(), ChangeKind::Added)));
@@ -165,5 +162,8 @@ fn enqueued_checkpoint_survives_immediate_shutdown() {
     let index = Index::open(&paths.index_db()).expect("reopen index");
     let latest = index.latest().expect("query").expect("row");
     assert_eq!(latest.kind, CheckpointKind::Post);
-    assert!(latest.published, "shutdown commit must cover the enqueued row");
+    assert!(
+        latest.published,
+        "shutdown commit must cover the enqueued row"
+    );
 }

@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use acyclic_fs::{GenerationId, LocalAuthorityBackend, LocalObjectBackend, VolumeId};
 use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::SharedCheckout;
+use acyclic_fs::{GenerationId, LocalAuthorityBackend, LocalObjectBackend, VolumeId};
 
 /// The mount-safe checkout wrapper for the local backend.
 pub type SharedLocalCheckout = SharedCheckout<LocalAuthorityBackend, LocalObjectBackend>;
@@ -37,6 +37,21 @@ pub enum PromoteOutcome {
     },
     /// The mainline moved past the fork's base — v1 surfaces the conflict
     /// legibly instead of merging.
+    Conflict { message: String },
+}
+
+/// Result of the commit half of a Safe Mode session resolve (see
+/// [`crate::pipeline::PipelineHandle::resolve_session`]) — the swap itself
+/// is deferred to a separate `apply_session` call so the caller can show an
+/// approval-gated diff in between.
+#[derive(Clone, Debug)]
+pub enum SessionResolveOutcome {
+    /// The overlay committed cleanly; `generation` is ready for
+    /// `apply_session`, or can simply be left unswapped (Safe Mode reject).
+    Resolved { generation: GenerationId },
+    /// Nothing was written; there is nothing to diff or apply.
+    NoChanges,
+    /// The mainline moved past the fork's base — same v1 stance as promote.
     Conflict { message: String },
 }
 
@@ -90,6 +105,28 @@ pub fn sweep_stale_forks(repo_root: &Path) {
         let _ = std::fs::remove_dir_all(&path);
     }
     let _ = std::fs::remove_dir(&root);
+}
+
+/// Best-effort cleanup of a Safe Mode shadow mount a dead daemon left
+/// directly on `repo_root` itself. Unlike [`sweep_stale_forks`], the
+/// directory is never removed here -- it IS the real repo -- only
+/// force-unmounted so its real content reappears. A no-op if nothing is
+/// mounted there.
+pub fn sweep_stale_dry_session(repo_root: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("umount")
+            .arg("-f")
+            .arg(repo_root)
+            .status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("fusermount")
+            .arg("-u")
+            .arg(repo_root)
+            .status();
+    }
 }
 
 #[cfg(test)]

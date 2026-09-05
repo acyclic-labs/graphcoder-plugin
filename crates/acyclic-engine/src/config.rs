@@ -22,6 +22,12 @@ pub struct Config {
     pub trash_ttl_days: u32,
     /// Override for the store directory (defaults to the per-machine root).
     pub store_dir: Option<String>,
+    /// Safe Mode: root every session in a fork by default, gated on an
+    /// approved diff before anything reaches the real tree.
+    pub dry_run: bool,
+    /// Safe Mode: path prefixes (relative to the repo root) no fork or
+    /// scratch tree may write to, enforced at the native mount layer.
+    pub guarded_paths: Vec<String>,
 }
 
 impl Default for Config {
@@ -33,6 +39,8 @@ impl Default for Config {
             commit_idle_ms: 60_000,
             trash_ttl_days: 7,
             store_dir: None,
+            dry_run: false,
+            guarded_paths: Vec::new(),
         }
     }
 }
@@ -91,6 +99,20 @@ mod tests {
         assert_eq!(config.commit_every, 5);
         // Unspecified keys keep their defaults.
         assert_eq!(config.trash_ttl_days, Config::default().trash_ttl_days);
+    }
+
+    #[test]
+    fn safe_mode_fields_parse_from_repo_config() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::write(
+            repo.path().join(".acyclic/config.toml"),
+            "dry_run = true\nguarded_paths = [\".env\", \"migrations/\"]\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(None, repo.path()).expect("load");
+        assert!(config.dry_run);
+        assert_eq!(config.guarded_paths, vec![".env", "migrations/"]);
     }
 
     #[test]

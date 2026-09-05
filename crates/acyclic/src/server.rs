@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acyclic_engine::config::Config;
-use acyclic_engine::fork::{self, PromoteOutcome, SharedLocalCheckout};
+use acyclic_engine::fork::{self, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
+use acyclic_engine::guard::GuardedMountFilesystem;
 use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
 use acyclic_fs::{
-    mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
-    RoutedMountSource,
+    mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
+    NativeMountRequest, NativeMountSession, RoutedMountSource,
 };
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,6 +28,26 @@ struct ForkState {
     shared: Arc<SharedLocalCheckout>,
     base: acyclic_engine::GenerationId,
     entry: proto::ForkEntry,
+}
+
+/// One Safe Mode session: its fork and the shadow mount that projects it
+/// directly at the real repo root for the session's duration. Only one can
+/// be active at a time -- shadowing is a whole-path substitution, so two
+/// sessions can't both shadow the same repo root concurrently.
+struct DrySession {
+    fork_id: String,
+    session_id: String,
+    shared: Arc<SharedLocalCheckout>,
+    base: acyclic_engine::GenerationId,
+    mount: NativeMountSession,
+}
+
+/// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`. Its
+/// overlay is already committed to the store under `generation`; nothing
+/// has touched the real tree yet.
+struct PendingSession {
+    generation: acyclic_engine::GenerationId,
+    label: String,
 }
 
 /// The one native session projecting every fork through the router.
@@ -47,6 +68,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // mounted (fork sessions do not survive the daemon).
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     fork::sweep_stale_forks(repo_root);
+    fork::sweep_stale_dry_session(repo_root);
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let store = runtime
@@ -54,7 +76,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let repo_root = store.repo_root.clone();
     let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;
-    let (handle, pipeline_thread) = pipeline::spawn(store, index, config);
+    let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
 
     // Socket + pidfile. A stale socket from a dead daemon is removed; a live
     // one refuses the second daemon via bind failure after removal race.
@@ -71,12 +93,15 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         index_db: paths.index_db(),
         store_root: paths.root.clone(),
         repo_root,
+        config,
         shutdown: shutdown.clone(),
         forks: Arc::new(Mutex::new(HashMap::new())),
         fork_mount: Arc::new(Mutex::new(ForkMount {
             router: Arc::new(RoutedMountSource::new()),
             session: None,
         })),
+        dry_session: Arc::new(Mutex::new(None)),
+        pending: Arc::new(Mutex::new(HashMap::new())),
     };
 
     runtime.block_on(async move {
@@ -106,9 +131,14 @@ struct Server {
     index_db: PathBuf,
     store_root: PathBuf,
     repo_root: PathBuf,
+    config: Config,
     shutdown: Arc<Notify>,
     forks: Arc<Mutex<HashMap<String, ForkState>>>,
     fork_mount: Arc<Mutex<ForkMount>>,
+    /// The one active Safe Mode session shadow-mounted at `repo_root`, if any.
+    dry_session: Arc<Mutex<Option<DrySession>>>,
+    /// Sessions that resolved (committed) but haven't been applied/discarded.
+    pending: Arc<Mutex<HashMap<String, PendingSession>>>,
 }
 
 impl Server {
@@ -255,34 +285,43 @@ impl Server {
                     .await
                     .map_err(stringify)?;
                 Ok(proto::Reply::Diff(
-                    changes
-                        .into_iter()
-                        .map(|change| proto::DiffEntry {
-                            path: change.path.display().to_string(),
-                            change: match change.change {
-                                acyclic_engine::diff::ChangeKind::Added => "added",
-                                acyclic_engine::diff::ChangeKind::Removed => "removed",
-                                acyclic_engine::diff::ChangeKind::Modified => "modified",
-                                acyclic_engine::diff::ChangeKind::MetadataOnly => "metadata",
-                            }
-                            .to_string(),
-                            file_kind: format!("{:?}", change.file_kind).to_lowercase(),
-                        })
-                        .collect(),
+                    changes.into_iter().map(diff_entry).collect(),
                 ))
             }
             proto::Op::SessionStart { session_id, host } => {
                 self.handle
-                    .session_started(session_id, host)
+                    .session_started(session_id.clone(), host)
                     .await
                     .map_err(stringify)?;
+                if self.config.dry_run {
+                    self.session_fork(session_id).await?;
+                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionEnd { session_id } => {
                 self.handle
-                    .session_ended(session_id)
+                    .session_ended(session_id.clone())
                     .await
                     .map_err(stringify)?;
+                // Scratch trees are tagged with their owning session and
+                // never meant to be promoted: best-effort drop, log rather
+                // than fail session-end over a leaked mount.
+                let scratch_ids: Vec<String> = self
+                    .forks
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(_, fork)| {
+                        fork.entry.session_id.as_deref() == Some(session_id.as_str())
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in scratch_ids {
+                    self.forks.lock().await.remove(&id);
+                    if let Err(error) = self.detach_route(&id).await {
+                        eprintln!("acyclic daemon: drop scratch fork {id}: {error}");
+                    }
+                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Commit => {
@@ -290,6 +329,13 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Stop => {
+                // Unmount an active Safe Mode shadow first: it sits directly
+                // on the real repo root, so this must never be left mounted
+                // once the daemon that owns it is gone.
+                if let Some(mut session) = self.dry_session.lock().await.take() {
+                    let _ = tokio::task::block_in_place(|| session.mount.stop());
+                }
+                self.pending.lock().await.clear();
                 // Detach the fork session before the pipeline goes away: its
                 // callback runtimes reach into the shared checkouts.
                 self.forks.lock().await.clear();
@@ -304,7 +350,7 @@ impl Server {
                 self.shutdown.notify_one();
                 Ok(proto::Reply::Unit)
             }
-            proto::Op::Fork { count } => {
+            proto::Op::Fork { count, session_id } => {
                 if count == 0 || count > 16 {
                     return Err("fork count must be 1..=16".into());
                 }
@@ -318,25 +364,32 @@ impl Server {
                     // keep it (and any mount syscall) off async workers.
                     let shared = Arc::clone(&seed.shared);
                     let config = seed.config;
+                    let guarded_paths = self.config.guarded_paths.clone();
                     let source = tokio::task::block_in_place(move || {
-                        CheckoutMountSource::new(shared, config)
-                            .map_err(|error| format!("mount source: {error:?}"))
+                        let source = CheckoutMountSource::new(shared, config)
+                            .map_err(|error| format!("mount source: {error:?}"))?;
+                        Ok::<Arc<dyn MountFilesystem>, String>(
+                            if GuardedMountFilesystem::is_active(&guarded_paths) {
+                                Arc::new(GuardedMountFilesystem::new(
+                                    Arc::new(source),
+                                    &guarded_paths,
+                                ))
+                            } else {
+                                Arc::new(source)
+                            },
+                        )
                     })?;
                     let mut mount = self.fork_mount.lock().await;
                     mount
                         .router
-                        .add_route(
-                            id.clone().into_bytes(),
-                            Arc::new(source) as Arc<dyn MountFilesystem>,
-                        )
+                        .add_route(id.clone().into_bytes(), source)
                         .map_err(|error| format!("route: {error:?}"))?;
                     // The ONE session, mounted lazily on the first fork. A
                     // route insert is all later forks pay.
                     if mount.session.is_none() {
                         let _ = std::fs::remove_dir_all(&root);
                         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-                        let router =
-                            Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
+                        let router = Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
                         let volume_id = seed.volume_id;
                         let dest = root.clone();
                         let session = tokio::task::block_in_place(move || {
@@ -367,6 +420,7 @@ impl Server {
                         path: root.join(&id).display().to_string(),
                         base: acyclic_engine::generation_hex(seed.base),
                         created_at: unix_now(),
+                        session_id: session_id.clone(),
                     };
                     self.forks.lock().await.insert(
                         id,
@@ -382,9 +436,11 @@ impl Server {
             }
             proto::Op::ForkList => {
                 let forks = self.forks.lock().await;
-                let mut entries: Vec<proto::ForkEntry> =
-                    forks.values().map(|fork| clone_entry(&fork.entry)).collect();
-                entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                let mut entries: Vec<proto::ForkEntry> = forks
+                    .values()
+                    .map(|fork| clone_entry(&fork.entry))
+                    .collect();
+                entries.sort_by_key(|entry| entry.created_at);
                 Ok(proto::Reply::Forks(entries))
             }
             proto::Op::ForkDrop { id } => {
@@ -412,19 +468,147 @@ impl Server {
                     .await
                     .map_err(stringify)?;
                 match outcome {
-                    PromoteOutcome::Promoted { generation, old_tree } => {
-                        Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(generation),
-                            old_tree: old_tree.map(|path| path.display().to_string()),
-                            warning:
-                                "reload your editor: open files still point at the replaced tree"
-                                    .into(),
-                        }))
-                    }
+                    PromoteOutcome::Promoted {
+                        generation,
+                        old_tree,
+                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
+                        generation: acyclic_engine::generation_hex(generation),
+                        old_tree: old_tree.map(|path| path.display().to_string()),
+                        warning: "reload your editor: open files still point at the replaced tree"
+                            .into(),
+                    })),
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
             }
+            proto::Op::SessionFork { session_id } => {
+                self.session_fork(session_id).await?;
+                Ok(proto::Reply::Unit)
+            }
+            proto::Op::SessionResolve { session_id } => {
+                let mut slot = self.dry_session.lock().await;
+                let session = slot
+                    .take()
+                    .filter(|session| session.session_id == session_id)
+                    .ok_or_else(|| format!("no active Safe Mode session {session_id}"))?;
+                drop(slot);
+                // Unmount first: the real tree must reappear before we ask
+                // the engine to touch it, and no new writes can race the
+                // commit below.
+                let DrySession {
+                    fork_id,
+                    session_id,
+                    shared,
+                    base,
+                    mut mount,
+                } = session;
+                tokio::task::block_in_place(|| mount.stop())
+                    .map_err(|error| format!("unmount: {error:?}"))?;
+                let label = format!("safe mode session {fork_id}");
+                let outcome = self
+                    .handle
+                    .resolve_session(Arc::clone(&shared), base, label.clone())
+                    .await
+                    .map_err(stringify)?;
+                match outcome {
+                    SessionResolveOutcome::NoChanges => {
+                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
+                            session_id,
+                            diff: Vec::new(),
+                        }))
+                    }
+                    SessionResolveOutcome::Resolved { generation } => {
+                        let changes = self
+                            .handle
+                            .diff(base, generation)
+                            .await
+                            .map_err(stringify)?;
+                        self.pending
+                            .lock()
+                            .await
+                            .insert(session_id.clone(), PendingSession { generation, label });
+                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
+                            session_id,
+                            diff: changes.into_iter().map(diff_entry).collect(),
+                        }))
+                    }
+                    SessionResolveOutcome::Conflict { message } => Err(message),
+                }
+            }
+            proto::Op::SessionApply { session_id } => {
+                let mut pending = self.pending.lock().await;
+                let session = pending
+                    .remove(&session_id)
+                    .ok_or_else(|| format!("no resolved Safe Mode session {session_id}"))?;
+                drop(pending);
+                let outcome = self
+                    .handle
+                    .apply_session(session.generation, session.label)
+                    .await
+                    .map_err(stringify)?;
+                match outcome {
+                    PromoteOutcome::Promoted {
+                        generation,
+                        old_tree,
+                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
+                        generation: acyclic_engine::generation_hex(generation),
+                        old_tree: old_tree.map(|path| path.display().to_string()),
+                        warning: "reload your editor: open files still point at the replaced tree"
+                            .into(),
+                    })),
+                    PromoteOutcome::Conflict { message } => Err(message),
+                }
+            }
+            proto::Op::SessionDiscard { session_id } => {
+                self.pending.lock().await.remove(&session_id);
+                Ok(proto::Reply::Unit)
+            }
         }
+    }
+
+    /// Forks one checkout and shadow-mounts it directly at `repo_root` for
+    /// `session_id`'s duration (Safe Mode's session redirection). Only one
+    /// Safe Mode session can be active per repo at a time.
+    async fn session_fork(&self, session_id: String) -> Result<(), String> {
+        if self.dry_session.lock().await.is_some() {
+            return Err("a Safe Mode session is already active for this repo".to_string());
+        }
+        let seed = self.handle.fork().await.map_err(stringify)?;
+        let shared = Arc::clone(&seed.shared);
+        let config = seed.config;
+        let guarded_paths = self.config.guarded_paths.clone();
+        let volume_id = seed.volume_id;
+        let destination = self.repo_root.clone();
+        let mount = tokio::task::block_in_place(move || {
+            let source = CheckoutMountSource::new(shared, config)
+                .map_err(|error| format!("mount source: {error:?}"))?;
+            let source: Arc<dyn MountFilesystem> =
+                if GuardedMountFilesystem::is_active(&guarded_paths) {
+                    Arc::new(GuardedMountFilesystem::new(
+                        Arc::new(source),
+                        &guarded_paths,
+                    ))
+                } else {
+                    Arc::new(source)
+                };
+            mount_native_over_existing(
+                NativeMountRequest {
+                    mount_id: acyclic_engine::MountId::new(),
+                    volume_id,
+                    destination,
+                    writable: true,
+                },
+                source,
+            )
+            .map_err(|error| format!("shadow mount: {error:?}"))
+        })?;
+        *self.dry_session.lock().await = Some(DrySession {
+            fork_id: short_id(),
+            session_id,
+            shared: seed.shared,
+            base: seed.base,
+            mount,
+        });
+        Ok(())
     }
 
     /// Removes one fork's route; the session unmounts (and the mount root
@@ -437,8 +621,7 @@ impl Server {
         // The kernel may hold a positive entry cache for the removed name
         // (FSKit caches until told otherwise): invalidate it eagerly.
         if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes()))
-            {
+            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes())) {
                 eprintln!("acyclic daemon: invalidate {id}: {error:?}");
             }
         }
@@ -518,9 +701,9 @@ fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
         path: entry.path.clone(),
         base: entry.base.clone(),
         created_at: entry.created_at,
+        session_id: entry.session_id.clone(),
     }
 }
-
 
 fn stringify(error: EngineError) -> String {
     error.to_string()
@@ -533,6 +716,20 @@ fn parse_kind(kind: &str) -> Result<CheckpointKind, String> {
         "manual" => CheckpointKind::Manual,
         other => return Err(format!("unknown checkpoint kind {other:?}")),
     })
+}
+
+fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
+    proto::DiffEntry {
+        path: change.path.display().to_string(),
+        change: match change.change {
+            acyclic_engine::diff::ChangeKind::Added => "added",
+            acyclic_engine::diff::ChangeKind::Removed => "removed",
+            acyclic_engine::diff::ChangeKind::Modified => "modified",
+            acyclic_engine::diff::ChangeKind::MetadataOnly => "metadata",
+        }
+        .to_string(),
+        file_kind: format!("{:?}", change.file_kind).to_lowercase(),
+    }
 }
 
 fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {

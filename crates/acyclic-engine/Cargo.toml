@@ -16,10 +16,10 @@ toml = "0.8"
 thiserror = "2"
 hex = "0.4"
 blake3 = "1"
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-bytes = "1"
 tempfile = "3"

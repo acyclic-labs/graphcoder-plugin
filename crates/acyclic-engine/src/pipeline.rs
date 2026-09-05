@@ -8,19 +8,19 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use acyclic_fs::{
-    CancellationToken, CheckoutCommitOutcome, GenerationId, NativeWatch, NativeWatchOptions,
-    OperationId, WatchBatch, WorkCounters,
-};
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
+use acyclic_fs::{
+    CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
+    NativeWatchOptions, OperationId, WatchBatch, WorkCounters,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use std::sync::Arc;
 
 use crate::config::Config;
 use crate::diff::{self, FileChange};
-use crate::fork::{ForkSeed, PromoteOutcome, SharedLocalCheckout};
+use crate::fork::{ForkSeed, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RewindOutcome};
 use crate::store::Store;
@@ -83,6 +83,17 @@ enum Request {
         label: String,
         reply: oneshot::Sender<Result<PromoteOutcome>>,
     },
+    ResolveSession {
+        shared: Arc<SharedLocalCheckout>,
+        base: GenerationId,
+        label: String,
+        reply: oneshot::Sender<Result<SessionResolveOutcome>>,
+    },
+    ApplySession {
+        generation: GenerationId,
+        label: String,
+        reply: oneshot::Sender<Result<PromoteOutcome>>,
+    },
     Status {
         reply: oneshot::Sender<StatusReport>,
     },
@@ -126,7 +137,13 @@ impl PipelineHandle {
         kind: CheckpointKind,
         attribution: Attribution,
     ) -> Result<CheckpointOutcome> {
-        request!(self, Checkpoint { kind: kind, attribution: attribution })?
+        request!(
+            self,
+            Checkpoint {
+                kind: kind,
+                attribution: attribution
+            }
+        )?
     }
 
     /// Enqueues a checkpoint and returns as soon as the pipeline has
@@ -158,12 +175,14 @@ impl PipelineHandle {
         request!(self, Rewind { target: target })?
     }
 
-    pub async fn diff(
-        &self,
-        before: GenerationId,
-        after: GenerationId,
-    ) -> Result<Vec<FileChange>> {
-        request!(self, Diff { before: before, after: after })?
+    pub async fn diff(&self, before: GenerationId, after: GenerationId) -> Result<Vec<FileChange>> {
+        request!(
+            self,
+            Diff {
+                before: before,
+                after: after
+            }
+        )?
     }
 
     pub async fn fork(&self) -> Result<ForkSeed> {
@@ -176,7 +195,49 @@ impl PipelineHandle {
         base: GenerationId,
         label: String,
     ) -> Result<PromoteOutcome> {
-        request!(self, Promote { shared: shared, base: base, label: label })?
+        request!(
+            self,
+            Promote {
+                shared: shared,
+                base: base,
+                label: label
+            }
+        )?
+    }
+
+    /// Safe Mode's commit half of promote: commits the overlay (or reports
+    /// a conflict) without touching the real tree, so the caller can show
+    /// an approval-gated diff before deciding whether to `apply_session`.
+    pub async fn resolve_session(
+        &self,
+        shared: Arc<SharedLocalCheckout>,
+        base: GenerationId,
+        label: String,
+    ) -> Result<SessionResolveOutcome> {
+        request!(
+            self,
+            ResolveSession {
+                shared: shared,
+                base: base,
+                label: label
+            }
+        )?
+    }
+
+    /// Safe Mode's swap half of promote: lands an already-`resolve_session`d
+    /// generation onto the real tree.
+    pub async fn apply_session(
+        &self,
+        generation: GenerationId,
+        label: String,
+    ) -> Result<PromoteOutcome> {
+        request!(
+            self,
+            ApplySession {
+                generation: generation,
+                label: label
+            }
+        )?
     }
 
     pub async fn status(&self) -> Result<StatusReport> {
@@ -184,11 +245,22 @@ impl PipelineHandle {
     }
 
     pub async fn session_started(&self, session_id: String, host: String) -> Result<()> {
-        request!(self, SessionStarted { session_id: session_id, host: host })?
+        request!(
+            self,
+            SessionStarted {
+                session_id: session_id,
+                host: host
+            }
+        )?
     }
 
     pub async fn session_ended(&self, session_id: String) -> Result<()> {
-        request!(self, SessionEnded { session_id: session_id })?
+        request!(
+            self,
+            SessionEnded {
+                session_id: session_id
+            }
+        )?
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -269,6 +341,8 @@ fn fail_request(request: Request, message: &str) {
         Request::Diff { reply, .. } => drop(reply.send(Err(error()))),
         Request::Fork { reply } => drop(reply.send(Err(error()))),
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
         Request::Status { reply } => drop(reply.send(StatusReport {
             state: State::Baselining,
             last_checkpoint: None,
@@ -296,7 +370,9 @@ impl Pipeline {
             },
         )
         .map_err(EngineError::fs("open watcher"))?;
-        watch.begin_rescan().map_err(EngineError::fs("begin rescan"))?;
+        watch
+            .begin_rescan()
+            .map_err(EngineError::fs("begin rescan"))?;
 
         let options = CaptureOptions {
             source_root: repo_root.clone(),
@@ -340,7 +416,9 @@ impl Pipeline {
         .await
         .map_err(EngineError::fs("capture baseline"))?;
         let generation = self.checkpoint_engine().await?;
-        let row = self.index.record(generation, kind, &Attribution::default())?;
+        let row = self
+            .index
+            .record(generation, kind, &Attribution::default())?;
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
@@ -416,6 +494,23 @@ impl Pipeline {
                 reply,
             } => {
                 let _ = reply.send(self.promote(shared, base, &label).await);
+                false
+            }
+            Request::ResolveSession {
+                shared,
+                base,
+                label,
+                reply,
+            } => {
+                let _ = reply.send(self.resolve_session(shared, base, &label).await);
+                false
+            }
+            Request::ApplySession {
+                generation,
+                label,
+                reply,
+            } => {
+                let _ = reply.send(self.apply_session(generation, &label).await);
                 false
             }
             Request::Status { reply } => {
@@ -588,8 +683,7 @@ impl Pipeline {
     async fn idle_commit(&mut self) {
         if self.state == State::Ready
             && self.checkpoints_since_commit > 0
-            && self.last_activity.elapsed()
-                >= Duration::from_millis(self.config.commit_idle_ms)
+            && self.last_activity.elapsed() >= Duration::from_millis(self.config.commit_idle_ms)
         {
             let _ = self.commit_engine().await;
         }
@@ -612,8 +706,8 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
-        let outcome = rewind::execute(&self.store, target.generation, self.config.trash_ttl_days)
-            .await;
+        let outcome =
+            rewind::execute(&self.store, target.generation, self.config.trash_ttl_days).await;
 
         // The swap replaced the repo directory's inode: the pinned root
         // identity and the watcher both point at the old tree. Rebuild both,
@@ -661,7 +755,13 @@ impl Pipeline {
         let config = checkout.volume_config();
         let volume_id = checkout.volume_id();
         Ok(ForkSeed {
-            shared: Arc::new(SharedLocalCheckout::new(checkout)),
+            // Native close/flush must never publish: sibling forks share one
+            // volume head, so a seal on close makes the next fork's mutations
+            // Stale. Promote/resolve are the only commits.
+            shared: Arc::new(SharedLocalCheckout::with_publication(
+                checkout,
+                MountPublication::Manual,
+            )),
             config,
             volume_id,
             base,
@@ -731,6 +831,106 @@ impl Pipeline {
 
         // The head advanced under our checkout: replace it, then land the
         // winner with the same journaled swap a rewind uses.
+        self.state = State::Rewinding;
+        self.store.checkout = self
+            .store
+            .volume
+            .checkout(
+                acyclic_fs::model::GenerationSelector::Head,
+                crate::store::writable_head(),
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("refresh checkout"))?
+            .value;
+        let row = self.index.record(
+            generation,
+            CheckpointKind::Manual,
+            &Attribution {
+                label: Some(label.to_string()),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = generation;
+        self.last_checkpoint_row = Some(row);
+
+        let swap = rewind::execute(&self.store, generation, self.config.trash_ttl_days).await;
+        self.reset_watch().await?;
+        self.baseline(CheckpointKind::Recovered).await?;
+        let swap = swap?;
+        Ok(PromoteOutcome::Promoted {
+            generation,
+            old_tree: Some(swap.old_tree),
+        })
+    }
+
+    /// The commit half of promote, split out for Safe Mode: publishes the
+    /// mainline safety net and commits the fork's overlay, but never
+    /// touches the real tree — the caller diffs `base` against the
+    /// returned generation and decides whether to `apply_session` it.
+    async fn resolve_session(
+        &mut self,
+        shared: Arc<SharedLocalCheckout>,
+        base: GenerationId,
+        label: &str,
+    ) -> Result<SessionResolveOutcome> {
+        self.drain_watcher().await?;
+        let safety = self.checkpoint_engine().await?;
+        let safety_row = self.index.record(
+            safety,
+            CheckpointKind::PreRewind,
+            &Attribution {
+                label: Some(format!("before {label}")),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = safety;
+        self.last_checkpoint_row = Some(safety_row);
+        self.commit_engine().await?;
+
+        let outcome = {
+            let mut guard = shared.lock().await;
+            if !guard.has_pending_mutations() {
+                return Ok(SessionResolveOutcome::NoChanges);
+            }
+            guard
+                .commit(OperationId::new(), WorkCounters::UNBOUNDED, &self.cancel)
+                .await
+                .map_err(EngineError::fs("session commit"))?
+                .value
+        };
+        match outcome {
+            CheckoutCommitOutcome::Committed { generation_id, .. }
+            | CheckoutCommitOutcome::AlreadyCommitted { generation_id, .. } => {
+                Ok(SessionResolveOutcome::Resolved {
+                    generation: generation_id,
+                })
+            }
+            CheckoutCommitOutcome::Conflict { .. } | CheckoutCommitOutcome::Fenced { .. } => {
+                Ok(SessionResolveOutcome::Conflict {
+                    message: format!(
+                        "the working tree moved past the session's base \
+                         ({}); Safe Mode in v1 requires an unmoved mainline — \
+                         rewind to the base or start a new session",
+                        crate::generation_hex(base)
+                    ),
+                })
+            }
+            other => Err(EngineError::Fs(format!(
+                "unexpected session commit outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// The swap half of promote, split out for Safe Mode: lands an
+    /// already-committed generation (from `resolve_session`) onto the real
+    /// tree, exactly like `promote`'s own tail.
+    async fn apply_session(
+        &mut self,
+        generation: GenerationId,
+        label: &str,
+    ) -> Result<PromoteOutcome> {
         self.state = State::Rewinding;
         self.store.checkout = self
             .store

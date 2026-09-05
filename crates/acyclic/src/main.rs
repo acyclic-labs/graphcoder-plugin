@@ -120,6 +120,17 @@ enum Command {
     /// Record a host session ending (hook use).
     #[command(hide = true)]
     SessionEnd { session_id: String },
+    /// Safe Mode: commit a session's shadow fork and show what it would
+    /// change, without touching the real tree yet.
+    #[command(hide = true)]
+    SessionResolve { session_id: String },
+    /// Safe Mode: apply a `session-resolve`d session's changes to the real
+    /// tree.
+    #[command(hide = true)]
+    SessionApply { session_id: String },
+    /// Safe Mode: discard a `session-resolve`d session without applying it.
+    #[command(hide = true)]
+    SessionDiscard { session_id: String },
     /// Internal: the per-repo daemon process.
     #[command(name = "__daemon", hide = true)]
     Daemon { repo_root: PathBuf },
@@ -171,7 +182,11 @@ fn run(cli: Cli, repo: &Path) -> i32 {
             }
         },
         command => {
-            let spawn = if cli.hook { Spawn::Never } else { Spawn::Allowed };
+            let spawn = if cli.hook {
+                Spawn::Never
+            } else {
+                Spawn::Allowed
+            };
             let mut client = match connect(repo, spawn) {
                 Ok(client) => client,
                 Err(ConnectError::NoDaemon) => {
@@ -195,8 +210,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
 }
 
 fn store_paths(repo: &Path) -> Result<acyclic_engine::store::StorePaths, String> {
-    let config =
-        acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+    let config = acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
     acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
         .map_err(|error| error.to_string())
@@ -301,7 +315,11 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     age(entry.created_at),
                     entry.kind,
                     label,
-                    if entry.published { "" } else { "  (unpublished)" },
+                    if entry.published {
+                        ""
+                    } else {
+                        "  (unpublished)"
+                    },
                 );
             }
             Ok(())
@@ -360,7 +378,10 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Fork { count } => {
-            let reply = client.call(proto::Op::Fork { count })?;
+            let reply = client.call(proto::Op::Fork {
+                count,
+                session_id: None,
+            })?;
             let proto::Reply::Forks(entries) = reply else {
                 return Err("unexpected reply".into());
             };
@@ -446,6 +467,52 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         }
         Command::SessionEnd { session_id } => {
             client.call(proto::Op::SessionEnd { session_id })?;
+            Ok(())
+        }
+        Command::SessionResolve { session_id } => {
+            let reply = client.call(proto::Op::SessionResolve { session_id })?;
+            let proto::Reply::SessionPending(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if info.diff.is_empty() {
+                println!("session {}: no changes", info.session_id);
+                return Ok(());
+            }
+            for entry in &info.diff {
+                let tag = match entry.change.as_str() {
+                    "added" => "A",
+                    "removed" => "D",
+                    "modified" => "M",
+                    _ => "m",
+                };
+                println!("{tag} {}", entry.path);
+            }
+            println!(
+                "{} paths changed; run `acyclic session-apply {}` to land them or \
+                 `acyclic session-discard {}` to throw them away",
+                info.diff.len(),
+                info.session_id,
+                info.session_id
+            );
+            Ok(())
+        }
+        Command::SessionApply { session_id } => {
+            let reply = client.call(proto::Op::SessionApply { session_id })?;
+            let proto::Reply::Promote(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            match info.old_tree {
+                Some(old_tree) => {
+                    println!("applied: working tree now at {}", &info.generation[..12]);
+                    println!("old tree kept at {old_tree}");
+                    println!("note: {}", info.warning);
+                }
+                None => println!("session had no changes; nothing to land"),
+            }
+            Ok(())
+        }
+        Command::SessionDiscard { session_id } => {
+            client.call(proto::Op::SessionDiscard { session_id })?;
             Ok(())
         }
         Command::Init | Command::Daemon { .. } | Command::Hook { .. } | Command::Install { .. } => {

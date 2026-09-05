@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use acyclic_fs::{materialize_checkout, MaterializeOptions};
+use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
@@ -202,9 +202,7 @@ fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
         .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
     // SAFETY: both are live NUL-terminated paths; RENAME_SWAP exchanges them
     // atomically on APFS.
-    let result = unsafe {
-        libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP)
-    };
+    let result = unsafe { libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP) };
     if result == 0 {
         Ok(())
     } else {
@@ -214,7 +212,6 @@ fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
         )))
     }
 }
-
 
 #[cfg(target_os = "linux")]
 fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
