@@ -129,6 +129,55 @@ pub fn sweep_stale_dry_session(repo_root: &Path) {
     }
 }
 
+/// Reaps a Safe Mode shadow left by a *crashed* daemon before the caller
+/// touches `repo`. A dead daemon's shadow is a loopback-NFS/FUSE mountpoint
+/// whose server is gone, so every `stat`/`open` under it (config load, path
+/// canonicalization) blocks indefinitely — the CLI would hang before it
+/// could even spawn a fresh daemon to clean up.
+///
+/// Distinguishing a dead shadow from a live session (whose shadow is fine)
+/// without a store/config lookup — which would itself stat `repo` — is done
+/// by probing: a live server answers a `stat` immediately, while a dead one
+/// either blocks or fails (the NFS layer surfaces `ETIMEDOUT`/`ENOTCONN`).
+/// So this force-unmounts whenever a bounded probe does not cleanly succeed;
+/// a healthy repo always stats OK and is never disturbed, and a `umount` of a
+/// path that is not actually a mount is a harmless no-op.
+pub fn reap_dead_shadow(repo: &Path) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::time::Duration;
+        // Resolve to an absolute mountpoint via the (always-live) parent, so
+        // the probe/unmount target is stable without stat-ing `repo` itself.
+        let target = match (repo.parent(), repo.file_name()) {
+            (Some(parent), Some(name)) => match parent.canonicalize() {
+                Ok(parent) => parent.join(name),
+                Err(_) => repo.to_path_buf(),
+            },
+            _ => repo.to_path_buf(),
+        };
+        let probe = target.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Detached: if the stat is truly wedged it never returns, but the
+        // force-unmount below releases it and this short-lived CLI exits.
+        std::thread::spawn(move || {
+            let _ = tx.send(std::fs::metadata(&probe).is_ok());
+        });
+        let healthy = matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        if !healthy {
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("umount")
+                .arg("-f")
+                .arg(&target)
+                .status();
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(&target)
+                .status();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

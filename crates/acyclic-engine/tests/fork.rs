@@ -168,7 +168,7 @@ fn resolve_then_apply_session_lands_fork_changes() {
         let diff = rig.handle.diff(seed.base, generation).await.expect("diff");
         let outcome = rig
             .handle
-            .apply_session(generation, "safe-mode session".into())
+            .apply_session(generation, seed.base, "safe-mode session".into())
             .await
             .expect("apply_session");
         (diff, outcome)

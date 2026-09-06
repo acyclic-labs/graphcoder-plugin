@@ -70,13 +70,14 @@ impl GuardedMountFilesystem {
         Self { inner, guarded }
     }
 
-    /// Whether any guarded prefix is configured at all — callers can skip
-    /// wrapping entirely when this is `false`.
+    /// Whether wrapping a projection in the guard adds anything. Always true:
+    /// even with no configured prefixes the guard drops macOS AppleDouble
+    /// sidecars, which every mount over the NFS transport would otherwise
+    /// capture. Kept as a predicate so the wrap sites read intently and a
+    /// future zero-cost fast path has a single place to live.
     #[must_use]
-    pub fn is_active(guarded_paths: &[String]) -> bool {
-        guarded_paths
-            .iter()
-            .any(|path| !parse_guarded_path(path).is_empty())
+    pub fn is_active(_guarded_paths: &[String]) -> bool {
+        true
     }
 
     fn is_guarded(&self, path: &MountPath) -> bool {
@@ -84,13 +85,32 @@ impl GuardedMountFilesystem {
         self.guarded.iter().any(|prefix| prefix.matches(components))
     }
 
+    /// Whether a mutating call to `path` must be refused: either it falls
+    /// under a configured guarded prefix, or its leaf is a macOS AppleDouble
+    /// sidecar (`._X`). Sidecars are written by the macOS client over the
+    /// mount to carry a file's xattrs / resource fork; in a Safe Mode or fork
+    /// projection they are pure transport noise that would otherwise pollute
+    /// the session diff and litter the real tree on apply, and a guarded
+    /// file's metadata must not leak into one either. Dropping every sidecar
+    /// covers both at once.
+    fn blocked(&self, path: &MountPath) -> bool {
+        self.is_guarded(path) || is_appledouble(path)
+    }
+
     fn guard(&self, path: &MountPath) -> Result<(), MountSourceError> {
-        if self.is_guarded(path) {
+        if self.blocked(path) {
             Err(guarded_error())
         } else {
             Ok(())
         }
     }
+}
+
+/// A path whose final component is a macOS AppleDouble sidecar (`._name`).
+fn is_appledouble(path: &MountPath) -> bool {
+    path.components()
+        .last()
+        .is_some_and(|leaf| leaf.starts_with(b"._"))
 }
 
 /// Wraps one open file handle so writes through it are still checked, even
@@ -191,12 +211,12 @@ impl MountFilesystem for GuardedMountFilesystem {
         let inner = self.inner.open_file(path)?;
         Ok(Arc::new(GuardedOpenFile {
             inner,
-            guarded: self.is_guarded(path),
+            guarded: self.blocked(path),
         }))
     }
 
     fn detach_file(&self, path: &MountPath) -> Result<Arc<dyn MountOpenFile>, MountSourceError> {
-        let guarded = self.is_guarded(path);
+        let guarded = self.blocked(path);
         if guarded {
             return Err(guarded_error());
         }
@@ -532,9 +552,34 @@ mod tests {
     }
 
     #[test]
-    fn no_guarded_paths_means_nothing_is_guarded() {
-        assert!(!GuardedMountFilesystem::is_active(&[]));
-        assert!(!GuardedMountFilesystem::is_active(&["   ".to_owned()]));
+    fn appledouble_sidecars_are_always_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        // Every `._X` sidecar is transport noise and must be refused —
+        // whether or not its base is guarded, at the root or nested — while
+        // the ordinary files beside them stay writable.
+        let guard = guarded_source(&[".env".to_owned(), "migrations".to_owned()])?;
+        for sidecar in [
+            test_path(&["._.env"]),
+            test_path(&["._migrations"]),
+            test_path(&["._notes.txt"]),
+            test_path(&["src", "._main.rs"]),
+        ] {
+            assert!(
+                matches!(
+                    guard.create_file(&sidecar, metadata()),
+                    Err(MountSourceError::Unsupported(_))
+                ),
+                "sidecar {sidecar:?} must be refused"
+            );
+        }
+        assert!(guard.create_file(&test_path(&["notes.txt"]), metadata()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn guard_wrapping_always_applies_to_drop_sidecars() {
+        // Always active: even with no configured prefixes the guard is worth
+        // wrapping because it drops AppleDouble sidecars.
+        assert!(GuardedMountFilesystem::is_active(&[]));
         assert!(GuardedMountFilesystem::is_active(&[".env".to_owned()]));
     }
 }

@@ -47,6 +47,7 @@ struct DrySession {
 /// has touched the real tree yet.
 struct PendingSession {
     generation: acyclic_engine::GenerationId,
+    base: acyclic_engine::GenerationId,
     label: String,
 }
 
@@ -58,6 +59,13 @@ struct ForkMount {
 }
 
 pub fn run(repo_root: &Path) -> Result<(), String> {
+    // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
+    // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
+    // that wedges every stat/open under it (Config::load, canonicalize, ...).
+    // The force-unmount acts on the mountpoint path itself without touching
+    // the dead server, so the real tree reappears before we read the config.
+    fork::sweep_stale_dry_session(repo_root);
+
     let config = Config::load(repo_root).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
     let paths = StorePaths::for_repo(repo_root, stores_root.as_deref())
@@ -68,7 +76,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // mounted (fork sessions do not survive the daemon).
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     fork::sweep_stale_forks(repo_root);
-    fork::sweep_stale_dry_session(repo_root);
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let store = runtime
@@ -525,7 +532,14 @@ impl Server {
                         self.pending
                             .lock()
                             .await
-                            .insert(session_id.clone(), PendingSession { generation, label });
+                            .insert(
+                                session_id.clone(),
+                                PendingSession {
+                                    generation,
+                                    base,
+                                    label,
+                                },
+                            );
                         Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
                             session_id,
                             diff: changes.into_iter().map(diff_entry).collect(),
@@ -542,7 +556,7 @@ impl Server {
                 drop(pending);
                 let outcome = self
                     .handle
-                    .apply_session(session.generation, session.label)
+                    .apply_session(session.generation, session.base, session.label)
                     .await
                     .map_err(stringify)?;
                 match outcome {
@@ -608,6 +622,10 @@ impl Server {
             base: seed.base,
             mount,
         });
+        // The fork now shadows the real repo root: suspend mainline capture
+        // until resolve/apply, or the pipeline watcher captures the shadow's
+        // content and the mount lifecycle instead of real-tree mutations.
+        self.handle.set_shadowed(true).await.map_err(stringify)?;
         Ok(())
     }
 

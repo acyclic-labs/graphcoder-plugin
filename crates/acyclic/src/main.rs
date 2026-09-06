@@ -150,15 +150,17 @@ fn main() {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
-    let repo = cli
-        .repo
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .canonicalize()
-        .unwrap_or_else(|error| {
-            eprintln!("acyclic: bad repo path: {error}");
-            std::process::exit(1);
-        });
+    let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+    // Before touching the repo path (canonicalize, config load, socket): a
+    // crashed Safe Mode daemon can leave a dead shadow mount over the repo
+    // root that wedges every stat under it. Force-unmount it first (a no-op
+    // unless a bounded probe shows the mount is genuinely wedged), so the
+    // real tree is back before we read anything.
+    acyclic_engine::fork::reap_dead_shadow(&repo_arg);
+    let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
+        eprintln!("acyclic: bad repo path: {error}");
+        std::process::exit(1);
+    });
     let code = run(cli, &repo);
     std::process::exit(code);
 }
