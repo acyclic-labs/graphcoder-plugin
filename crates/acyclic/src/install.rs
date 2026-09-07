@@ -369,12 +369,15 @@ round <depth>/<max_depth> · <goal>
 ```
 
 After the final round: `acyclic diff <first checkpoint> <latest>` and
-summarise the blast radius. Mention anything a script or generator wrote.
+summarise the blast radius, ignoring `m` (metadata-only) lines. Mention
+anything a script or generator wrote.
 
 ## 6. Failure and fallback
 
 - A conflict on promote means the mainline moved: you edited the real
-  tree, or a hook did. Drop all forks and re-run the round.
+  tree, or a hook did. The conflicting fork is discarded by the engine,
+  its changes included. Drop the remaining forks and re-run the round;
+  do not try to salvage the conflicting one.
 - `acyclic forks` says none are live after a daemon restart: every fork is
   lost. Re-run the round; nothing was landed.
 - `acyclic fork` fails with a mounts error: read `acyclic status`, tell the
