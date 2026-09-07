@@ -87,6 +87,12 @@ enum Request {
     Fork {
         reply: oneshot::Sender<Result<ForkSeed>>,
     },
+    /// Copy-mode fork: write `generation` out to `destination`.
+    Materialize {
+        generation: GenerationId,
+        destination: PathBuf,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Promote {
         shared: Arc<SharedLocalCheckout>,
         base: GenerationId,
@@ -229,6 +235,17 @@ impl PipelineHandle {
 
     pub async fn fork(&self) -> Result<ForkSeed> {
         request!(self, Fork {})?
+    }
+
+    /// Copy-mode fork: materializes `generation` into `destination`.
+    pub async fn materialize(&self, generation: GenerationId, destination: PathBuf) -> Result<()> {
+        request!(
+            self,
+            Materialize {
+                generation: generation,
+                destination: destination
+            }
+        )?
     }
 
     pub async fn promote(
@@ -397,6 +414,7 @@ fn fail_request(request: Request, message: &str) {
         Request::Diff { reply, .. } => drop(reply.send(Err(error()))),
         Request::Fork { reply } => drop(reply.send(Err(error()))),
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
+        Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePath { reply, .. } => drop(reply.send(Err(error()))),
@@ -561,6 +579,15 @@ impl Pipeline {
             }
             Request::Fork { reply } => {
                 let _ = reply.send(self.fork().await);
+                false
+            }
+            Request::Materialize {
+                generation,
+                destination,
+                reply,
+            } => {
+                let _ = reply
+                    .send(rewind::materialize_into(&self.store, generation, &destination).await);
                 false
             }
             Request::Promote {

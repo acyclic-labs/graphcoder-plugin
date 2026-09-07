@@ -344,6 +344,35 @@ pub enum Phase {
     Swapping,
 }
 
+/// Materializes `generation` into `destination`, which must not exist yet.
+/// Used for copy-mode forks; a rewind does the same into its temp sibling.
+pub async fn materialize_into(
+    store: &Store,
+    generation: GenerationId,
+    destination: &Path,
+) -> Result<()> {
+    std::fs::create_dir(destination)?;
+    let mut checkout = store.checkout_exact(generation).await?;
+    let cancel = CancellationToken::new();
+    materialize_checkout(
+        &mut checkout,
+        &MaterializeOptions {
+            destination: destination.to_path_buf(),
+            maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
+            maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
+            transfer_bytes: TRANSFER_BYTES,
+        },
+        WorkCounters::UNBOUNDED,
+        &cancel,
+    )
+    .await
+    .map_err(|error| {
+        let _ = std::fs::remove_dir_all(destination);
+        EngineError::Restore(format!("materialize: {error:?}"))
+    })?;
+    Ok(())
+}
+
 /// Executes a rewind against the store's repo. Called from the pipeline with
 /// captures paused; the caller re-baselines afterwards.
 pub async fn execute(

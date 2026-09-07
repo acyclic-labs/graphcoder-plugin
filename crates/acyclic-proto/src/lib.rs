@@ -205,6 +205,9 @@ pub struct SessionPendingInfo {
 pub struct ForkEntry {
     pub id: String,
     pub path: String,
+    /// "mount" (routed native mount) or "copy" (materialized directory).
+    #[serde(default = "default_fork_mode")]
+    pub mode: String,
     /// Hex of the published generation the fork was cut from.
     pub base: String,
     pub created_at: i64,
@@ -228,6 +231,14 @@ pub struct StatusInfo {
     pub unpublished: u64,
     pub store_bytes: u64,
     pub repo_root: String,
+    /// Mount provider this daemon would use for forks and Safe Mode.
+    #[serde(default)]
+    pub mount_provider: String,
+    #[serde(default)]
+    pub mount_available: bool,
+    /// Why mounts are unavailable, when they are.
+    #[serde(default)]
+    pub mount_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -366,4 +377,8 @@ pub struct DiffEntry {
     /// "added" | "removed" | "modified" | "metadata"
     pub change: String,
     pub file_kind: String,
+}
+
+fn default_fork_mode() -> String {
+    "mount".to_string()
 }

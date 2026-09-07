@@ -221,7 +221,10 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         Command::Init => init(repo),
         Command::Hook { event } => hook::run(repo, &event),
         Command::Install { host } => match install::run(repo, &host) {
-            Ok(()) => 0,
+            Ok(()) => {
+                print_mount_capability();
+                0
+            }
             Err(message) => {
                 eprintln!("acyclic install: {message}");
                 1
@@ -268,6 +271,21 @@ fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
     Client::connect(&paths.socket(), repo, &log, spawn)
 }
 
+/// One line on what forks and Safe Mode can do here, plus setup steps when
+/// the host lacks a mount provider. Shown by `init` and `install`.
+fn print_mount_capability() {
+    let capability = acyclic_engine::fork::mount_capability();
+    if capability.available {
+        println!("mounts:        {} (forks and Safe Mode available)", capability.provider);
+    } else {
+        println!(
+            "mounts:        unavailable ({})",
+            capability.reason.as_deref().unwrap_or("unknown reason")
+        );
+        println!("{}", acyclic_engine::fork::mount_setup_hint());
+    }
+}
+
 fn init(repo: &Path) -> i32 {
     let result = (|| -> Result<(), String> {
         let config =
@@ -291,6 +309,7 @@ fn init(repo: &Path) -> i32 {
         })?;
         client.call(proto::Op::Ping)?;
         println!("daemon ready — checkpointing is on");
+        print_mount_capability();
         Ok(())
     })();
     match result {
@@ -585,12 +604,18 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 return Err("unexpected reply".into());
             };
             for entry in &entries {
-                println!("fork {}  {}", entry.id, entry.path);
+                println!("fork {}  ({})  {}", entry.id, entry.mode, entry.path);
             }
             println!(
                 "{} fork(s) ready — work in them freely; `acyclic promote <id>` keeps a winner",
                 entries.len()
             );
+            if entries.iter().any(|entry| entry.mode == "copy") {
+                println!(
+                    "note: no mount provider on this host, so these are full copies \
+                     (`acyclic status` explains; promote works the same)"
+                );
+            }
             Ok(())
         }
         Command::Forks => {
@@ -604,8 +629,9 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             for entry in entries {
                 println!(
-                    "{}  {}  {}  base {}",
+                    "{}  {}  {}  {}  base {}",
                     entry.id,
+                    entry.mode,
                     age(entry.created_at),
                     entry.path,
                     &entry.base[..12]
@@ -648,6 +674,14 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             );
             println!("unpublished:   {}", info.unpublished);
             println!("store size:    {}", human_bytes(info.store_bytes));
+            if info.mount_available {
+                println!("mounts:        {} (forks mount, Safe Mode on)", info.mount_provider);
+            } else {
+                println!(
+                    "mounts:        unavailable ({}) — forks copy, Safe Mode off",
+                    info.mount_reason.as_deref().unwrap_or("unknown reason")
+                );
+            }
             Ok(())
         }
         Command::Commit => {
