@@ -191,6 +191,9 @@ impl Index {
         attribution: &Attribution,
     ) -> Result<i64> {
         let turn = self.effective_turn(attribution)?;
+        if let Some(session_id) = attribution.session_id.as_deref() {
+            self.ensure_session(session_id)?;
+        }
         self.connection.execute(
             "INSERT INTO checkpoints
                (generation, created_at, kind, session_id, tool_call_id, tool_name, label,
@@ -431,6 +434,7 @@ impl Index {
     /// Records the start of a conversation turn; returns its 1-based number.
     /// The prompt is truncated to an excerpt on a char boundary.
     pub fn turn_started(&mut self, session_id: &str, prompt: &str) -> Result<i64> {
+        self.ensure_session(session_id)?;
         let next: i64 = self.connection.query_row(
             "SELECT COALESCE(MAX(turn), 0) + 1 FROM turns WHERE session_id = ?1",
             params![session_id],
@@ -520,9 +524,25 @@ impl Index {
     }
 
     pub fn session_started(&mut self, session_id: &str, host: &str) -> Result<()> {
+        // A row backfilled by `ensure_session` has no host yet: fill it in,
+        // but never move the start of a session that was already seen.
         self.connection.execute(
-            "INSERT OR IGNORE INTO sessions(session_id, host, started_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO sessions(session_id, host, started_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET host = COALESCE(sessions.host, excluded.host)",
             params![session_id, host, now()],
+        )?;
+        Ok(())
+    }
+
+    /// A turn or checkpoint for a session the daemon never saw start (its
+    /// SessionStart hook fired while the daemon was down) still gets a
+    /// session row, so `sessions`, `diff --turn`, and `brief` can find it.
+    /// The host is unknown at this point; a later `session_started` is
+    /// ignored by the primary key, so the row keeps its earliest start.
+    fn ensure_session(&mut self, session_id: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO sessions(session_id, host, started_at) VALUES (?1, NULL, ?2)",
+            params![session_id, now()],
         )?;
         Ok(())
     }
@@ -739,6 +759,49 @@ mod tests {
             .expect("row");
         assert!(index.by_id(ok).expect("q").expect("s").is_restorable());
         assert!(!index.by_id(bad).expect("q").expect("s").is_restorable());
+    }
+
+    #[test]
+    fn turns_and_checkpoints_backfill_a_missing_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut index = Index::open(&dir.path().join("index.db")).expect("open");
+        // The SessionStart hook fired while the daemon was down; the first
+        // thing the daemon hears about "late" is a turn.
+        index.turn_started("late", "fix it").expect("turn");
+        let sessions = index.sessions(10).expect("sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "late");
+        assert_eq!(sessions[0].host, None);
+        assert_eq!(sessions[0].turns, 1);
+
+        // A checkpoint alone is enough too.
+        let a = Attribution {
+            session_id: Some("orphan".into()),
+            ..Attribution::default()
+        };
+        index
+            .record(generation(1), CheckpointKind::Post, &a)
+            .expect("row");
+        let ids: Vec<_> = index
+            .sessions(10)
+            .expect("sessions")
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert!(ids.contains(&"orphan".to_string()));
+
+        // A late session-start fills in the host without resetting the row.
+        let started = index.sessions(10).expect("s")[0].started_at;
+        index.session_started("late", "claude-code").expect("start");
+        let late = index
+            .sessions(10)
+            .expect("sessions")
+            .into_iter()
+            .find(|s| s.session_id == "late")
+            .expect("late");
+        assert_eq!(late.host.as_deref(), Some("claude-code"));
+        assert_eq!(late.turns, 1);
+        assert!(late.started_at <= started);
     }
 
     #[test]

@@ -1,7 +1,10 @@
 //! Host-hook entrypoint. Claude Code (and compatible hosts) invoke
 //! `acyclic hook <event>` with a JSON payload on stdin. The contract:
 //! NEVER block or fail the agent — every path exits 0, a missing daemon is
-//! a silent no-op, and pre-tool waits are bounded.
+//! a silent no-op, and pre-tool waits are bounded. The one exception is
+//! `session-start`: it runs once per session, before any edit, and the host
+//! waits for it anyway, so it starts the daemon if none is running. Without
+//! that, a session begun after a reboot would never be checkpointed.
 
 use std::io::Read;
 use std::path::Path;
@@ -39,7 +42,12 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = parse_payload(&raw);
 
-    let Ok(mut client) = connect(repo) else {
+    let spawn = if event == "session-start" {
+        Spawn::Allowed
+    } else {
+        Spawn::Never
+    };
+    let Ok(mut client) = connect(repo, spawn) else {
         // No daemon (not initialized, or stopped): checkpointing is off.
         // Stay quiet — hooks fire on every tool call.
         return 0;
@@ -118,10 +126,10 @@ fn parse_payload(raw: &str) -> Payload {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
-fn connect(repo: &Path) -> Result<Client, ConnectError> {
+fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
     let paths = crate::store_paths(repo).map_err(ConnectError::Other)?;
     let log = paths.root.join("daemon.log");
-    Client::connect(&paths.socket(), repo, &log, Spawn::Never)
+    Client::connect(&paths.socket(), repo, &log, spawn)
 }
 
 #[cfg(test)]

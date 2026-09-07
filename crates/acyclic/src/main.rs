@@ -37,8 +37,13 @@ enum Command {
     Checkpoint {
         #[arg(short = 'm', long)]
         message: Option<String>,
-        /// Wait for the checkpoint to land (default replies on enqueue).
-        #[arg(long)]
+        /// Return as soon as the checkpoint is queued instead of waiting for
+        /// it to land. Only safe when nothing edits the tree right after:
+        /// a queued snapshot can include edits made before it runs.
+        #[arg(long, conflicts_with = "durable")]
+        no_wait: bool,
+        /// Accepted for compatibility: waiting is now the default.
+        #[arg(long, hide = true)]
         wait: bool,
         /// Also publish to the durable authority (coarse boundary).
         #[arg(long)]
@@ -301,7 +306,8 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
     match command {
         Command::Checkpoint {
             message,
-            wait,
+            no_wait,
+            wait: _,
             durable,
             kind,
             session_id,
@@ -318,9 +324,10 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 tool_call_id,
                 tool_name,
                 label: message,
-                // A durable checkpoint is a publish barrier: fire-and-forget
-                // would let a stop race the commit, so it always waits.
-                wait: wait || durable,
+                // Waiting is the default so `checkpoint` followed by an edit
+                // snapshots the pre-edit tree. A durable checkpoint is a
+                // publish barrier and always waits.
+                wait: !no_wait || durable,
                 durable,
             })?;
             match reply {
