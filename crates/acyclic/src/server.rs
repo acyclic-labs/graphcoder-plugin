@@ -613,34 +613,40 @@ impl Server {
                 let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
                 let label = format!("promote fork {id}");
-                let outcome = match fork.copy_dir.as_deref() {
-                    Some(dir) => {
-                        let outcome = self.promote_copy(&fork, dir, &label).await;
-                        let _ = std::fs::remove_dir_all(dir);
-                        Self::remove_if_empty(dir.parent());
-                        outcome?
-                    }
-                    None => {
-                        // Detach the route first: new writes stop reaching the
-                        // overlay before its commit (in-flight handles detach).
-                        self.detach_route(&id).await?;
-                        self.handle
-                            .promote(Arc::clone(&fork.shared), fork.base, label)
-                            .await
-                            .map_err(stringify)?
-                    }
-                };
-                match outcome {
-                    PromoteOutcome::Promoted {
+                let result = self.promote_fork(&id, &fork, &label).await;
+                if let Some(dir) = fork.copy_dir.as_deref() {
+                    let _ = std::fs::remove_dir_all(dir);
+                    Self::remove_if_empty(dir.parent());
+                }
+                match result? {
+                    Landed::Swapped {
                         generation,
                         old_tree,
                     } => Ok(proto::Reply::Promote(proto::PromoteInfo {
                         generation: acyclic_engine::generation_hex(generation),
-                        old_tree: old_tree.map(|path| path.display().to_string()),
+                        old_tree: Some(old_tree.display().to_string()),
                         warning: "reload your editor: open files still point at the replaced tree"
                             .into(),
+                        replayed_paths: 0,
                     })),
-                    PromoteOutcome::Conflict { message } => Err(message),
+                    Landed::Replayed { generation, paths } => {
+                        Ok(proto::Reply::Promote(proto::PromoteInfo {
+                            generation: acyclic_engine::generation_hex(generation),
+                            old_tree: None,
+                            warning: "the mainline had moved; the fork's paths were written \
+                                      in place, no directory swap"
+                                .into(),
+                            replayed_paths: paths,
+                        }))
+                    }
+                    Landed::Nothing { generation } => {
+                        Ok(proto::Reply::Promote(proto::PromoteInfo {
+                            generation: acyclic_engine::generation_hex(generation),
+                            old_tree: None,
+                            warning: String::new(),
+                            replayed_paths: 0,
+                        }))
+                    }
                 }
             }
             proto::Op::ForkDiff { id } => {
@@ -768,6 +774,7 @@ impl Server {
                         old_tree: old_tree.map(|path| path.display().to_string()),
                         warning: "reload your editor: open files still point at the replaced tree"
                             .into(),
+                        replayed_paths: 0,
                     })),
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
@@ -878,30 +885,76 @@ impl Server {
         Ok(proto::Reply::Forks(created))
     }
 
-    /// Promotes a copy-mode fork. The directory is captured into the fork's
-    /// overlay, then committed and landed through the same two-phase path
-    /// Safe Mode uses, so the conflict check is identical to a mounted
-    /// promote. Materialized files carry fresh timestamps, so a capture of
-    /// an untouched copy still yields metadata-only mutations; those are
-    /// reported as "no changes" rather than swapping the tree for nothing.
-    async fn promote_copy(
+    /// Lands a fork. Three outcomes: the mainline is still at the fork's
+    /// base and the whole tree is swapped (mounted forks use the engine's
+    /// promote, copy forks the resolve/apply pair); the mainline moved but
+    /// nothing overlaps and the fork's paths are replayed in place; or the
+    /// fork had no content changes. Overlap is an error naming the paths.
+    async fn promote_fork(
         &self,
+        id: &str,
         fork: &ForkState,
-        dir: &Path,
+        label: &str,
+    ) -> Result<Landed, String> {
+        // Freeze the fork's writes and get at its overlay.
+        let overlay = match fork.copy_dir.as_deref() {
+            Some(dir) => {
+                let scratch = self.handle.scratch_checkout(fork.base).await.map_err(stringify)?;
+                fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
+                scratch
+            }
+            None => {
+                self.detach_route(id).await?;
+                Arc::clone(&fork.shared)
+            }
+        };
+        let head = self.handle.publish_head().await.map_err(stringify)?;
+        if head != fork.base {
+            return self.replay_onto_head(id, overlay, fork.base, head, label).await;
+        }
+        let outcome = if fork.copy_dir.is_some() {
+            self.land_overlay(overlay, fork.base, label).await?
+        } else {
+            self.handle
+                .promote(overlay, fork.base, label.to_string())
+                .await
+                .map_err(stringify)?
+        };
+        match outcome {
+            PromoteOutcome::Promoted {
+                generation,
+                old_tree: Some(old_tree),
+            } => Ok(Landed::Swapped {
+                generation,
+                old_tree,
+            }),
+            PromoteOutcome::Promoted {
+                generation,
+                old_tree: None,
+            } => Ok(Landed::Nothing { generation }),
+            PromoteOutcome::Conflict { message } => Err(message),
+        }
+    }
+
+    /// Unmoved mainline, overlay-backed fork: commit the overlay as an
+    /// unpublished generation and land it with the Safe Mode swap. A
+    /// materialized copy carries fresh timestamps, so metadata-only
+    /// differences count as "no changes" rather than swapping for nothing.
+    async fn land_overlay(
+        &self,
+        overlay: Arc<SharedLocalCheckout>,
+        base: acyclic_engine::GenerationId,
         label: &str,
     ) -> Result<PromoteOutcome, String> {
-        fork::capture_copy(&fork.shared, dir)
-            .await
-            .map_err(stringify)?;
         let resolved = self
             .handle
-            .resolve_session(Arc::clone(&fork.shared), fork.base, label.to_string())
+            .resolve_session(overlay, base, label.to_string())
             .await
             .map_err(stringify)?;
         let generation = match resolved {
             SessionResolveOutcome::NoChanges => {
                 return Ok(PromoteOutcome::Promoted {
-                    generation: fork.base,
+                    generation: base,
                     old_tree: None,
                 })
             }
@@ -910,35 +963,129 @@ impl Server {
             }
             SessionResolveOutcome::Resolved { generation } => generation,
         };
-        let changes = self
-            .handle
-            .diff(fork.base, generation)
-            .await
-            .map_err(stringify)?;
-        let content_changed = changes
-            .iter()
-            .any(|change| change.change != acyclic_engine::diff::ChangeKind::MetadataOnly);
-        if !content_changed {
+        if content_changes(self.handle.diff(base, generation).await.map_err(stringify)?)
+            .is_empty()
+        {
             return Ok(PromoteOutcome::Promoted {
-                generation: fork.base,
+                generation: base,
                 old_tree: None,
             });
         }
-        let outcome = self
+        self.handle
+            .apply_session(generation, base, label.to_string())
+            .await
+            .map_err(stringify)
+    }
+
+    /// The merge primitive, v1: path-disjoint replay. The mainline moved
+    /// past the fork's base. Diff both sides against the base; if no path on
+    /// one side is the same as, or inside, a path on the other, write the
+    /// fork's changed paths onto the current tree one by one (each write is
+    /// the same atomic single-path restore a `restore` uses), then checkpoint
+    /// and publish. Any overlap is a conflict that names the paths: content
+    /// merging is a later launch.
+    async fn replay_onto_head(
+        &self,
+        id: &str,
+        overlay: Arc<SharedLocalCheckout>,
+        base: acyclic_engine::GenerationId,
+        head: acyclic_engine::GenerationId,
+        label: &str,
+    ) -> Result<Landed, String> {
+        if !overlay.lock().await.has_pending_mutations() {
+            return Ok(Landed::Nothing { generation: head });
+        }
+        let snapshot = self
             .handle
-            .apply_session(generation, fork.base, label.to_string())
+            .snapshot_overlay(overlay)
             .await
             .map_err(stringify)?;
-        Ok(match outcome {
-            // apply_session speaks in Safe Mode terms; this is a fork.
-            PromoteOutcome::Conflict { .. } => PromoteOutcome::Conflict {
-                message: format!(
-                    "the working tree moved past the fork's base ({}); promote in v1 \
-                     requires an unmoved mainline — rewind to the base or re-fork and re-apply",
-                    acyclic_engine::generation_hex(fork.base)
-                ),
-            },
-            promoted => promoted,
+        let fork_changes: Vec<PathBuf> = content_changes(self.handle.diff(base, snapshot).await.map_err(stringify)?)
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        if fork_changes.is_empty() {
+            return Ok(Landed::Nothing { generation: head });
+        }
+        let head_changes: Vec<PathBuf> = content_changes(self.handle.diff(base, head).await.map_err(stringify)?)
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        let mut overlaps: Vec<String> = fork_changes
+            .iter()
+            .filter(|fork_path| {
+                head_changes
+                    .iter()
+                    .any(|head_path| fork_path.starts_with(head_path) || head_path.starts_with(fork_path))
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        if !overlaps.is_empty() {
+            overlaps.sort();
+            let shown: Vec<&str> = overlaps.iter().take(8).map(String::as_str).collect();
+            let more = overlaps.len().saturating_sub(shown.len());
+            return Err(format!(
+                "the working tree moved past the fork's base ({}) and both sides changed {} path(s): {}{}. \
+                 Merge is path-disjoint in v1: re-fork from the current tree and re-apply those paths, \
+                 or rewind to the base",
+                acyclic_engine::generation_hex(base),
+                overlaps.len(),
+                shown.join(", "),
+                if more > 0 { format!(" (+{more} more)") } else { String::new() }
+            ));
+        }
+        // A subtree restore covers its descendants: restore each changed
+        // path only if no ancestor of it is also being restored.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for path in &fork_changes {
+            if !roots.iter().any(|root| path.starts_with(root)) {
+                roots.push(path.clone());
+            }
+        }
+        let target = self
+            .handle
+            .record_generation(snapshot, format!("fork {id} snapshot"))
+            .await
+            .map_err(stringify)?;
+        self.handle
+            .checkpoint(
+                CheckpointKind::PreRewind,
+                Attribution {
+                    label: Some(format!("before {label} (replay)")),
+                    ..Attribution::default()
+                },
+            )
+            .await
+            .map_err(stringify)?;
+        let mut written = 0u32;
+        for root in &roots {
+            self.handle
+                .restore_path(target.clone(), root.clone())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "replay stopped at {} after {written} path(s): {error}. The tree is partially \
+                         merged; `acyclic rewind --last` returns to the pre-replay safety checkpoint",
+                        root.display()
+                    )
+                })?;
+            written += 1;
+        }
+        let landed = self
+            .handle
+            .checkpoint(
+                CheckpointKind::Manual,
+                Attribution {
+                    label: Some(format!("{label} (replayed {written} paths onto moved mainline)")),
+                    ..Attribution::default()
+                },
+            )
+            .await
+            .map_err(stringify)?;
+        self.handle.commit().await.map_err(stringify)?;
+        Ok(Landed::Replayed {
+            generation: landed.generation,
+            paths: written,
         })
     }
 
@@ -1176,6 +1323,24 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// How a fork ended up in the real tree.
+enum Landed {
+    /// Whole-tree swap; the old tree is in trash.
+    Swapped {
+        generation: acyclic_engine::GenerationId,
+        old_tree: PathBuf,
+    },
+    /// Path-by-path replay onto a moved mainline; no swap.
+    Replayed {
+        generation: acyclic_engine::GenerationId,
+        paths: u32,
+    },
+    /// No content changes to land.
+    Nothing {
+        generation: acyclic_engine::GenerationId,
+    },
 }
 
 fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {

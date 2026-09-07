@@ -680,13 +680,20 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             let proto::Reply::Promote(info) = reply else {
                 return Err("unexpected reply".into());
             };
-            match info.old_tree {
-                Some(old_tree) => {
+            match (info.old_tree, info.replayed_paths) {
+                (Some(old_tree), _) => {
                     println!("promoted: working tree now at {}", &info.generation[..12]);
                     println!("old tree kept at {old_tree}");
                     println!("note: {}", info.warning);
                 }
-                None => println!("fork had no changes; nothing to land"),
+                (None, paths) if paths > 0 => {
+                    println!(
+                        "promoted by replay: {paths} path(s) written in place, tree now at {}",
+                        &info.generation[..12]
+                    );
+                    println!("note: {}", info.warning);
+                }
+                (None, _) => println!("fork had no changes; nothing to land"),
             }
             Ok(())
         }

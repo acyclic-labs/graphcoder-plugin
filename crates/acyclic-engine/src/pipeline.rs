@@ -94,6 +94,18 @@ enum Request {
         base: GenerationId,
         reply: oneshot::Sender<Result<Arc<SharedLocalCheckout>>>,
     },
+    /// Folds pending real-tree changes in, publishes, and returns the
+    /// published head: the reference point a promote is judged against.
+    PublishHead {
+        reply: oneshot::Sender<Result<GenerationId>>,
+    },
+    /// Records an existing (e.g. snapshot) generation as a checkpoint row so
+    /// it can be a `restore_path` target.
+    RecordGeneration {
+        generation: GenerationId,
+        label: String,
+        reply: oneshot::Sender<Result<CheckpointRow>>,
+    },
     /// Snapshots an overlay's pending mutations as an unpublished
     /// generation (diffable by id; the head does not move).
     SnapshotOverlay {
@@ -248,6 +260,26 @@ impl PipelineHandle {
 
     pub async fn fork(&self) -> Result<ForkSeed> {
         request!(self, Fork {})?
+    }
+
+    /// Publishes the current real tree and returns the head generation.
+    pub async fn publish_head(&self) -> Result<GenerationId> {
+        request!(self, PublishHead {})?
+    }
+
+    /// Records `generation` as a manual checkpoint row (a `restore_path` target).
+    pub async fn record_generation(
+        &self,
+        generation: GenerationId,
+        label: String,
+    ) -> Result<CheckpointRow> {
+        request!(
+            self,
+            RecordGeneration {
+                generation: generation,
+                label: label
+            }
+        )?
     }
 
     /// Private writable overlay pinned at `base`; nothing recorded or published.
@@ -439,6 +471,8 @@ fn fail_request(request: Request, message: &str) {
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
         Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
         Request::ScratchCheckout { reply, .. } => drop(reply.send(Err(error()))),
+        Request::PublishHead { reply } => drop(reply.send(Err(error()))),
+        Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
@@ -608,6 +642,32 @@ impl Pipeline {
             }
             Request::ScratchCheckout { base, reply } => {
                 let _ = reply.send(self.scratch_checkout(base).await);
+                false
+            }
+            Request::PublishHead { reply } => {
+                let _ = reply.send(self.publish_head().await);
+                false
+            }
+            Request::RecordGeneration {
+                generation,
+                label,
+                reply,
+            } => {
+                let result = self
+                    .index
+                    .record(
+                        generation,
+                        CheckpointKind::Manual,
+                        &Attribution {
+                            label: Some(label),
+                            ..Attribution::default()
+                        },
+                    )
+                    .and_then(|id| self.index.by_id(id))
+                    .and_then(|row| {
+                        row.ok_or_else(|| EngineError::Store("recorded row vanished".into()))
+                    });
+                let _ = reply.send(result);
                 false
             }
             Request::SnapshotOverlay { shared, reply } => {
@@ -940,6 +1000,32 @@ impl Pipeline {
 
     /// Mints one fork: publish the current state (the fork base), then cut a
     /// fresh writable Head checkout whose overlay the daemon will mount.
+    /// Same first half as `promote`: fold in pending changes, publish, and
+    /// hand back the head so the caller can decide between a plain land
+    /// (head == fork base) and a replay (head moved).
+    async fn publish_head(&mut self) -> Result<GenerationId> {
+        if self.state != State::Ready {
+            return Err(EngineError::Capture(format!(
+                "pipeline not ready ({:?})",
+                self.state
+            )));
+        }
+        self.drain_watcher().await?;
+        let head = self.checkpoint_engine().await?;
+        let row = self.index.record(
+            head,
+            CheckpointKind::Manual,
+            &Attribution {
+                label: Some("promote base".into()),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = head;
+        self.last_checkpoint_row = Some(row);
+        self.commit_engine().await?;
+        Ok(head)
+    }
+
     async fn scratch_checkout(&mut self, base: GenerationId) -> Result<Arc<SharedLocalCheckout>> {
         let checkout = self
             .store

@@ -224,9 +224,14 @@ pub struct ForkEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PromoteInfo {
     pub generation: String,
-    /// Where the replaced tree went; absent when the fork had no writes.
+    /// Where the replaced tree went; absent when the fork had no writes or
+    /// when the fork was replayed path by path onto a moved mainline.
     pub old_tree: Option<String>,
     pub warning: String,
+    /// Paths written in place because the mainline moved past the fork's
+    /// base and nothing overlapped. 0 for a plain swap or a no-op.
+    #[serde(default)]
+    pub replayed_paths: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

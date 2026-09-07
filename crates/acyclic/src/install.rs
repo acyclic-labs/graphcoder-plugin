@@ -250,7 +250,7 @@ forking.
 
 const FORK_DECOMPOSE_SKILL: &str = r#"---
 name: acyclic-fork-decompose
-description: Solve a large or uncertain task by racing alternative approaches in isolated acyclic forks, landing one winner, and repeating from the new tree. Use when two or more designs are plausible, when a step must not touch the real tree until it is proven, or when the user runs /fork. Not for small edits: checkpoint and do those in place.
+description: Solve a large or uncertain task with isolated acyclic forks - race alternative approaches and land one winner, partition independent parts across forks and land them all, or prove a risky step in a fork before it touches the real tree. Use when two or more designs are plausible, when a task splits into parts that touch different files, or when the user runs /fork. Not for small edits: checkpoint and do those in place.
 ---
 
 # Fork decomposition with acyclic
@@ -276,21 +276,26 @@ tie_break = ...      "smallest-diff" | "first-passing" | "ask-user"
 effective values in ONE line before the first fork, e.g.
 `fork policy: fan_out=3 max_depth=2 max_forks=8 tests=required tie=smallest-diff`.
 
-## 1. Decide ONCE, locally: DO, RACE, or SEQUENCE
+## 1. Decide ONCE, locally: DO, RACE, PARTITION, or SEQUENCE
 
 - **DO** — one obvious approach, or a handful of edits. Run
   `acyclic checkpoint -m "before <task>"` and work in the real tree.
   If unsure, prefer DO. Rewind already makes a wrong turn cheap; a fork
   must beat rewind, not beat nothing.
 - **RACE** — one goal, 2 or more genuinely different approaches, and a
-  wrong choice would be expensive. Fork `fan_out` ways, one approach each.
+  wrong choice would be expensive. Fork `fan_out` ways, one approach each,
+  land ONE.
+- **PARTITION** — independent parts that touch DIFFERENT files. Fork one
+  per part, land EVERY passing fork. Promote merges path-disjoint forks
+  onto the moved mainline ("promoted by replay"). If two forks touched the
+  same path, or one touched a path inside a directory the other changed,
+  the second promote fails naming the paths: re-fork from the current
+  tree and redo only that part. Assign ownership by file in each child
+  prompt so overlap never happens by accident. Never partition a change
+  to a shared file (a type, an interface, a config): do that first as a
+  SEQUENCE step, then partition the rest.
 - **SEQUENCE** — several dependent steps where a later step must not start
   until an earlier one is proven. One fork per step, promote, re-fork.
-
-Never PARTITION (split into parts and land all of them). Promote requires
-an unmoved mainline: after the first fork lands, every sibling's promote
-reports "the working tree moved past the fork's base". Land ONE fork per
-round.
 
 ## 2. One ROUND
 
@@ -305,10 +310,13 @@ Depth starts at 1 and increases by one per round.
 4. **Freeze.** Make NO edits to the real tree while forks are live. A
    single edit moves the mainline and every promote will conflict.
 5. When all reports are in, `acyclic fork-diff <id>` for each fork.
-6. Pick the winner by the SELECTION RULE. `acyclic promote <winner>`.
-7. Run `cd "$PWD"`. Promote swaps the repo directory; a shell left in the
-   old inode silently runs every later command in the replaced tree.
-8. `acyclic fork-drop <id>` for every loser, immediately.
+6. RACE: pick the winner by the SELECTION RULE and `acyclic promote <winner>`.
+   PARTITION: `acyclic promote <id>` for every fork that passed, in
+   dispatch order. The first swaps the tree; the rest replay in place.
+7. Run `cd "$PWD"`. A swap-style promote replaces the repo directory; a
+   shell left in the old inode silently runs every later command in the
+   replaced tree. Harmless after a replay, so always do it.
+8. `acyclic fork-drop <id>` for every fork you will not land, immediately.
 9. Report the round in the ROUND REPORT shape.
 10. If work remains and depth < max_depth and forks used < max_forks,
     start the next round from the promoted tree. Otherwise stop and
@@ -326,6 +334,8 @@ Do not read or write the real repository at <absolute repo root>.
 GOAL: <one sentence, verbatim from the task>
 YOUR APPROACH (<kebab-case-id>): <one or two sentences naming this
 approach and what makes it different from the alternatives>
+YOU OWN: <PARTITION only: the files or directories this fork may change;
+touch nothing else, or the merge will refuse your fork>
 DEPTH: <depth> of <max_depth>
 
 Do the work. Make your first tool call a write to the file you own most.
@@ -374,10 +384,11 @@ anything a script or generator wrote.
 
 ## 6. Failure and fallback
 
-- A conflict on promote means the mainline moved: you edited the real
-  tree, or a hook did. The conflicting fork is discarded by the engine,
-  its changes included. Drop the remaining forks and re-run the round;
-  do not try to salvage the conflicting one.
+- A promote that names overlapping paths means two sides changed the
+  same file or directory: a PARTITION child stepped outside what it owns,
+  or you edited the real tree. The conflicting fork is discarded by the
+  engine, its changes included. Re-fork from the current tree and redo
+  that part with tighter ownership; do not try to salvage it.
 - `acyclic forks` says none are live after a daemon restart: every fork is
   lost. Re-run the round; nothing was landed.
 - `acyclic fork` fails with a mounts error: read `acyclic status`, tell the
@@ -391,7 +402,8 @@ anything a script or generator wrote.
 | One obvious approach, or a handful of edits | DO |
 | 2+ genuinely different designs, expensive to guess wrong | RACE |
 | Dependent steps, each must be proven first | SEQUENCE |
-| Independent parts you want to land together | Not supported: SEQUENCE them |
+| Independent parts, different files | PARTITION |
+| Independent parts that share a file | SEQUENCE the shared file first, then PARTITION |
 | depth == max_depth and work remains | Stop, report, ask |
 | forks used == max_forks | Stop, report, ask |
 | Winner's fork-diff is empty | Drop it; the round was DO |
