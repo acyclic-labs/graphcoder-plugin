@@ -87,6 +87,19 @@ enum Request {
     Fork {
         reply: oneshot::Sender<Result<ForkSeed>>,
     },
+    /// A private writable overlay pinned at `base`, with no index record
+    /// and no publish: the scratch space `fork-diff` captures a fork's
+    /// current tree into.
+    ScratchCheckout {
+        base: GenerationId,
+        reply: oneshot::Sender<Result<Arc<SharedLocalCheckout>>>,
+    },
+    /// Snapshots an overlay's pending mutations as an unpublished
+    /// generation (diffable by id; the head does not move).
+    SnapshotOverlay {
+        shared: Arc<SharedLocalCheckout>,
+        reply: oneshot::Sender<Result<GenerationId>>,
+    },
     /// Copy-mode fork: write `generation` out to `destination`.
     Materialize {
         generation: GenerationId,
@@ -235,6 +248,16 @@ impl PipelineHandle {
 
     pub async fn fork(&self) -> Result<ForkSeed> {
         request!(self, Fork {})?
+    }
+
+    /// Private writable overlay pinned at `base`; nothing recorded or published.
+    pub async fn scratch_checkout(&self, base: GenerationId) -> Result<Arc<SharedLocalCheckout>> {
+        request!(self, ScratchCheckout { base: base })?
+    }
+
+    /// Unpublished generation holding `shared`'s pending mutations.
+    pub async fn snapshot_overlay(&self, shared: Arc<SharedLocalCheckout>) -> Result<GenerationId> {
+        request!(self, SnapshotOverlay { shared: shared })?
     }
 
     /// Copy-mode fork: materializes `generation` into `destination`.
@@ -415,6 +438,8 @@ fn fail_request(request: Request, message: &str) {
         Request::Fork { reply } => drop(reply.send(Err(error()))),
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
         Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ScratchCheckout { reply, .. } => drop(reply.send(Err(error()))),
+        Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePath { reply, .. } => drop(reply.send(Err(error()))),
@@ -579,6 +604,23 @@ impl Pipeline {
             }
             Request::Fork { reply } => {
                 let _ = reply.send(self.fork().await);
+                false
+            }
+            Request::ScratchCheckout { base, reply } => {
+                let _ = reply.send(self.scratch_checkout(base).await);
+                false
+            }
+            Request::SnapshotOverlay { shared, reply } => {
+                let result = async {
+                    let guard = shared.lock().await;
+                    Ok(guard
+                        .checkpoint(WorkCounters::UNBOUNDED, &self.cancel)
+                        .await
+                        .map_err(EngineError::fs("overlay snapshot"))?
+                        .value)
+                }
+                .await;
+                let _ = reply.send(result);
                 false
             }
             Request::Materialize {
@@ -898,6 +940,25 @@ impl Pipeline {
 
     /// Mints one fork: publish the current state (the fork base), then cut a
     /// fresh writable Head checkout whose overlay the daemon will mount.
+    async fn scratch_checkout(&mut self, base: GenerationId) -> Result<Arc<SharedLocalCheckout>> {
+        let checkout = self
+            .store
+            .volume
+            .checkout(
+                acyclic_fs::model::GenerationSelector::Exact(base),
+                crate::store::writable_head(),
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("scratch checkout"))?
+            .value;
+        Ok(Arc::new(SharedLocalCheckout::with_publication(
+            checkout,
+            MountPublication::Manual,
+        )))
+    }
+
     async fn fork(&mut self) -> Result<ForkSeed> {
         if self.state != State::Ready {
             return Err(EngineError::Capture(format!(

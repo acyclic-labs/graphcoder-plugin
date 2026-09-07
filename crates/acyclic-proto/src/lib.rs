@@ -118,6 +118,11 @@ pub enum Op {
         #[serde(rename = "fork")]
         id: String,
     },
+    /// Blast radius of a live fork against its base, without landing it.
+    ForkDiff {
+        #[serde(rename = "fork")]
+        id: String,
+    },
     /// Safe Mode: forks one checkout and mounts it directly at the repo
     /// root for the session's duration (see `dry_run` in `.acyclic/config.toml`).
     SessionFork {

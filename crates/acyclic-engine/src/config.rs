@@ -28,6 +28,44 @@ pub struct Config {
     /// Safe Mode: path prefixes (relative to the repo root) no fork or
     /// scratch tree may write to, enforced at the native mount layer.
     pub guarded_paths: Vec<String>,
+    /// Parameters the fork-decomposition skill reads via `acyclic policy`.
+    pub decompose: Decompose,
+}
+
+/// Knobs for the `acyclic-fork-decompose` skill. The skill text is the
+/// same everywhere; a team tunes these in `.acyclic/config.toml` under
+/// `[decompose]`, and `/fork` arguments override them per invocation.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Decompose {
+    /// Forks per race (2..=4 is the useful range; the engine caps at 16).
+    pub fan_out: u32,
+    /// Promote-then-refork rounds the root may run before checking in
+    /// with the user.
+    pub max_depth: u32,
+    /// Total forks one task may create across all rounds.
+    pub max_forks: u32,
+    /// A fork may win only if its tests pass.
+    pub require_tests: bool,
+    /// The command every subagent runs inside its fork before reporting.
+    /// None: the skill asks the subagent to infer it from the repo.
+    pub test_command: Option<String>,
+    /// How to break a tie between passing forks: "smallest-diff" |
+    /// "first-passing" | "ask-user".
+    pub tie_break: String,
+}
+
+impl Default for Decompose {
+    fn default() -> Self {
+        Self {
+            fan_out: 3,
+            max_depth: 2,
+            max_forks: 8,
+            require_tests: true,
+            test_command: None,
+            tie_break: "smallest-diff".into(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -41,6 +79,7 @@ impl Default for Config {
             store_dir: None,
             dry_run: false,
             guarded_paths: Vec::new(),
+            decompose: Decompose::default(),
         }
     }
 }
@@ -113,6 +152,22 @@ mod tests {
         let config = Config::load_layered(None, repo.path()).expect("load");
         assert!(config.dry_run);
         assert_eq!(config.guarded_paths, vec![".env", "migrations/"]);
+    }
+
+    #[test]
+    fn decompose_table_overrides_defaults_and_keeps_the_rest() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::write(
+            repo.path().join(".acyclic/config.toml"),
+            "[decompose]\nfan_out = 2\ntest_command = \"cargo test\"\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(None, repo.path()).expect("load");
+        assert_eq!(config.decompose.fan_out, 2);
+        assert_eq!(config.decompose.test_command.as_deref(), Some("cargo test"));
+        assert_eq!(config.decompose.max_depth, 2);
+        assert_eq!(config.decompose.tie_break, "smallest-diff");
     }
 
     #[test]

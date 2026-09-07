@@ -643,6 +643,50 @@ impl Server {
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
             }
+            proto::Op::ForkDiff { id } => {
+                let (base, shared, copy_dir) = {
+                    let forks = self.forks.lock().await;
+                    let fork = forks.get(&id).ok_or(format!("no fork {id}"))?;
+                    (fork.base, Arc::clone(&fork.shared), fork.copy_dir.clone())
+                };
+                // Mounted fork: its writes already sit in its own overlay, so
+                // snapshot that. Copy fork: read the directory into a
+                // scratch overlay pinned at the base (native capture cannot
+                // read through the mount itself: NFS lacks the extent ioctl).
+                // Either way the fork stays promotable afterwards.
+                let overlay = match copy_dir {
+                    None => shared,
+                    Some(dir) => {
+                        let scratch =
+                            self.handle.scratch_checkout(base).await.map_err(stringify)?;
+                        fork::capture_copy(&scratch, &dir)
+                            .await
+                            .map_err(stringify)?;
+                        scratch
+                    }
+                };
+                let changes = if overlay.lock().await.has_pending_mutations() {
+                    let generation = self
+                        .handle
+                        .snapshot_overlay(overlay)
+                        .await
+                        .map_err(stringify)?;
+                    self.handle.diff(base, generation).await.map_err(stringify)?
+                } else {
+                    Vec::new()
+                };
+                // Timestamps differ on a copy fork by construction; only
+                // content is a blast radius.
+                Ok(proto::Reply::Diff(
+                    changes
+                        .into_iter()
+                        .filter(|change| {
+                            change.change != acyclic_engine::diff::ChangeKind::MetadataOnly
+                        })
+                        .map(diff_entry)
+                        .collect(),
+                ))
+            }
             proto::Op::SessionFork { session_id } => {
                 self.session_fork(session_id).await?;
                 Ok(proto::Reply::Unit)

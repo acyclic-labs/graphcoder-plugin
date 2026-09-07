@@ -136,6 +136,11 @@ enum Command {
     ForkDrop { id: String },
     /// Land a fork's changes in the real working tree.
     Promote { id: String },
+    /// Blast radius of a live fork against its base, without landing it.
+    ForkDiff { id: String },
+    /// Print the fork-decomposition parameters ([decompose] in
+    /// .acyclic/config.toml over machine defaults) for the skill to read.
+    Policy,
     /// Daemon and store health.
     Status,
     /// Publish pending checkpoints to the durable authority now.
@@ -219,6 +224,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
             }
         },
         Command::Init => init(repo),
+        Command::Policy => policy(repo),
         Command::Hook { event } => hook::run(repo, &event),
         Command::Install { host } => match install::run(repo, &host) {
             Ok(()) => {
@@ -283,6 +289,31 @@ fn print_mount_capability() {
             capability.reason.as_deref().unwrap_or("unknown reason")
         );
         println!("{}", acyclic_engine::fork::mount_setup_hint());
+    }
+}
+
+/// `acyclic policy`: the effective `[decompose]` parameters as `key = value`
+/// lines, so the skill reads one command instead of parsing TOML.
+fn policy(repo: &Path) -> i32 {
+    match acyclic_engine::config::Config::load(repo) {
+        Ok(config) => {
+            let d = config.decompose;
+            println!("fan_out = {}", d.fan_out);
+            println!("max_depth = {}", d.max_depth);
+            println!("max_forks = {}", d.max_forks);
+            println!("require_tests = {}", d.require_tests);
+            match d.test_command {
+                Some(command) => println!("test_command = {command:?}"),
+                None => println!("test_command = (infer from the repo)"),
+            }
+            println!("tie_break = {:?}", d.tie_break);
+            println!("# set these under [decompose] in .acyclic/config.toml");
+            0
+        }
+        Err(error) => {
+            eprintln!("acyclic policy: {error}");
+            1
+        }
     }
 }
 
@@ -659,6 +690,27 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             Ok(())
         }
+        Command::ForkDiff { id } => {
+            let reply = client.call(proto::Op::ForkDiff { id })?;
+            let proto::Reply::Diff(entries) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if entries.is_empty() {
+                println!("no changes");
+                return Ok(());
+            }
+            for entry in &entries {
+                let tag = match entry.change.as_str() {
+                    "added" => "A",
+                    "removed" => "D",
+                    "modified" => "M",
+                    _ => "m",
+                };
+                println!("{tag} {}", entry.path);
+            }
+            println!("{} paths changed", entries.len());
+            Ok(())
+        }
         Command::Status => {
             let reply = client.call(proto::Op::Status)?;
             let proto::Reply::Status(info) = reply else {
@@ -748,7 +800,11 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             client.call(proto::Op::SessionDiscard { session_id })?;
             Ok(())
         }
-        Command::Init | Command::Daemon { .. } | Command::Hook { .. } | Command::Install { .. } => {
+        Command::Init
+        | Command::Policy
+        | Command::Daemon { .. }
+        | Command::Hook { .. }
+        | Command::Install { .. } => {
             unreachable!("handled in run()")
         }
     }
