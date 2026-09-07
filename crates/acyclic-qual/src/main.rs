@@ -18,12 +18,13 @@ use acyclic_fs::model::{
     MutationMode, VolumeConfig,
 };
 use acyclic_fs::{
-    CancellationToken, CheckoutCommitOutcome, GenerationId, LocalFs, LocalOptions, OperationId,
-    VolumeId, WorkCounters,
-};
-use acyclic_fs::{
     capture_baseline, capture_root_identity, materialize_checkout, CaptureOptions,
     MaterializeOptions,
+};
+use acyclic_engine::store::local_options;
+use acyclic_fs::{
+    CancellationToken, CheckoutCommitOutcome, GenerationId, LocalFs, OperationId, VolumeId,
+    WorkCounters,
 };
 
 fn main() {
@@ -133,7 +134,10 @@ fn restore_gen(args: &[String]) -> Result<(), Failure> {
     let volume_uuid: [u8; 16] = {
         let clean: String = volume_hex.chars().filter(|c| *c != '-').collect();
         let bytes = hex_decode(&clean)?;
-        bytes.as_slice().try_into().map_err(|_| "volume uuid must be 16 bytes")?
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "volume uuid must be 16 bytes")?
     };
     let digest: [u8; 32] = hex_decode(generation_hex)?
         .as_slice()
@@ -144,7 +148,7 @@ fn restore_gen(args: &[String]) -> Result<(), Failure> {
     runtime.block_on(async {
         let cancel = CancellationToken::new();
         let fs_engine =
-            LocalFs::local(LocalOptions::new(&store_dir)).map_err(engine_err("open store"))?;
+            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
         let volume = fs_engine
             .open_volume(
                 VolumeId::from_bytes(volume_uuid),
@@ -214,8 +218,7 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     };
     use std::sync::Arc;
 
-    let source = PathBuf::from(args.first().ok_or("mount-smoke: missing <src>")?)
-        .canonicalize()?;
+    let source = PathBuf::from(args.first().ok_or("mount-smoke: missing <src>")?).canonicalize()?;
     let work = PathBuf::from(args.get(1).ok_or("mount-smoke: missing <work>")?);
     let store_dir = work.join("store");
     let mount_dir = work.join("mnt");
@@ -225,7 +228,9 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     let capabilities = probe_native_mount();
     println!(
         "probe: kind={:?} available={} writable={} reason={:?}",
-        capabilities.kind, capabilities.available, capabilities.writable,
+        capabilities.kind,
+        capabilities.available,
+        capabilities.writable,
         capabilities.unavailable_reason
     );
     if !capabilities.available || !capabilities.writable {
@@ -240,8 +245,8 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     let config = volume_config();
     let (checkout, fs_engine) = runtime.block_on(async {
         let cancel = CancellationToken::new();
-        let fs_engine = LocalFs::local(LocalOptions::new(&store_dir))
-            .map_err(engine_err("reopen store"))?;
+        let fs_engine =
+            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("reopen store"))?;
         let volume = fs_engine
             .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
@@ -281,7 +286,11 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
         mount_source,
     )
     .map_err(engine_err("mount_native"))?;
-    println!("mounted at {} in {:?}", mount_dir.display(), started.elapsed());
+    println!(
+        "mounted at {} in {:?}",
+        mount_dir.display(),
+        started.elapsed()
+    );
 
     // Everything below must not leave the mount attached on failure.
     let verdict = (|| -> Result<(), Failure> {
@@ -303,7 +312,7 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
             return Err("asset content mismatch through mount".into());
         }
         let mounted_link = fs::read_link(mount_dir.join("node_modules/.bin/tool"))?;
-        if mounted_link != PathBuf::from("../../tool.sh") {
+        if mounted_link != Path::new("../../tool.sh") {
             return Err(format!("symlink mismatch through mount: {mounted_link:?}").into());
         }
 
@@ -341,13 +350,10 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_hold(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs::{
-        mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout,
-    };
+    use acyclic_fs::{mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout};
     use std::sync::Arc;
 
-    let source = PathBuf::from(args.first().ok_or("mount-hold: missing <src>")?)
-        .canonicalize()?;
+    let source = PathBuf::from(args.first().ok_or("mount-hold: missing <src>")?).canonicalize()?;
     let work = PathBuf::from(args.get(1).ok_or("mount-hold: missing <work>")?);
     let seconds: u64 = args.get(2).map_or(Ok(60), |value| value.parse())?;
     let store_dir = work.join("store");
@@ -361,7 +367,7 @@ fn mount_hold(args: &[String]) -> Result<(), Failure> {
     let checkout = runtime.block_on(async {
         let cancel = CancellationToken::new();
         let fs_engine =
-            LocalFs::local(LocalOptions::new(&store_dir)).map_err(engine_err("open store"))?;
+            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
         let volume = fs_engine
             .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
@@ -385,9 +391,8 @@ fn mount_hold(args: &[String]) -> Result<(), Failure> {
         Ok::<_, Failure>(checkout)
     })?;
     let shared = Arc::new(SharedCheckout::new(checkout));
-    let mount_source = Arc::new(
-        CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?,
-    );
+    let mount_source =
+        Arc::new(CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?);
     let mut session = mount_native(
         NativeMountRequest {
             mount_id: acyclic_fs::MountId::new(),
@@ -414,8 +419,8 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
     use acyclic_fs::{CheckoutMountSource, MountFilesystem, MountPath, SharedCheckout};
     use std::sync::Arc;
 
-    let source = PathBuf::from(args.first().ok_or("source-probe: missing <src>")?)
-        .canonicalize()?;
+    let source =
+        PathBuf::from(args.first().ok_or("source-probe: missing <src>")?).canonicalize()?;
     let work = PathBuf::from(args.get(1).ok_or("source-probe: missing <work>")?);
     let store_dir = work.join("store");
     fs::create_dir_all(&store_dir)?;
@@ -426,7 +431,7 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
     let checkout = runtime.block_on(async {
         let cancel = CancellationToken::new();
         let fs_engine =
-            LocalFs::local(LocalOptions::new(&store_dir)).map_err(engine_err("open store"))?;
+            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
         let volume = fs_engine
             .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
@@ -454,8 +459,18 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
         CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?;
 
     let readme = MountPath::root().child(b"README.md".to_vec());
-    println!("lookup(/):          {:?}", mount_source.lookup(&MountPath::root()).map(|l| l.map(|l| l.node.kind)));
-    println!("lookup(README.md):  {:?}", mount_source.lookup(&readme).map(|l| l.map(|l| (l.node.kind, l.node.logical_bytes))));
+    println!(
+        "lookup(/):          {:?}",
+        mount_source
+            .lookup(&MountPath::root())
+            .map(|l| l.map(|l| l.node.kind))
+    );
+    println!(
+        "lookup(README.md):  {:?}",
+        mount_source
+            .lookup(&readme)
+            .map(|l| l.map(|l| (l.node.kind, l.node.logical_bytes)))
+    );
     println!(
         "read_directory(/):  {:?}",
         mount_source
@@ -465,8 +480,15 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
     match mount_source.open_file(&readme) {
         Ok(file) => {
             println!("open_file(README):  Ok");
-            println!("  handle.lookup():  {:?}", file.lookup().map(|l| l.node.logical_bytes));
-            println!("  read_range(0,13): {:?}", file.read_range(0, 13).map(|b| String::from_utf8_lossy(&b).into_owned()));
+            println!(
+                "  handle.lookup():  {:?}",
+                file.lookup().map(|l| l.node.logical_bytes)
+            );
+            println!(
+                "  read_range(0,13): {:?}",
+                file.read_range(0, 13)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            );
         }
         Err(error) => println!("open_file(README):  ERR {error:?}"),
     }
@@ -479,13 +501,11 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs::{
-        mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout,
-    };
+    use acyclic_fs::{mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout};
     use std::sync::Arc;
 
-    let source = PathBuf::from(args.first().ok_or("mount-smoke2: missing <src>")?)
-        .canonicalize()?;
+    let source =
+        PathBuf::from(args.first().ok_or("mount-smoke2: missing <src>")?).canonicalize()?;
     let work = PathBuf::from(args.get(1).ok_or("mount-smoke2: missing <work>")?);
     let store_dir = work.join("store");
     fs::create_dir_all(&store_dir)?;
@@ -500,8 +520,8 @@ fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
         fs::create_dir_all(&mount_dir)?;
         let checkout = runtime.block_on(async {
             let cancel = CancellationToken::new();
-            let fs_engine = LocalFs::local(LocalOptions::new(&store_dir))
-                .map_err(engine_err("open store"))?;
+            let fs_engine =
+                LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
             let volume = fs_engine
                 .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
                 .await
@@ -525,9 +545,8 @@ fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
             Ok::<_, Failure>(checkout)
         })?;
         let shared = Arc::new(SharedCheckout::new(checkout));
-        let mount_source = Arc::new(
-            CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?,
-        );
+        let mount_source =
+            Arc::new(CheckoutMountSource::new(shared, config).map_err(engine_err("mount source"))?);
         let started = Instant::now();
         let session = mount_native(
             NativeMountRequest {
@@ -606,12 +625,12 @@ fn bench(args: &[String]) -> Result<(), Failure> {
 }
 
 async fn bench_inner(source: &Path, store_dir: &Path, rounds: usize) -> Result<(), Failure> {
-    use acyclic_fs::{NativeWatch, NativeWatchOptions, WatchBatch};
     use acyclic_fs::model::VolumeLimits;
+    use acyclic_fs::{NativeWatch, NativeWatchOptions, WatchBatch};
 
     let cancel = CancellationToken::new();
     let fs_engine =
-        LocalFs::local(LocalOptions::new(store_dir)).map_err(engine_err("open store"))?;
+        LocalFs::local(local_options(store_dir)).await.map_err(engine_err("open store"))?;
     let volume = fs_engine
         .create_volume(volume_config(), WorkCounters::UNBOUNDED, &cancel)
         .await
@@ -802,7 +821,8 @@ async fn capture_and_commit(
     store_dir: &Path,
 ) -> Result<(VolumeId, GenerationId), Failure> {
     let cancel = CancellationToken::new();
-    let fs_engine = LocalFs::local(LocalOptions::new(store_dir)).map_err(engine_err("open store"))?;
+    let fs_engine =
+        LocalFs::local(local_options(store_dir)).await.map_err(engine_err("open store"))?;
 
     let started = Instant::now();
     let volume = fs_engine
@@ -828,7 +848,8 @@ async fn capture_and_commit(
 
     let options = CaptureOptions {
         source_root: source.to_path_buf(),
-        expected_root_identity: capture_root_identity(source).map_err(engine_err("root identity"))?,
+        expected_root_identity: capture_root_identity(source)
+            .map_err(engine_err("root identity"))?,
         maximum_paths: 4_000_000,
         maximum_extent_spans: 65_536,
     };
@@ -877,7 +898,8 @@ async fn materialize(
     destination: &Path,
 ) -> Result<(), Failure> {
     let cancel = CancellationToken::new();
-    let fs_engine = LocalFs::local(LocalOptions::new(store_dir)).map_err(engine_err("reopen store"))?;
+    let fs_engine =
+        LocalFs::local(local_options(store_dir)).await.map_err(engine_err("reopen store"))?;
     let volume = fs_engine
         .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
         .await
@@ -968,10 +990,9 @@ fn compare_trees(source: &Path, restored: &Path) -> Result<Vec<String>, Failure>
     for (path, kind) in &left {
         match right.get(path) {
             None => mismatches.push(format!("{}: missing in restore", path.display())),
-            Some(other) if other != kind => mismatches.push(format!(
-                "{}: kind {kind:?} vs {other:?}",
-                path.display()
-            )),
+            Some(other) if other != kind => {
+                mismatches.push(format!("{}: kind {kind:?} vs {other:?}", path.display()))
+            }
             Some(_) => {
                 let a = source.join(path);
                 let b = restored.join(path);

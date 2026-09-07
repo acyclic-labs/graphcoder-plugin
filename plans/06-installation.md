@@ -34,8 +34,12 @@ The same verbs everywhere, used by both the dev and the agent:
 ```
 acyclic checkpoint [-m msg]      # snapshot now (hooks do this automatically)
 acyclic timeline                 # checkpoints, linked to conversation turns
+acyclic turns                    # which prompt caused which checkpoints   (Launch 2)
+acyclic show <checkpoint>        # session, turn, prompt of one checkpoint  (Launch 2)
+acyclic brief                    # previous session's end state + abandoned branches (Launch 2)
 acyclic rewind <checkpoint>      # restore the tree, untracked files included
-acyclic diff [<a> <b>]           # blast radius since session start, or between two points
+acyclic restore <checkpoint> <p> # restore one path, leave the rest        (Launch 2)
+acyclic diff [<a> <b>|--turn N]  # blast radius since session start, between two points, or of one turn
 acyclic fork [-n N]              # N copy-on-write working trees        (Launch 3)
 acyclic promote <fork>           # merge the winning fork back          (Launch 3)
 acyclic search <query>           # indexed search, checkpoint-aware     (Launch 5)

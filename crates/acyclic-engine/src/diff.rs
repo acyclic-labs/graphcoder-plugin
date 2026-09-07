@@ -89,8 +89,36 @@ pub async fn diff(
             });
         }
     }
+    // Snapshots carry `.git` so rewind restores it, but a blast-radius
+    // report is about the working tree: object and ref churn from ordinary
+    // git commands would otherwise swamp the real changes.
+    changes.retain(|change| !is_git_internal(&change.path));
     changes.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(changes)
+}
+
+/// `.git` itself or anything beneath it, at the repo root only.
+fn is_git_internal(path: &std::path::Path) -> bool {
+    path.components()
+        .next()
+        .is_some_and(|first| first.as_os_str() == ".git")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_git_internal;
+    use std::path::Path;
+
+    #[test]
+    fn only_root_git_dir_is_internal() {
+        assert!(is_git_internal(Path::new(".git")));
+        assert!(is_git_internal(Path::new(".git/HEAD")));
+        assert!(is_git_internal(Path::new(".git/objects/ab/cd")));
+        assert!(!is_git_internal(Path::new(".gitignore")));
+        assert!(!is_git_internal(Path::new("src/.git/config")));
+        assert!(!is_git_internal(Path::new("vendor/.gitkeep")));
+        assert!(!is_git_internal(Path::new("a.txt")));
+    }
 }
 
 /// Walks every directory record in a generation into path → record summary.

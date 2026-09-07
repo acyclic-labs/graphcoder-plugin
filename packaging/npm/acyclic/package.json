@@ -1,5 +1,5 @@
 {
-  "name": "@acyclic-labs/acyclic",
+  "name": "@acyclic-labs/plugin",
   "version": "0.0.1",
   "description": "Agent-native state engine: checkpoints, rewind, and blast-radius diff for coding-agent sessions",
   "license": "Apache-2.0",
@@ -17,9 +17,13 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@acyclic-labs/acyclic-darwin-arm64": "0.0.1",
-    "@acyclic-labs/acyclic-darwin-x64": "0.0.1",
-    "@acyclic-labs/acyclic-linux-x64": "0.0.1",
-    "@acyclic-labs/acyclic-linux-arm64": "0.0.1"
+    "@acyclic-labs/plugin-darwin-arm64": "0.0.1",
+    "@acyclic-labs/plugin-darwin-x64": "0.0.1",
+    "@acyclic-labs/plugin-linux-x64": "0.0.1",
+    "@acyclic-labs/plugin-linux-arm64": "0.0.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

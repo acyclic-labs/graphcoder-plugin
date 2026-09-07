@@ -10,8 +10,8 @@ use acyclic_fs::model::{
     MutationMode, VolumeConfig,
 };
 use acyclic_fs::{
-    CancellationToken, Checkout, LocalAuthorityBackend, LocalFs, LocalObjectBackend, LocalOptions,
-    VolumeId, WorkCounters,
+    CancellationToken, Checkout, LocalAuthorityBackend, LocalFs, LocalObjectBackend,
+    LocalObjectsDurability, LocalOptions, LocalStreamDurability, VolumeId, WorkCounters,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +132,17 @@ pub fn read_only() -> CheckoutMode {
     }
 }
 
+/// Barrier durability for both providers: a full device flush per journal
+/// frame costs ~5ms each on Apple SSDs and a small capture issues dozens,
+/// while the store only needs to survive a daemon crash — a torn tail after
+/// power loss just drops the newest checkpoint.
+pub fn local_options(root: impl Into<PathBuf>) -> LocalOptions {
+    let mut options = LocalOptions::new(root);
+    options.stream.durability = LocalStreamDurability::Barrier;
+    options.objects.durability = LocalObjectsDurability::Barrier;
+    options
+}
+
 impl Store {
     /// Creates the store for a repo: directories, volume, meta record.
     /// Fails if the store already exists.
@@ -146,7 +157,8 @@ impl Store {
         std::fs::create_dir_all(paths.trash())?;
 
         let cancel = CancellationToken::new();
-        let fs = LocalFs::local(LocalOptions::new(paths.object_store()))
+        let fs = LocalFs::local(local_options(paths.object_store()))
+            .await
             .map_err(EngineError::fs("open object store"))?;
         let volume_id = VolumeId::new();
         let volume = fs
@@ -200,7 +212,8 @@ impl Store {
         }
 
         let cancel = CancellationToken::new();
-        let fs = LocalFs::local(LocalOptions::new(paths.object_store()))
+        let fs = LocalFs::local(local_options(paths.object_store()))
+            .await
             .map_err(EngineError::fs("open object store"))?;
         let volume = fs
             .open_volume(meta.volume_id, WorkCounters::UNBOUNDED, &cancel)
@@ -288,8 +301,7 @@ mod tests {
         let repo = tempfile::tempdir().expect("repo dir");
         let stores = tempfile::tempdir().expect("stores dir");
         std::fs::write(repo.path().join("file.txt"), b"hi").expect("seed file");
-        let paths =
-            StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
+        let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
 
         let created = Store::init(repo.path(), paths.clone()).await.expect("init");
         let created_id = created.volume_id;
@@ -307,8 +319,7 @@ mod tests {
     async fn double_init_is_refused() {
         let repo = tempfile::tempdir().expect("repo dir");
         let stores = tempfile::tempdir().expect("stores dir");
-        let paths =
-            StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
+        let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
         Store::init(repo.path(), paths.clone()).await.expect("init");
         assert!(Store::init(repo.path(), paths).await.is_err());
     }

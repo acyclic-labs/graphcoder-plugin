@@ -1,5 +1,6 @@
 //! `acyclic` — checkpoints, rewind, and blast-radius diff for agent sessions.
 
+mod brief;
 mod client;
 mod hook;
 mod install;
@@ -36,8 +37,13 @@ enum Command {
     Checkpoint {
         #[arg(short = 'm', long)]
         message: Option<String>,
-        /// Wait for the checkpoint to land (default replies on enqueue).
-        #[arg(long)]
+        /// Return as soon as the checkpoint is queued instead of waiting for
+        /// it to land. Only safe when nothing edits the tree right after:
+        /// a queued snapshot can include edits made before it runs.
+        #[arg(long, conflicts_with = "durable")]
+        no_wait: bool,
+        /// Accepted for compatibility: waiting is now the default.
+        #[arg(long, hide = true)]
         wait: bool,
         /// Also publish to the durable authority (coarse boundary).
         #[arg(long)]
@@ -52,12 +58,45 @@ enum Command {
         #[arg(long)]
         tool_name: Option<String>,
     },
-    /// List checkpoints, newest first.
+    /// List checkpoints, newest first, with their conversation turn.
     Timeline {
         #[arg(long)]
         session: Option<String>,
+        /// Only this conversation turn of --session.
+        #[arg(long)]
+        turn: Option<i64>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+    },
+    /// Conversation turns: which prompt caused which checkpoints.
+    Turns {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// One checkpoint resolved to its session, turn, and prompt.
+    Show { checkpoint: i64 },
+    /// Host sessions, newest first.
+    Sessions {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Previous-session summary (what the SessionStart hook hands the agent).
+    Brief {
+        /// The session asking, excluded from the summary.
+        #[arg(long)]
+        current: Option<String>,
+        /// Emit JSON instead of the agent-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore one or more paths from a checkpoint, leaving the rest of the
+    /// tree untouched.
+    Restore {
+        /// Checkpoint id from `acyclic timeline`.
+        checkpoint: i64,
+        /// Paths relative to the repo root.
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     /// Restore the tree to a checkpoint (untracked files included).
     Rewind {
@@ -73,10 +112,15 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Blast radius: what changed between two checkpoints.
+    /// Blast radius: what changed between two checkpoints, or in one turn.
     Diff {
         before: Option<i64>,
         after: Option<i64>,
+        /// What one conversation turn changed (latest session unless --session).
+        #[arg(long, conflicts_with_all = ["before", "after"])]
+        turn: Option<i64>,
+        #[arg(long, requires = "turn")]
+        session: Option<String>,
         /// One line per file (the default output already is).
         #[arg(long)]
         stat: bool,
@@ -92,6 +136,11 @@ enum Command {
     ForkDrop { id: String },
     /// Land a fork's changes in the real working tree.
     Promote { id: String },
+    /// Blast radius of a live fork against its base, without landing it.
+    ForkDiff { id: String },
+    /// Print the fork-decomposition parameters ([decompose] in
+    /// .acyclic/config.toml over machine defaults) for the skill to read.
+    Policy,
     /// Daemon and store health.
     Status,
     /// Publish pending checkpoints to the durable authority now.
@@ -102,7 +151,7 @@ enum Command {
     /// performs the matching engine action. Always exits 0 (never blocks the
     /// agent); a missing daemon is a silent no-op.
     Hook {
-        /// pre-tool | post-tool | session-start | session-end
+        /// pre-tool | post-tool | user-prompt | session-start | session-end
         event: String,
     },
     /// Wire a host's adapter into the current repo.
@@ -120,6 +169,17 @@ enum Command {
     /// Record a host session ending (hook use).
     #[command(hide = true)]
     SessionEnd { session_id: String },
+    /// Safe Mode: commit a session's shadow fork and show what it would
+    /// change, without touching the real tree yet.
+    #[command(hide = true)]
+    SessionResolve { session_id: String },
+    /// Safe Mode: apply a `session-resolve`d session's changes to the real
+    /// tree.
+    #[command(hide = true)]
+    SessionApply { session_id: String },
+    /// Safe Mode: discard a `session-resolve`d session without applying it.
+    #[command(hide = true)]
+    SessionDiscard { session_id: String },
     /// Internal: the per-repo daemon process.
     #[command(name = "__daemon", hide = true)]
     Daemon { repo_root: PathBuf },
@@ -139,15 +199,17 @@ fn main() {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
-    let repo = cli
-        .repo
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .canonicalize()
-        .unwrap_or_else(|error| {
-            eprintln!("acyclic: bad repo path: {error}");
-            std::process::exit(1);
-        });
+    let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+    // Before touching the repo path (canonicalize, config load, socket): a
+    // crashed Safe Mode daemon can leave a dead shadow mount over the repo
+    // root that wedges every stat under it. Force-unmount it first (a no-op
+    // unless a bounded probe shows the mount is genuinely wedged), so the
+    // real tree is back before we read anything.
+    acyclic_engine::fork::reap_dead_shadow(&repo_arg);
+    let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
+        eprintln!("acyclic: bad repo path: {error}");
+        std::process::exit(1);
+    });
     let code = run(cli, &repo);
     std::process::exit(code);
 }
@@ -162,16 +224,24 @@ fn run(cli: Cli, repo: &Path) -> i32 {
             }
         },
         Command::Init => init(repo),
+        Command::Policy => policy(repo),
         Command::Hook { event } => hook::run(repo, &event),
         Command::Install { host } => match install::run(repo, &host) {
-            Ok(()) => 0,
+            Ok(()) => {
+                print_mount_capability();
+                0
+            }
             Err(message) => {
                 eprintln!("acyclic install: {message}");
                 1
             }
         },
         command => {
-            let spawn = if cli.hook { Spawn::Never } else { Spawn::Allowed };
+            let spawn = if cli.hook {
+                Spawn::Never
+            } else {
+                Spawn::Allowed
+            };
             let mut client = match connect(repo, spawn) {
                 Ok(client) => client,
                 Err(ConnectError::NoDaemon) => {
@@ -195,8 +265,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
 }
 
 fn store_paths(repo: &Path) -> Result<acyclic_engine::store::StorePaths, String> {
-    let config =
-        acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+    let config = acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
     acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
         .map_err(|error| error.to_string())
@@ -206,6 +275,46 @@ fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
     let paths = store_paths(repo).map_err(ConnectError::Other)?;
     let log = paths.root.join("daemon.log");
     Client::connect(&paths.socket(), repo, &log, spawn)
+}
+
+/// One line on what forks and Safe Mode can do here, plus setup steps when
+/// the host lacks a mount provider. Shown by `init` and `install`.
+fn print_mount_capability() {
+    let capability = acyclic_engine::fork::mount_capability();
+    if capability.available {
+        println!("mounts:        {} (forks and Safe Mode available)", capability.provider);
+    } else {
+        println!(
+            "mounts:        unavailable ({})",
+            capability.reason.as_deref().unwrap_or("unknown reason")
+        );
+        println!("{}", acyclic_engine::fork::mount_setup_hint());
+    }
+}
+
+/// `acyclic policy`: the effective `[decompose]` parameters as `key = value`
+/// lines, so the skill reads one command instead of parsing TOML.
+fn policy(repo: &Path) -> i32 {
+    match acyclic_engine::config::Config::load(repo) {
+        Ok(config) => {
+            let d = config.decompose;
+            println!("fan_out = {}", d.fan_out);
+            println!("max_depth = {}", d.max_depth);
+            println!("max_forks = {}", d.max_forks);
+            println!("require_tests = {}", d.require_tests);
+            match d.test_command {
+                Some(command) => println!("test_command = {command:?}"),
+                None => println!("test_command = (infer from the repo)"),
+            }
+            println!("tie_break = {:?}", d.tie_break);
+            println!("# set these under [decompose] in .acyclic/config.toml");
+            0
+        }
+        Err(error) => {
+            eprintln!("acyclic policy: {error}");
+            1
+        }
+    }
 }
 
 fn init(repo: &Path) -> i32 {
@@ -231,6 +340,7 @@ fn init(repo: &Path) -> i32 {
         })?;
         client.call(proto::Op::Ping)?;
         println!("daemon ready — checkpointing is on");
+        print_mount_capability();
         Ok(())
     })();
     match result {
@@ -246,7 +356,8 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
     match command {
         Command::Checkpoint {
             message,
-            wait,
+            no_wait,
+            wait: _,
             durable,
             kind,
             session_id,
@@ -263,9 +374,10 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 tool_call_id,
                 tool_name,
                 label: message,
-                // A durable checkpoint is a publish barrier: fire-and-forget
-                // would let a stop race the commit, so it always waits.
-                wait: wait || durable,
+                // Waiting is the default so `checkpoint` followed by an edit
+                // snapshots the pre-edit tree. A durable checkpoint is a
+                // publish barrier and always waits.
+                wait: !no_wait || durable,
                 durable,
             })?;
             match reply {
@@ -277,9 +389,14 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Timeline { session, limit } => {
+        Command::Timeline {
+            session,
+            turn,
+            limit,
+        } => {
             let reply = client.call(proto::Op::Timeline {
                 session_id: session,
+                turn,
                 limit,
             })?;
             let proto::Reply::Timeline(entries) = reply else {
@@ -295,14 +412,154 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     .or(entry.tool_name)
                     .or(entry.error.map(|error| format!("error: {error}")))
                     .unwrap_or_default();
+                let turn = entry
+                    .turn
+                    .map(|turn| format!("t{turn}"))
+                    .unwrap_or_default();
                 println!(
-                    "#{:<5} {:<10} {:<9} {}{}",
+                    "#{:<5} {:<10} {:<9} {:<4} {}{}",
                     entry.id,
                     age(entry.created_at),
                     entry.kind,
+                    turn,
                     label,
-                    if entry.published { "" } else { "  (unpublished)" },
+                    if entry.published {
+                        ""
+                    } else {
+                        "  (unpublished)"
+                    },
                 );
+            }
+            Ok(())
+        }
+        Command::Turns { session } => {
+            let reply = client.call(proto::Op::Turns {
+                session_id: session,
+            })?;
+            let proto::Reply::Turns(turns) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if turns.is_empty() {
+                println!("no turns recorded (the user-prompt hook records them)");
+                return Ok(());
+            }
+            for turn in turns {
+                let range = match (turn.first_checkpoint, turn.last_checkpoint) {
+                    (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
+                    (Some(first), _) => format!("#{first}"),
+                    _ => "no checkpoints".to_string(),
+                };
+                println!(
+                    "{}  t{:<3} {:<10} {:<14} {}",
+                    short_session(&turn.session_id),
+                    turn.turn,
+                    age(turn.started_at),
+                    range,
+                    brief::quote(&turn.prompt, 72),
+                );
+            }
+            Ok(())
+        }
+        Command::Show { checkpoint } => {
+            let reply = client.call(proto::Op::Inspect { checkpoint })?;
+            let proto::Reply::Inspect(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            println!("checkpoint:  #{}  ({}{})", info.id, info.kind, if info.published { "" } else { ", unpublished" });
+            println!("generation:  {}", info.generation);
+            println!("created:     {}", age(info.created_at));
+            match &info.session_id {
+                Some(session) => println!(
+                    "session:     {}{}",
+                    session,
+                    info.host.as_ref().map(|host| format!("  ({host})")).unwrap_or_default()
+                ),
+                None => println!("session:     none (outside any host session)"),
+            }
+            match info.turn {
+                Some(turn) => println!("turn:        {turn}"),
+                None => println!("turn:        none"),
+            }
+            if let Some(prompt) = &info.prompt {
+                println!("prompt:      {}", brief::quote(prompt, 200));
+            }
+            if let Some(tool) = &info.tool_name {
+                println!(
+                    "tool:        {tool}{}",
+                    info.tool_call_id.as_ref().map(|id| format!("  ({id})")).unwrap_or_default()
+                );
+            }
+            if let Some(label) = &info.label {
+                println!("label:       {label}");
+            }
+            if let Some(target) = info.rewind_target {
+                println!("rewind to:   #{target}");
+            }
+            if let Some(error) = &info.error {
+                println!("error:       {error}");
+            }
+            Ok(())
+        }
+        Command::Sessions { limit } => {
+            let reply = client.call(proto::Op::Sessions { limit })?;
+            let proto::Reply::Sessions(sessions) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if sessions.is_empty() {
+                println!("no sessions recorded");
+                return Ok(());
+            }
+            for session in sessions {
+                println!(
+                    "{}  {:<12} started {:<10} {:<12} {:>3} turns  {:>4} checkpoints  ends at {}",
+                    short_session(&session.session_id),
+                    session.host.unwrap_or_default(),
+                    age(session.started_at),
+                    session
+                        .ended_at
+                        .map(|ended| format!("ended {}", age(ended)))
+                        .unwrap_or_else(|| "(no end)".into()),
+                    session.turns,
+                    session.checkpoints,
+                    session
+                        .end_checkpoint
+                        .map(|id| format!("#{id}"))
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+            Ok(())
+        }
+        Command::Brief { current, json } => {
+            let reply = client.call(proto::Op::Brief { current })?;
+            let proto::Reply::Brief(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info).map_err(|error| error.to_string())?
+                );
+            } else {
+                print!("{}", brief::render(&info));
+            }
+            Ok(())
+        }
+        Command::Restore { checkpoint, paths } => {
+            for path in paths {
+                let reply = client.call(proto::Op::Rewind {
+                    target: proto::RewindTarget::Checkpoint(checkpoint),
+                    path: Some(path),
+                })?;
+                let proto::Reply::Restore(info) = reply else {
+                    return Err("unexpected reply".into());
+                };
+                match info.action.as_str() {
+                    "removed" => println!("{}: absent at #{}, removed", info.path, info.checkpoint),
+                    _ => println!("{}: restored from #{}", info.path, info.checkpoint),
+                }
+                if let Some(recorded) = info.recorded_checkpoint {
+                    println!("  recorded as checkpoint #{recorded}");
+                }
             }
             Ok(())
         }
@@ -338,7 +595,17 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             println!("note: {}", info.warning);
             Ok(())
         }
-        Command::Diff { before, after, .. } => {
+        Command::Diff {
+            before,
+            after,
+            turn,
+            session,
+            ..
+        } => {
+            let (before, after) = match turn {
+                Some(turn) => turn_range(client, session, turn)?,
+                None => (before, after),
+            };
             let reply = client.call(proto::Op::Diff { before, after })?;
             let proto::Reply::Diff(entries) = reply else {
                 return Err("unexpected reply".into());
@@ -360,17 +627,26 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Fork { count } => {
-            let reply = client.call(proto::Op::Fork { count })?;
+            let reply = client.call(proto::Op::Fork {
+                count,
+                session_id: None,
+            })?;
             let proto::Reply::Forks(entries) = reply else {
                 return Err("unexpected reply".into());
             };
             for entry in &entries {
-                println!("fork {}  {}", entry.id, entry.path);
+                println!("fork {}  ({})  {}", entry.id, entry.mode, entry.path);
             }
             println!(
                 "{} fork(s) ready — work in them freely; `acyclic promote <id>` keeps a winner",
                 entries.len()
             );
+            if entries.iter().any(|entry| entry.mode == "copy") {
+                println!(
+                    "note: no mount provider on this host, so these are full copies \
+                     (`acyclic status` explains; promote works the same)"
+                );
+            }
             Ok(())
         }
         Command::Forks => {
@@ -384,8 +660,9 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             for entry in entries {
                 println!(
-                    "{}  {}  {}  base {}",
+                    "{}  {}  {}  {}  base {}",
                     entry.id,
+                    entry.mode,
                     age(entry.created_at),
                     entry.path,
                     &entry.base[..12]
@@ -403,14 +680,42 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             let proto::Reply::Promote(info) = reply else {
                 return Err("unexpected reply".into());
             };
-            match info.old_tree {
-                Some(old_tree) => {
+            match (info.old_tree, info.replayed_paths) {
+                (Some(old_tree), _) => {
                     println!("promoted: working tree now at {}", &info.generation[..12]);
                     println!("old tree kept at {old_tree}");
                     println!("note: {}", info.warning);
                 }
-                None => println!("fork had no changes; nothing to land"),
+                (None, paths) if paths > 0 => {
+                    println!(
+                        "promoted by replay: {paths} path(s) written in place, tree now at {}",
+                        &info.generation[..12]
+                    );
+                    println!("note: {}", info.warning);
+                }
+                (None, _) => println!("fork had no changes; nothing to land"),
             }
+            Ok(())
+        }
+        Command::ForkDiff { id } => {
+            let reply = client.call(proto::Op::ForkDiff { id })?;
+            let proto::Reply::Diff(entries) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if entries.is_empty() {
+                println!("no changes");
+                return Ok(());
+            }
+            for entry in &entries {
+                let tag = match entry.change.as_str() {
+                    "added" => "A",
+                    "removed" => "D",
+                    "modified" => "M",
+                    _ => "m",
+                };
+                println!("{tag} {}", entry.path);
+            }
+            println!("{} paths changed", entries.len());
             Ok(())
         }
         Command::Status => {
@@ -428,6 +733,14 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             );
             println!("unpublished:   {}", info.unpublished);
             println!("store size:    {}", human_bytes(info.store_bytes));
+            if info.mount_available {
+                println!("mounts:        {} (forks mount, Safe Mode on)", info.mount_provider);
+            } else {
+                println!(
+                    "mounts:        unavailable ({}) — forks copy, Safe Mode off",
+                    info.mount_reason.as_deref().unwrap_or("unknown reason")
+                );
+            }
             Ok(())
         }
         Command::Commit => {
@@ -448,10 +761,105 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             client.call(proto::Op::SessionEnd { session_id })?;
             Ok(())
         }
-        Command::Init | Command::Daemon { .. } | Command::Hook { .. } | Command::Install { .. } => {
+        Command::SessionResolve { session_id } => {
+            let reply = client.call(proto::Op::SessionResolve { session_id })?;
+            let proto::Reply::SessionPending(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if info.diff.is_empty() {
+                println!("session {}: no changes", info.session_id);
+                return Ok(());
+            }
+            for entry in &info.diff {
+                let tag = match entry.change.as_str() {
+                    "added" => "A",
+                    "removed" => "D",
+                    "modified" => "M",
+                    _ => "m",
+                };
+                println!("{tag} {}", entry.path);
+            }
+            println!(
+                "{} paths changed; run `acyclic session-apply {}` to land them or \
+                 `acyclic session-discard {}` to throw them away",
+                info.diff.len(),
+                info.session_id,
+                info.session_id
+            );
+            Ok(())
+        }
+        Command::SessionApply { session_id } => {
+            let reply = client.call(proto::Op::SessionApply { session_id })?;
+            let proto::Reply::Promote(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            match info.old_tree {
+                Some(old_tree) => {
+                    println!("applied: working tree now at {}", &info.generation[..12]);
+                    println!("old tree kept at {old_tree}");
+                    println!("note: {}", info.warning);
+                }
+                None => println!("session had no changes; nothing to land"),
+            }
+            Ok(())
+        }
+        Command::SessionDiscard { session_id } => {
+            client.call(proto::Op::SessionDiscard { session_id })?;
+            Ok(())
+        }
+        Command::Init
+        | Command::Policy
+        | Command::Daemon { .. }
+        | Command::Hook { .. }
+        | Command::Install { .. } => {
             unreachable!("handled in run()")
         }
     }
+}
+
+/// Resolves `--turn N` to (base, last) checkpoint ids: the latest real
+/// checkpoint before the turn's first one, and the turn's last one.
+fn turn_range(
+    client: &mut Client,
+    session: Option<String>,
+    turn: i64,
+) -> Result<(Option<i64>, Option<i64>), String> {
+    let session = match session {
+        Some(session) => session,
+        None => {
+            let proto::Reply::Sessions(sessions) = client.call(proto::Op::Sessions { limit: 1 })?
+            else {
+                return Err("unexpected reply".into());
+            };
+            sessions
+                .into_iter()
+                .next()
+                .map(|session| session.session_id)
+                .ok_or("no sessions recorded")?
+        }
+    };
+    let proto::Reply::Turns(turns) = client.call(proto::Op::Turns {
+        session_id: Some(session.clone()),
+    })?
+    else {
+        return Err("unexpected reply".into());
+    };
+    let entry = turns
+        .into_iter()
+        .find(|entry| entry.turn == turn)
+        .ok_or(format!("session {session} has no turn {turn}"))?;
+    let Some(last) = entry.last_checkpoint else {
+        return Err(format!("turn {turn} produced no checkpoints"));
+    };
+    Ok((entry.base_checkpoint, Some(last)))
+}
+
+fn short_session(session_id: &str) -> String {
+    let mut short: String = session_id.chars().take(8).collect();
+    if session_id.chars().count() > 8 {
+        short.push('…');
+    }
+    short
 }
 
 fn age(created_at: i64) -> String {

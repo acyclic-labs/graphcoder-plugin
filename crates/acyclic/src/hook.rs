@@ -1,7 +1,10 @@
 //! Host-hook entrypoint. Claude Code (and compatible hosts) invoke
 //! `acyclic hook <event>` with a JSON payload on stdin. The contract:
 //! NEVER block or fail the agent — every path exits 0, a missing daemon is
-//! a silent no-op, and pre-tool waits are bounded.
+//! a silent no-op, and pre-tool waits are bounded. The one exception is
+//! `session-start`: it runs once per session, before any edit, and the host
+//! waits for it anyway, so it starts the daemon if none is running. Without
+//! that, a session begun after a reboot would never be checkpointed.
 
 use std::io::Read;
 use std::path::Path;
@@ -20,6 +23,12 @@ struct Payload {
     tool_name: Option<String>,
     #[serde(default)]
     tool_use_id: Option<String>,
+    /// `UserPromptSubmit`: the prompt text.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// `SessionStart`: "startup" | "resume" | "clear" | "compact".
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// The bound on a pre-tool wait: an exact boundary is nice to have, but the
@@ -33,7 +42,12 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = parse_payload(&raw);
 
-    let Ok(mut client) = connect(repo) else {
+    let spawn = if event == "session-start" {
+        Spawn::Allowed
+    } else {
+        Spawn::Never
+    };
+    let Ok(mut client) = connect(repo, spawn) else {
         // No daemon (not initialized, or stopped): checkpointing is off.
         // Stay quiet — hooks fire on every tool call.
         return 0;
@@ -58,10 +72,34 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             wait: false,
             durable: false,
         },
-        "session-start" => proto::Op::SessionStart {
+        "user-prompt" => proto::Op::TurnStart {
             session_id: payload.session_id.unwrap_or_default(),
-            host: "claude-code".into(),
+            prompt: payload.prompt.unwrap_or_default(),
         },
+        "session-start" => {
+            let session_id = payload.session_id.unwrap_or_default();
+            let registered = client.call(proto::Op::SessionStart {
+                session_id: session_id.clone(),
+                host: "claude-code".into(),
+            });
+            if let Err(message) = registered {
+                eprintln!("acyclic hook (session-start): {message}");
+                return 0;
+            }
+            // Stdout of a SessionStart hook lands in the agent's context:
+            // hand it the previous session's end state and abandoned
+            // branches. A compaction restart already has that context.
+            if payload.source.as_deref() != Some("compact") {
+                match client.call(proto::Op::Brief {
+                    current: Some(session_id),
+                }) {
+                    Ok(proto::Reply::Brief(info)) => print!("{}", crate::brief::render(&info)),
+                    Ok(_) => {}
+                    Err(message) => eprintln!("acyclic hook (session-start brief): {message}"),
+                }
+            }
+            return 0;
+        }
         "session-end" => proto::Op::SessionEnd {
             session_id: payload.session_id.unwrap_or_default(),
         },
@@ -88,10 +126,10 @@ fn parse_payload(raw: &str) -> Payload {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
-fn connect(repo: &Path) -> Result<Client, ConnectError> {
+fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
     let paths = crate::store_paths(repo).map_err(ConnectError::Other)?;
     let log = paths.root.join("daemon.log");
-    Client::connect(&paths.socket(), repo, &log, Spawn::Never)
+    Client::connect(&paths.socket(), repo, &log, spawn)
 }
 
 #[cfg(test)]
@@ -109,6 +147,17 @@ mod tests {
         assert_eq!(payload.session_id.as_deref(), Some("abc"));
         assert_eq!(payload.tool_name.as_deref(), Some("Edit"));
         assert_eq!(payload.tool_use_id.as_deref(), Some("toolu_01"));
+    }
+
+    #[test]
+    fn user_prompt_payload_carries_the_prompt() {
+        let payload = parse_payload(
+            r#"{"session_id":"abc","hook_event_name":"UserPromptSubmit",
+                "prompt":"fix the JWT refactor"}"#,
+        );
+        assert_eq!(payload.prompt.as_deref(), Some("fix the JWT refactor"));
+        let start = parse_payload(r#"{"session_id":"abc","source":"compact"}"#);
+        assert_eq!(start.source.as_deref(), Some("compact"));
     }
 
     #[test]
