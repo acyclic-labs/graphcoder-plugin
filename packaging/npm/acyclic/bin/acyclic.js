@@ -6,10 +6,10 @@
 const { execFileSync, spawnSync } = require("node:child_process");
 
 const PLATFORMS = {
-  "darwin arm64": "@acyclic-labs/acyclic-darwin-arm64",
-  "darwin x64": "@acyclic-labs/acyclic-darwin-x64",
-  "linux x64": "@acyclic-labs/acyclic-linux-x64",
-  "linux arm64": "@acyclic-labs/acyclic-linux-arm64",
+  "darwin arm64": "@acyclic-labs/plugin-darwin-arm64",
+  "darwin x64": "@acyclic-labs/plugin-darwin-x64",
+  "linux x64": "@acyclic-labs/plugin-linux-x64",
+  "linux arm64": "@acyclic-labs/plugin-linux-arm64",
 };
 
 const key = `${process.platform} ${process.arch}`;
