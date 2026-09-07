@@ -20,6 +20,12 @@ struct Payload {
     tool_name: Option<String>,
     #[serde(default)]
     tool_use_id: Option<String>,
+    /// `UserPromptSubmit`: the prompt text.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// `SessionStart`: "startup" | "resume" | "clear" | "compact".
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// The bound on a pre-tool wait: an exact boundary is nice to have, but the
@@ -58,10 +64,34 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             wait: false,
             durable: false,
         },
-        "session-start" => proto::Op::SessionStart {
+        "user-prompt" => proto::Op::TurnStart {
             session_id: payload.session_id.unwrap_or_default(),
-            host: "claude-code".into(),
+            prompt: payload.prompt.unwrap_or_default(),
         },
+        "session-start" => {
+            let session_id = payload.session_id.unwrap_or_default();
+            let registered = client.call(proto::Op::SessionStart {
+                session_id: session_id.clone(),
+                host: "claude-code".into(),
+            });
+            if let Err(message) = registered {
+                eprintln!("acyclic hook (session-start): {message}");
+                return 0;
+            }
+            // Stdout of a SessionStart hook lands in the agent's context:
+            // hand it the previous session's end state and abandoned
+            // branches. A compaction restart already has that context.
+            if payload.source.as_deref() != Some("compact") {
+                match client.call(proto::Op::Brief {
+                    current: Some(session_id),
+                }) {
+                    Ok(proto::Reply::Brief(info)) => print!("{}", crate::brief::render(&info)),
+                    Ok(_) => {}
+                    Err(message) => eprintln!("acyclic hook (session-start brief): {message}"),
+                }
+            }
+            return 0;
+        }
         "session-end" => proto::Op::SessionEnd {
             session_id: payload.session_id.unwrap_or_default(),
         },
@@ -109,6 +139,17 @@ mod tests {
         assert_eq!(payload.session_id.as_deref(), Some("abc"));
         assert_eq!(payload.tool_name.as_deref(), Some("Edit"));
         assert_eq!(payload.tool_use_id.as_deref(), Some("toolu_01"));
+    }
+
+    #[test]
+    fn user_prompt_payload_carries_the_prompt() {
+        let payload = parse_payload(
+            r#"{"session_id":"abc","hook_event_name":"UserPromptSubmit",
+                "prompt":"fix the JWT refactor"}"#,
+        );
+        assert_eq!(payload.prompt.as_deref(), Some("fix the JWT refactor"));
+        let start = parse_payload(r#"{"session_id":"abc","source":"compact"}"#);
+        assert_eq!(start.source.as_deref(), Some("compact"));
     }
 
     #[test]

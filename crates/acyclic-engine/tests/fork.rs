@@ -135,7 +135,7 @@ fn promote_lands_fork_changes() {
 
     // I6: fork base + promote rows exist.
     let index = Index::open(&rig.paths.index_db()).expect("index");
-    let rows = index.list(None, 50).expect("rows");
+    let rows = index.list(None, None, 50).expect("rows");
     assert!(rows.iter().any(|row| {
         row.kind == CheckpointKind::Manual && row.label.as_deref() == Some("fork base")
     }));

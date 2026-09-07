@@ -1,5 +1,6 @@
 //! `acyclic` — checkpoints, rewind, and blast-radius diff for agent sessions.
 
+mod brief;
 mod client;
 mod hook;
 mod install;
@@ -52,12 +53,45 @@ enum Command {
         #[arg(long)]
         tool_name: Option<String>,
     },
-    /// List checkpoints, newest first.
+    /// List checkpoints, newest first, with their conversation turn.
     Timeline {
         #[arg(long)]
         session: Option<String>,
+        /// Only this conversation turn of --session.
+        #[arg(long)]
+        turn: Option<i64>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+    },
+    /// Conversation turns: which prompt caused which checkpoints.
+    Turns {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// One checkpoint resolved to its session, turn, and prompt.
+    Show { checkpoint: i64 },
+    /// Host sessions, newest first.
+    Sessions {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Previous-session summary (what the SessionStart hook hands the agent).
+    Brief {
+        /// The session asking, excluded from the summary.
+        #[arg(long)]
+        current: Option<String>,
+        /// Emit JSON instead of the agent-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore one or more paths from a checkpoint, leaving the rest of the
+    /// tree untouched.
+    Restore {
+        /// Checkpoint id from `acyclic timeline`.
+        checkpoint: i64,
+        /// Paths relative to the repo root.
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     /// Restore the tree to a checkpoint (untracked files included).
     Rewind {
@@ -73,10 +107,15 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Blast radius: what changed between two checkpoints.
+    /// Blast radius: what changed between two checkpoints, or in one turn.
     Diff {
         before: Option<i64>,
         after: Option<i64>,
+        /// What one conversation turn changed (latest session unless --session).
+        #[arg(long, conflicts_with_all = ["before", "after"])]
+        turn: Option<i64>,
+        #[arg(long, requires = "turn")]
+        session: Option<String>,
         /// One line per file (the default output already is).
         #[arg(long)]
         stat: bool,
@@ -102,7 +141,7 @@ enum Command {
     /// performs the matching engine action. Always exits 0 (never blocks the
     /// agent); a missing daemon is a silent no-op.
     Hook {
-        /// pre-tool | post-tool | session-start | session-end
+        /// pre-tool | post-tool | user-prompt | session-start | session-end
         event: String,
     },
     /// Wire a host's adapter into the current repo.
@@ -293,9 +332,14 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Timeline { session, limit } => {
+        Command::Timeline {
+            session,
+            turn,
+            limit,
+        } => {
             let reply = client.call(proto::Op::Timeline {
                 session_id: session,
+                turn,
                 limit,
             })?;
             let proto::Reply::Timeline(entries) = reply else {
@@ -311,11 +355,16 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     .or(entry.tool_name)
                     .or(entry.error.map(|error| format!("error: {error}")))
                     .unwrap_or_default();
+                let turn = entry
+                    .turn
+                    .map(|turn| format!("t{turn}"))
+                    .unwrap_or_default();
                 println!(
-                    "#{:<5} {:<10} {:<9} {}{}",
+                    "#{:<5} {:<10} {:<9} {:<4} {}{}",
                     entry.id,
                     age(entry.created_at),
                     entry.kind,
+                    turn,
                     label,
                     if entry.published {
                         ""
@@ -323,6 +372,137 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                         "  (unpublished)"
                     },
                 );
+            }
+            Ok(())
+        }
+        Command::Turns { session } => {
+            let reply = client.call(proto::Op::Turns {
+                session_id: session,
+            })?;
+            let proto::Reply::Turns(turns) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if turns.is_empty() {
+                println!("no turns recorded (the user-prompt hook records them)");
+                return Ok(());
+            }
+            for turn in turns {
+                let range = match (turn.first_checkpoint, turn.last_checkpoint) {
+                    (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
+                    (Some(first), _) => format!("#{first}"),
+                    _ => "no checkpoints".to_string(),
+                };
+                println!(
+                    "{}  t{:<3} {:<10} {:<14} {}",
+                    short_session(&turn.session_id),
+                    turn.turn,
+                    age(turn.started_at),
+                    range,
+                    brief::quote(&turn.prompt, 72),
+                );
+            }
+            Ok(())
+        }
+        Command::Show { checkpoint } => {
+            let reply = client.call(proto::Op::Inspect { checkpoint })?;
+            let proto::Reply::Inspect(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            println!("checkpoint:  #{}  ({}{})", info.id, info.kind, if info.published { "" } else { ", unpublished" });
+            println!("generation:  {}", info.generation);
+            println!("created:     {}", age(info.created_at));
+            match &info.session_id {
+                Some(session) => println!(
+                    "session:     {}{}",
+                    session,
+                    info.host.as_ref().map(|host| format!("  ({host})")).unwrap_or_default()
+                ),
+                None => println!("session:     none (outside any host session)"),
+            }
+            match info.turn {
+                Some(turn) => println!("turn:        {turn}"),
+                None => println!("turn:        none"),
+            }
+            if let Some(prompt) = &info.prompt {
+                println!("prompt:      {}", brief::quote(prompt, 200));
+            }
+            if let Some(tool) = &info.tool_name {
+                println!(
+                    "tool:        {tool}{}",
+                    info.tool_call_id.as_ref().map(|id| format!("  ({id})")).unwrap_or_default()
+                );
+            }
+            if let Some(label) = &info.label {
+                println!("label:       {label}");
+            }
+            if let Some(target) = info.rewind_target {
+                println!("rewind to:   #{target}");
+            }
+            if let Some(error) = &info.error {
+                println!("error:       {error}");
+            }
+            Ok(())
+        }
+        Command::Sessions { limit } => {
+            let reply = client.call(proto::Op::Sessions { limit })?;
+            let proto::Reply::Sessions(sessions) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if sessions.is_empty() {
+                println!("no sessions recorded");
+                return Ok(());
+            }
+            for session in sessions {
+                println!(
+                    "{}  {:<12} started {:<10} {:<12} {:>3} turns  {:>4} checkpoints  ends at {}",
+                    short_session(&session.session_id),
+                    session.host.unwrap_or_default(),
+                    age(session.started_at),
+                    session
+                        .ended_at
+                        .map(|ended| format!("ended {}", age(ended)))
+                        .unwrap_or_else(|| "(no end)".into()),
+                    session.turns,
+                    session.checkpoints,
+                    session
+                        .end_checkpoint
+                        .map(|id| format!("#{id}"))
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+            Ok(())
+        }
+        Command::Brief { current, json } => {
+            let reply = client.call(proto::Op::Brief { current })?;
+            let proto::Reply::Brief(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info).map_err(|error| error.to_string())?
+                );
+            } else {
+                print!("{}", brief::render(&info));
+            }
+            Ok(())
+        }
+        Command::Restore { checkpoint, paths } => {
+            for path in paths {
+                let reply = client.call(proto::Op::Rewind {
+                    target: proto::RewindTarget::Checkpoint(checkpoint),
+                    path: Some(path),
+                })?;
+                let proto::Reply::Restore(info) = reply else {
+                    return Err("unexpected reply".into());
+                };
+                match info.action.as_str() {
+                    "removed" => println!("{}: absent at #{}, removed", info.path, info.checkpoint),
+                    _ => println!("{}: restored from #{}", info.path, info.checkpoint),
+                }
+                if let Some(recorded) = info.recorded_checkpoint {
+                    println!("  recorded as checkpoint #{recorded}");
+                }
             }
             Ok(())
         }
@@ -358,7 +538,17 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             println!("note: {}", info.warning);
             Ok(())
         }
-        Command::Diff { before, after, .. } => {
+        Command::Diff {
+            before,
+            after,
+            turn,
+            session,
+            ..
+        } => {
+            let (before, after) = match turn {
+                Some(turn) => turn_range(client, session, turn)?,
+                None => (before, after),
+            };
             let reply = client.call(proto::Op::Diff { before, after })?;
             let proto::Reply::Diff(entries) = reply else {
                 return Err("unexpected reply".into());
@@ -521,6 +711,51 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             unreachable!("handled in run()")
         }
     }
+}
+
+/// Resolves `--turn N` to (base, last) checkpoint ids: the latest real
+/// checkpoint before the turn's first one, and the turn's last one.
+fn turn_range(
+    client: &mut Client,
+    session: Option<String>,
+    turn: i64,
+) -> Result<(Option<i64>, Option<i64>), String> {
+    let session = match session {
+        Some(session) => session,
+        None => {
+            let proto::Reply::Sessions(sessions) = client.call(proto::Op::Sessions { limit: 1 })?
+            else {
+                return Err("unexpected reply".into());
+            };
+            sessions
+                .into_iter()
+                .next()
+                .map(|session| session.session_id)
+                .ok_or("no sessions recorded")?
+        }
+    };
+    let proto::Reply::Turns(turns) = client.call(proto::Op::Turns {
+        session_id: Some(session.clone()),
+    })?
+    else {
+        return Err("unexpected reply".into());
+    };
+    let entry = turns
+        .into_iter()
+        .find(|entry| entry.turn == turn)
+        .ok_or(format!("session {session} has no turn {turn}"))?;
+    let Some(last) = entry.last_checkpoint else {
+        return Err(format!("turn {turn} produced no checkpoints"));
+    };
+    Ok((entry.base_checkpoint, Some(last)))
+}
+
+fn short_session(session_id: &str) -> String {
+    let mut short: String = session_id.chars().take(8).collect();
+    if session_id.chars().count() > 8 {
+        short.push('…');
+    }
+    short
 }
 
 fn age(created_at: i64) -> String {

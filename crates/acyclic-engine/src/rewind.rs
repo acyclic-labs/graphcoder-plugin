@@ -3,13 +3,14 @@
 //! in trash, and journal every phase so kill -9 leaves the repo fully-old or
 //! fully-new — never mixed.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use acyclic_fs::{materialize_checkout, MaterializeOptions};
+use acyclic_fs::kernel::{FileKind, FilePayload, LogicalName, MetadataField, NameEncoding, NamespacePath};
+use acyclic_fs::{materialize_checkout, ByteRange, MaterializeOptions};
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
-use crate::store::Store;
+use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
 
 const MAXIMUM_DIRECTORY_ENTRIES: u32 = 1_024;
@@ -24,6 +25,305 @@ pub struct RewindOutcome {
     pub old_tree: PathBuf,
     /// User-facing caveat: open editors keep inodes from the old tree.
     pub warning: &'static str,
+}
+
+/// What a single-path restore did to the working tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreAction {
+    /// The path now matches the checkpoint's content.
+    Restored,
+    /// The path was absent at the checkpoint and has been removed.
+    Removed,
+}
+
+/// Result of [`restore_path`].
+#[derive(Clone, Debug)]
+pub struct RestoreOutcome {
+    pub path: PathBuf,
+    pub action: RestoreAction,
+}
+
+/// Restores ONE path (file, symlink, or directory subtree) from `target`
+/// into the working tree, leaving every other path untouched. The content
+/// is staged in a hidden sibling and swapped in atomically (directory
+/// subtrees use the same exchange as a full rewind), so a crash leaves the
+/// path either old or new. Called from the pipeline, which brackets it with
+/// checkpoints so the timeline records the restore.
+pub async fn restore_path(
+    store: &Store,
+    target: GenerationId,
+    relative: &Path,
+) -> Result<RestoreOutcome> {
+    let components = validate_relative(relative)?;
+    let destination = store.repo_root.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| EngineError::Restore("path has no parent".into()))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| EngineError::Restore("path has no name".into()))?
+        .to_string_lossy()
+        .into_owned();
+
+    let mut checkout = store.checkout_exact(target).await?;
+    let limits = checkout.volume_config().limits;
+    let cancel = CancellationToken::new();
+    let namespace = namespace_path(&components, limits)?;
+    let lookup = checkout
+        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
+        .await
+        .map_err(EngineError::fs("lookup"))?
+        .value;
+
+    let Some(record) = lookup.record else {
+        // Faithful restore of an absent path: remove it if it exists now.
+        return match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    std::fs::remove_dir_all(&destination)?;
+                } else {
+                    std::fs::remove_file(&destination)?;
+                }
+                Ok(RestoreOutcome {
+                    path: relative.to_path_buf(),
+                    action: RestoreAction::Removed,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(EngineError::Restore(
+                format!("{} does not exist at that checkpoint or in the tree", relative.display()),
+            )),
+            Err(error) => Err(error.into()),
+        };
+    };
+
+    // Stage next to the destination so the final rename never crosses a
+    // filesystem; the parent must exist (it did at the checkpoint, but the
+    // tree may have lost it since).
+    std::fs::create_dir_all(parent)?;
+    let staged = parent.join(format!(".{name}.acyclic-restore-{}", std::process::id()));
+    let _ = remove_any(&staged);
+    let written = write_node(&mut checkout, &namespace, record.kind, &record.payload, &staged, limits, &cancel).await;
+    if let Err(error) = written {
+        let _ = remove_any(&staged);
+        return Err(error);
+    }
+
+    // Swap in. An existing destination is exchanged atomically and the old
+    // node discarded; an absent one is a plain rename.
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            if let Err(error) = atomic_exchange(&destination, &staged) {
+                let _ = remove_any(&staged);
+                return Err(error);
+            }
+            let _ = remove_any(&staged);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(error) = std::fs::rename(&staged, &destination) {
+                let _ = remove_any(&staged);
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            let _ = remove_any(&staged);
+            return Err(error.into());
+        }
+    }
+    Ok(RestoreOutcome {
+        path: relative.to_path_buf(),
+        action: RestoreAction::Restored,
+    })
+}
+
+/// Writes one checkpoint node (recursively for directories) to a fresh host
+/// path. Modes are applied; mtimes are not (same contract as a full rewind).
+fn write_node<'a>(
+    checkout: &'a mut LocalCheckout,
+    namespace: &'a NamespacePath,
+    kind: FileKind,
+    payload: &'a FilePayload,
+    host: &'a Path,
+    limits: acyclic_fs::model::VolumeLimits,
+    cancel: &'a CancellationToken,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        match kind {
+            FileKind::Regular => {
+                let length = match payload {
+                    FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
+                    FilePayload::Regular { logical_bytes, .. } => *logical_bytes,
+                    _ => return Err(EngineError::Restore("regular file with foreign payload".into())),
+                };
+                let mut file = std::fs::File::create(host)?;
+                let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
+                let mut offset = 0;
+                while offset < length {
+                    let take = chunk.min(length - offset);
+                    let read = checkout
+                        .read_file_range(
+                            namespace,
+                            ByteRange { offset, length: take },
+                            WorkCounters::UNBOUNDED,
+                            cancel,
+                        )
+                        .await
+                        .map_err(EngineError::fs("read file range"))?
+                        .value;
+                    use std::io::Write;
+                    file.write_all(&read.bytes)?;
+                    offset += take;
+                }
+                file.sync_all()?;
+                drop(file);
+                apply_mode(checkout, namespace, host, cancel).await
+            }
+            FileKind::SymbolicLink => {
+                let target = checkout
+                    .read_symbolic_link(namespace, WorkCounters::UNBOUNDED, cancel)
+                    .await
+                    .map_err(EngineError::fs("read symlink"))?
+                    .value;
+                create_symlink(&target, host)
+            }
+            FileKind::Directory => {
+                std::fs::create_dir(host)?;
+                let mut entries = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = checkout
+                        .list_directory_records(
+                            namespace,
+                            after.as_ref(),
+                            MAXIMUM_DIRECTORY_ENTRIES,
+                            WorkCounters::UNBOUNDED,
+                            cancel,
+                        )
+                        .await
+                        .map_err(EngineError::fs("list directory"))?
+                        .value;
+                    for entry in &page.entries {
+                        entries.push((entry.name.clone(), entry.record.kind, entry.record.payload));
+                    }
+                    match page.entries.last() {
+                        Some(last) if page.has_more => after = Some(last.name.clone()),
+                        _ => break,
+                    }
+                }
+                for (name, kind, payload) in entries {
+                    let mut components = namespace.components().to_vec();
+                    components.push(name.clone());
+                    let child = NamespacePath::new(components, limits)
+                        .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?;
+                    let child_host = host.join(logical_to_os(&name));
+                    write_node(checkout, &child, kind, &payload, &child_host, limits, cancel).await?;
+                }
+                apply_mode(checkout, namespace, host, cancel).await
+            }
+            other => Err(EngineError::Restore(format!(
+                "cannot restore a {other:?} node (only files, symlinks, and directories)"
+            ))),
+        }
+    })
+}
+
+async fn apply_mode(
+    checkout: &mut LocalCheckout,
+    namespace: &NamespacePath,
+    host: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let metadata = checkout
+        .read_metadata(namespace, WorkCounters::UNBOUNDED, cancel)
+        .await
+        .map_err(EngineError::fs("read metadata"))?
+        .value;
+    #[cfg(unix)]
+    if let MetadataField::Value(mode) = metadata.posix_mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(host, std::fs::Permissions::from_mode(mode & 0o7777))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (metadata, host);
+    Ok(())
+}
+
+fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => components.push(os_to_bytes(name)),
+            Component::CurDir => {}
+            _ => {
+                return Err(EngineError::Restore(format!(
+                    "{}: path must be relative to the repo root and stay inside it",
+                    relative.display()
+                )))
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(EngineError::Restore(
+            "restoring the whole tree is `acyclic rewind`, not a path restore".into(),
+        ));
+    }
+    Ok(components)
+}
+
+fn namespace_path(
+    components: &[Vec<u8>],
+    limits: acyclic_fs::model::VolumeLimits,
+) -> Result<NamespacePath> {
+    let names = components
+        .iter()
+        .map(|bytes| {
+            LogicalName::new(NameEncoding::PosixBytes, bytes.clone(), limits.maximum_component_bytes)
+                .map_err(|error| EngineError::Restore(format!("bad path component: {error:?}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    NamespacePath::new(names, limits).map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
+}
+
+fn remove_any(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+    name.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(unix)]
+fn logical_to_os(name: &LogicalName) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(name.as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn logical_to_os(name: &LogicalName) -> std::ffi::OsString {
+    String::from_utf8_lossy(name.as_bytes()).into_owned().into()
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &[u8], host: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), host)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &[u8], _host: &Path) -> Result<()> {
+    Err(EngineError::Restore("symlink restore is unix-only".into()))
 }
 
 /// Crash-recovery journal. Present on disk only while a swap is in flight.

@@ -44,8 +44,39 @@ pub enum Op {
     Timeline {
         #[serde(default)]
         session_id: Option<String>,
+        /// Only checkpoints of this conversation turn (needs `session_id`).
+        #[serde(default)]
+        turn: Option<i64>,
         #[serde(default = "default_limit")]
         limit: u32,
+    },
+    /// Conversation turns (the `UserPromptSubmit` hook records them), with
+    /// each turn's checkpoint range. All sessions when `session_id` is None.
+    Turns {
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Records the start of a conversation turn (hook use).
+    TurnStart {
+        session_id: String,
+        #[serde(default)]
+        prompt: String,
+    },
+    /// One checkpoint, resolved to its session, turn, and prompt.
+    Inspect {
+        checkpoint: i64,
+    },
+    /// Sessions newest-first.
+    Sessions {
+        #[serde(default = "default_limit")]
+        limit: u32,
+    },
+    /// Agent-readable summary of the previous session: where it ended and
+    /// which branches were abandoned. `current` is excluded (it is the
+    /// session asking, and it has no history yet).
+    Brief {
+        #[serde(default)]
+        current: Option<String>,
     },
     Rewind {
         target: RewindTarget,
@@ -150,7 +181,14 @@ pub enum Reply {
     Checkpoint(CheckpointInfo),
     Timeline(Vec<TimelineEntry>),
     Rewind(RewindInfo),
+    /// Single-path restore (`Rewind` with `path`).
+    Restore(RestoreInfo),
     Diff(Vec<DiffEntry>),
+    Turns(Vec<TurnEntry>),
+    Turn(TurnInfo),
+    Inspect(InspectInfo),
+    Sessions(Vec<SessionEntry>),
+    Brief(BriefInfo),
     Forks(Vec<ForkEntry>),
     Promote(PromoteInfo),
     /// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`.
@@ -209,6 +247,110 @@ pub struct TimelineEntry {
     pub tool_name: Option<String>,
     pub label: Option<String>,
     pub error: Option<String>,
+    /// Conversation turn within the session, when the host reported one.
+    #[serde(default)]
+    pub turn: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TurnEntry {
+    pub session_id: String,
+    pub turn: i64,
+    pub started_at: i64,
+    pub prompt: String,
+    pub first_checkpoint: Option<i64>,
+    pub last_checkpoint: Option<i64>,
+    pub checkpoints: i64,
+    /// Latest real checkpoint before the turn's first one: the diff base
+    /// for "what did this turn change".
+    pub base_checkpoint: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TurnInfo {
+    pub session_id: String,
+    pub turn: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InspectInfo {
+    pub id: i64,
+    pub generation: String,
+    pub created_at: i64,
+    pub kind: String,
+    pub published: bool,
+    pub session_id: Option<String>,
+    pub host: Option<String>,
+    pub turn: Option<i64>,
+    pub prompt: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub label: Option<String>,
+    pub error: Option<String>,
+    pub rewind_target: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub session_id: String,
+    pub host: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub checkpoints: i64,
+    pub turns: i64,
+    pub end_checkpoint: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoreInfo {
+    pub checkpoint: i64,
+    pub path: String,
+    /// "restored" | "removed"
+    pub action: String,
+    /// The `manual` checkpoint recording the tree after the restore.
+    pub recorded_checkpoint: Option<i64>,
+}
+
+/// The previous-session summary. Structured so hosts can render it; the CLI
+/// renders it as < 1KB of text for the agent's context.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct BriefInfo {
+    pub session: Option<BriefSession>,
+    /// Files that differ between the previous session's end state and the
+    /// latest checkpoint (edits made outside any session, or by a later
+    /// session that left no end state).
+    pub drift_files: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BriefSession {
+    pub session_id: String,
+    pub host: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub turns: i64,
+    pub checkpoints: i64,
+    pub end_checkpoint: Option<i64>,
+    pub end_turn: Option<i64>,
+    pub end_prompt: Option<String>,
+    /// Files changed from the session's first checkpoint to its last.
+    pub files_changed: u64,
+    pub sample_paths: Vec<String>,
+    pub abandoned: Vec<BriefAbandoned>,
+}
+
+/// One rewind taken during the session: the checkpoints it left behind.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BriefAbandoned {
+    /// First and last abandoned checkpoint ids.
+    pub from_checkpoint: i64,
+    pub to_checkpoint: i64,
+    /// Where the rewind went back to.
+    pub rewound_to: i64,
+    pub turn: Option<i64>,
+    pub prompt: Option<String>,
+    pub checkpoints: i64,
+    pub files_changed: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

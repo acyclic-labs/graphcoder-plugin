@@ -212,6 +212,8 @@ impl Server {
                     tool_call_id,
                     tool_name,
                     label,
+                    turn: None,
+                    rewind_target: None,
                 };
                 if wait {
                     let outcome = self
@@ -245,19 +247,144 @@ impl Server {
                     Ok(proto::Reply::Enqueued)
                 }
             }
-            proto::Op::Timeline { session_id, limit } => {
+            proto::Op::Timeline {
+                session_id,
+                turn,
+                limit,
+            } => {
+                if turn.is_some() && session_id.is_none() {
+                    return Err("--turn needs --session (turn numbers are per session)".into());
+                }
                 let index = self.open_index()?;
                 let rows = index
-                    .list(session_id.as_deref(), limit)
+                    .list(session_id.as_deref(), turn, limit)
                     .map_err(stringify)?;
                 Ok(proto::Reply::Timeline(
                     rows.into_iter().map(timeline_entry).collect(),
                 ))
             }
-            proto::Op::Rewind { target, path } => {
-                if path.is_some() {
-                    return Err("single-path restore is not implemented yet".into());
+            proto::Op::Turns { session_id } => {
+                let index = self.open_index()?;
+                let turns = index.turns(session_id.as_deref()).map_err(stringify)?;
+                let mut entries = Vec::with_capacity(turns.len());
+                for turn in turns {
+                    let base_checkpoint = match turn.first_checkpoint {
+                        Some(first) => index
+                            .latest_target_before(first)
+                            .map_err(stringify)?
+                            .map(|row| row.id),
+                        None => None,
+                    };
+                    entries.push(proto::TurnEntry {
+                        session_id: turn.session_id,
+                        turn: turn.turn,
+                        started_at: turn.started_at,
+                        prompt: turn.prompt,
+                        first_checkpoint: turn.first_checkpoint,
+                        last_checkpoint: turn.last_checkpoint,
+                        checkpoints: turn.checkpoints,
+                        base_checkpoint,
+                    });
                 }
+                Ok(proto::Reply::Turns(entries))
+            }
+            proto::Op::TurnStart { session_id, prompt } => {
+                let turn = self
+                    .handle
+                    .turn_started(session_id.clone(), prompt)
+                    .await
+                    .map_err(stringify)?;
+                Ok(proto::Reply::Turn(proto::TurnInfo { session_id, turn }))
+            }
+            proto::Op::Inspect { checkpoint } => {
+                let index = self.open_index()?;
+                let row = index
+                    .by_id(checkpoint)
+                    .map_err(stringify)?
+                    .ok_or(format!("no checkpoint #{checkpoint}"))?;
+                let (host, prompt) = match (&row.session_id, row.turn) {
+                    (Some(session), turn) => {
+                        let host = index
+                            .session(session)
+                            .map_err(stringify)?
+                            .and_then(|session| session.host);
+                        let prompt = match turn {
+                            Some(turn) => index
+                                .turn(session, turn)
+                                .map_err(stringify)?
+                                .map(|turn| turn.prompt),
+                            None => None,
+                        };
+                        (host, prompt)
+                    }
+                    (None, _) => (None, None),
+                };
+                Ok(proto::Reply::Inspect(proto::InspectInfo {
+                    id: row.id,
+                    generation: hex_generation(row.generation),
+                    created_at: row.created_at,
+                    kind: row.kind.as_str().to_string(),
+                    published: row.published,
+                    session_id: row.session_id,
+                    host,
+                    turn: row.turn,
+                    prompt,
+                    tool_name: row.tool_name,
+                    tool_call_id: row.tool_call_id,
+                    label: row.label,
+                    error: row.error,
+                    rewind_target: row.rewind_target,
+                }))
+            }
+            proto::Op::Sessions { limit } => {
+                let index = self.open_index()?;
+                let sessions = index.sessions(limit).map_err(stringify)?;
+                let mut entries = Vec::with_capacity(sessions.len());
+                for session in sessions {
+                    let end_checkpoint = index
+                        .session_end(&session.session_id)
+                        .map_err(stringify)?
+                        .map(|row| row.id);
+                    entries.push(proto::SessionEntry {
+                        session_id: session.session_id,
+                        host: session.host,
+                        started_at: session.started_at,
+                        ended_at: session.ended_at,
+                        checkpoints: session.checkpoints,
+                        turns: session.turns,
+                        end_checkpoint,
+                    });
+                }
+                Ok(proto::Reply::Sessions(entries))
+            }
+            proto::Op::Brief { current } => {
+                let brief = self.brief(current.as_deref()).await?;
+                Ok(proto::Reply::Brief(brief))
+            }
+            proto::Op::Rewind {
+                target,
+                path: Some(path),
+            } => {
+                let row = self.resolve_target(target)?;
+                let row_id = row.id;
+                let outcome = self
+                    .handle
+                    .restore_path(row, PathBuf::from(&path))
+                    .await
+                    .map_err(stringify)?;
+                let recorded_checkpoint = self.handle.status().await.map_err(stringify)?.last_checkpoint;
+                Ok(proto::Reply::Restore(proto::RestoreInfo {
+                    checkpoint: row_id,
+                    path: outcome.path.display().to_string(),
+                    action: match outcome.action {
+                        rewind::RestoreAction::Restored => "restored",
+                        rewind::RestoreAction::Removed => "removed",
+                    }
+                    .to_string(),
+                    recorded_checkpoint,
+                }))
+            }
+            proto::Op::Rewind { target, path: None } => {
                 let row = self.resolve_target(target)?;
                 let row_id = row.id;
                 let outcome = self.handle.rewind(row).await.map_err(stringify)?;
@@ -681,16 +808,148 @@ impl Server {
     /// Default diff base: the most recent session's first checkpoint, falling
     /// back to the oldest checkpoint on record.
     fn default_diff_base(&self, index: &Index) -> Result<CheckpointRow, String> {
-        let rows = index.list(None, 10_000).map_err(stringify)?;
-        let base = rows
-            .iter()
-            .rev()
-            .find(|row| row.session_id.is_some())
-            .and_then(|row| row.session_id.clone())
-            .and_then(|session| index.session_start(&session).ok().flatten())
-            .or_else(|| rows.last().cloned());
+        let from_session = match index.latest_session().map_err(stringify)? {
+            Some(session) => index
+                .session_start(&session.session_id)
+                .map_err(stringify)?,
+            None => None,
+        };
+        let base = match from_session {
+            Some(row) => Some(row),
+            None => index.oldest().map_err(stringify)?,
+        };
         base.ok_or_else(|| "no checkpoints yet".to_string())
     }
+
+    /// Builds the previous-session brief: where the last session (other
+    /// than `current`) ended, what it changed, and every branch it abandoned
+    /// by rewinding. Diffs are computed against the store, so counts are
+    /// exact rather than remembered.
+    async fn brief(&self, current: Option<&str>) -> Result<proto::BriefInfo, String> {
+        let index = self.open_index()?;
+        let Some(session) = index
+            .last_session_with_checkpoints(current)
+            .map_err(stringify)?
+        else {
+            return Ok(proto::BriefInfo::default());
+        };
+        let id = session.session_id.clone();
+        let start = index.session_start(&id).map_err(stringify)?;
+        let end = index.session_end(&id).map_err(stringify)?;
+        let last_any = index.list(Some(&id), None, 1).map_err(stringify)?.into_iter().next();
+
+        let (files_changed, sample_paths) = match (&start, &end) {
+            (Some(start), Some(end)) if start.generation != end.generation => {
+                let changes = content_changes(
+                    self.handle
+                        .diff(start.generation, end.generation)
+                        .await
+                        .map_err(stringify)?,
+                );
+                let sample = changes
+                    .iter()
+                    .take(5)
+                    .map(|change| change.path.display().to_string())
+                    .collect();
+                (changes.len() as u64, sample)
+            }
+            _ => (0, Vec::new()),
+        };
+
+        let mut abandoned = Vec::new();
+        if let (Some(start), Some(last)) = (&start, &last_any) {
+            for rewind in index
+                .rewinds_between(start.id, last.id)
+                .map_err(stringify)?
+            {
+                let Some(target) = rewind.rewind_target else { continue };
+                let branch = index.between(target, rewind.id).map_err(stringify)?;
+                let (Some(first), Some(last)) = (branch.first(), branch.last()) else {
+                    continue;
+                };
+                let target_row = index.by_id(target).map_err(stringify)?;
+                let files = match target_row {
+                    Some(target_row) if target_row.generation != last.generation => {
+                        content_changes(
+                            self.handle
+                                .diff(target_row.generation, last.generation)
+                                .await
+                                .map_err(stringify)?,
+                        )
+                        .len() as u64
+                    }
+                    _ => 0,
+                };
+                let turn = last.turn.or(first.turn);
+                let prompt = match (last.session_id.as_deref(), turn) {
+                    (Some(session), Some(turn)) => index
+                        .turn(session, turn)
+                        .map_err(stringify)?
+                        .map(|turn| turn.prompt),
+                    _ => None,
+                };
+                abandoned.push(proto::BriefAbandoned {
+                    from_checkpoint: first.id,
+                    to_checkpoint: last.id,
+                    rewound_to: target,
+                    turn,
+                    prompt,
+                    checkpoints: branch.len() as i64,
+                    files_changed: files,
+                });
+            }
+        }
+
+        let (end_turn, end_prompt) = match end.as_ref().and_then(|row| row.turn) {
+            Some(turn) => (
+                Some(turn),
+                index.turn(&id, turn).map_err(stringify)?.map(|turn| turn.prompt),
+            ),
+            None => (None, None),
+        };
+
+        // Drift: the tree may have moved since the session ended (another
+        // session that never ended cleanly, or edits with no session).
+        let drift_files = match (&end, index.latest_target().map_err(stringify)?) {
+            (Some(end), Some(latest)) if latest.generation != end.generation => content_changes(
+                self.handle
+                    .diff(end.generation, latest.generation)
+                    .await
+                    .map_err(stringify)?,
+            )
+            .len() as u64,
+            _ => 0,
+        };
+
+        Ok(proto::BriefInfo {
+            session: Some(proto::BriefSession {
+                session_id: id,
+                host: session.host,
+                started_at: session.started_at,
+                ended_at: session.ended_at,
+                turns: session.turns,
+                checkpoints: session.checkpoints,
+                end_checkpoint: end.as_ref().map(|row| row.id),
+                end_turn,
+                end_prompt,
+                files_changed,
+                sample_paths,
+                abandoned,
+            }),
+            drift_files,
+        })
+    }
+}
+
+/// Content changes only. A rewind or restore rewrites mtimes on every path
+/// it materializes, so metadata-only rows are noise for "what changed".
+fn content_changes(
+    changes: Vec<acyclic_engine::diff::FileChange>,
+) -> Vec<acyclic_engine::diff::FileChange> {
+    changes
+        .into_iter()
+        .filter(|change| change.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+        .collect()
 }
 
 fn err(message: String) -> proto::Payload {
@@ -760,6 +1019,7 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
         tool_name: row.tool_name,
         label: row.label,
         error: row.error,
+        turn: row.turn,
     }
 }
 

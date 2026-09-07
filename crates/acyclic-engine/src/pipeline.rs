@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::diff::{self, FileChange};
 use crate::fork::{ForkSeed, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
-use crate::rewind::{self, RewindOutcome};
+use crate::rewind::{self, RestoreOutcome, RewindOutcome};
 use crate::store::Store;
 use crate::{EngineError, Result};
 
@@ -68,6 +68,16 @@ enum Request {
     Rewind {
         target: CheckpointRow,
         reply: oneshot::Sender<Result<RewindOutcome>>,
+    },
+    RestorePath {
+        target: CheckpointRow,
+        path: PathBuf,
+        reply: oneshot::Sender<Result<RestoreOutcome>>,
+    },
+    TurnStarted {
+        session_id: String,
+        prompt: String,
+        reply: oneshot::Sender<Result<i64>>,
     },
     Diff {
         before: GenerationId,
@@ -178,6 +188,33 @@ impl PipelineHandle {
 
     pub async fn rewind(&self, target: CheckpointRow) -> Result<RewindOutcome> {
         request!(self, Rewind { target: target })?
+    }
+
+    /// Restores one path from `target` without touching the rest of the tree.
+    pub async fn restore_path(
+        &self,
+        target: CheckpointRow,
+        path: PathBuf,
+    ) -> Result<RestoreOutcome> {
+        request!(
+            self,
+            RestorePath {
+                target: target,
+                path: path
+            }
+        )?
+    }
+
+    /// Records a conversation turn; returns its 1-based number. Later
+    /// checkpoints in the session inherit it.
+    pub async fn turn_started(&self, session_id: String, prompt: String) -> Result<i64> {
+        request!(
+            self,
+            TurnStarted {
+                session_id: session_id,
+                prompt: prompt
+            }
+        )?
     }
 
     pub async fn diff(&self, before: GenerationId, after: GenerationId) -> Result<Vec<FileChange>> {
@@ -362,6 +399,8 @@ fn fail_request(request: Request, message: &str) {
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
+        Request::RestorePath { reply, .. } => drop(reply.send(Err(error()))),
+        Request::TurnStarted { reply, .. } => drop(reply.send(Err(error()))),
         Request::SetShadowed { reply, .. } => drop(reply.send(Err(error()))),
         Request::Status { reply } => drop(reply.send(StatusReport {
             state: State::Baselining,
@@ -494,6 +533,22 @@ impl Pipeline {
             }
             Request::Rewind { target, reply } => {
                 let _ = reply.send(self.rewind(target).await);
+                false
+            }
+            Request::RestorePath {
+                target,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(self.restore_path(target, &path).await);
+                false
+            }
+            Request::TurnStarted {
+                session_id,
+                prompt,
+                reply,
+            } => {
+                let _ = reply.send(self.index.turn_started(&session_id, &prompt));
                 false
             }
             Request::Diff {
@@ -741,6 +796,7 @@ impl Pipeline {
             CheckpointKind::PreRewind,
             &Attribution {
                 label: Some(format!("before rewind to #{}", target.id)),
+                rewind_target: Some(target.id),
                 ..Attribution::default()
             },
         )?;
@@ -757,6 +813,60 @@ impl Pipeline {
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         outcome
+    }
+
+    /// Single-path restore, bracketed by checkpoints: a `manual` safety row
+    /// before if the tree has uncaptured edits (so the pre-restore content
+    /// is one `acyclic restore` away) and a `manual` row after, so the
+    /// timeline shows what the restore changed. Not `pre_rewind`: a restore
+    /// abandons nothing, so it must not read as a branch in the brief.
+    /// No swap of the repo root, so the watcher stays valid and the
+    /// post-restore capture is an ordinary incremental one.
+    async fn restore_path(
+        &mut self,
+        target: CheckpointRow,
+        path: &std::path::Path,
+    ) -> Result<RestoreOutcome> {
+        if self.shadowed {
+            return Err(EngineError::Restore(
+                "a Safe Mode session is shadowing the repo root; resolve it first".into(),
+            ));
+        }
+        if self.state != State::Ready {
+            self.reset_watch().await?;
+            self.baseline(CheckpointKind::Recovered).await?;
+        }
+        if self.drain_watcher().await? {
+            let safety = self.checkpoint_engine().await?;
+            let row = self.index.record(
+                safety,
+                CheckpointKind::Manual,
+                &Attribution {
+                    label: Some(format!("before restore {} from #{}", path.display(), target.id)),
+                    ..Attribution::default()
+                },
+            )?;
+            self.last_generation = safety;
+            self.last_checkpoint_row = Some(row);
+        }
+
+        let outcome = rewind::restore_path(&self.store, target.generation, path).await?;
+
+        // Let the watcher report the restore, then record it.
+        self.drain_watcher().await?;
+        let generation = self.checkpoint_engine().await?;
+        let row = self.index.record(
+            generation,
+            CheckpointKind::Manual,
+            &Attribution {
+                label: Some(format!("restore {} from #{}", path.display(), target.id)),
+                ..Attribution::default()
+            },
+        )?;
+        self.last_generation = generation;
+        self.last_checkpoint_row = Some(row);
+        self.checkpoints_since_commit += 1;
+        Ok(outcome)
     }
 
     /// Mints one fork: publish the current state (the fork base), then cut a

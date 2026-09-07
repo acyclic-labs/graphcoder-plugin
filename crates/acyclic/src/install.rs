@@ -1,7 +1,8 @@
 //! `acyclic install <host>` — wires the adapter into the current repo.
 //!
 //! claude-code: merges hook entries into the repo's `.claude/settings.json`
-//! and drops the `/rewind` command and self-rollback skill into `.claude/`.
+//! and drops the `/rewind` and `/timeline` commands and the self-rollback
+//! skill into `.claude/`.
 //! Checked-in files, so the whole team inherits the wiring.
 //! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
 //! shell-capable agent.
@@ -27,6 +28,8 @@ fn claude_code(repo: &Path) -> Result<(), String> {
 
     merge_hooks(&claude_dir.join("settings.json"))?;
     std::fs::write(claude_dir.join("commands/rewind.md"), REWIND_COMMAND).map_err(stringify)?;
+    std::fs::write(claude_dir.join("commands/timeline.md"), TIMELINE_COMMAND)
+        .map_err(stringify)?;
     std::fs::write(
         claude_dir.join("skills/acyclic-self-rollback/SKILL.md"),
         SELF_ROLLBACK_SKILL,
@@ -37,8 +40,8 @@ fn claude_code(repo: &Path) -> Result<(), String> {
         "claude-code adapter installed into {}",
         claude_dir.display()
     );
-    println!("  hooks:    .claude/settings.json (pre/post tool + session)");
-    println!("  command:  /rewind");
+    println!("  hooks:    .claude/settings.json (pre/post tool, prompt, session)");
+    println!("  commands: /rewind, /timeline");
     println!("  skill:    acyclic-self-rollback");
     println!("check these files in so the whole team inherits checkpointing.");
     Ok(())
@@ -55,7 +58,7 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     };
 
-    let events: [(&str, Option<&str>, &str); 4] = [
+    let events: [(&str, Option<&str>, &str); 5] = [
         (
             "PreToolUse",
             Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
@@ -66,6 +69,7 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
             Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
             "acyclic hook post-tool",
         ),
+        ("UserPromptSubmit", None, "acyclic hook user-prompt"),
         ("SessionStart", None, "acyclic hook session-start"),
         ("SessionEnd", None, "acyclic hook session-end"),
     ];
@@ -147,6 +151,31 @@ Restore this repo to an earlier acyclic checkpoint. Follow exactly:
 5. Do not run any other write operations until the rewind completes.
 "#;
 
+const TIMELINE_COMMAND: &str = r#"---
+description: Show the repo's history as conversation turns, diff what a turn changed, or restore one file from an earlier point
+---
+
+Answer the user's history question with acyclic's timeline. Request:
+$ARGUMENTS
+
+Pick the matching step:
+
+- "What happened / what did each turn do": run `acyclic turns` (add
+  `--session <id>` for an older session from `acyclic sessions`) and
+  summarize which prompt led to which checkpoints.
+- "What did turn N change" or "what did approach X look like": run
+  `acyclic diff --turn N` and list the files; for an abandoned attempt the
+  session brief names its checkpoint range, so `acyclic diff <a> <b>`.
+- "Why did file X change": run `acyclic timeline --limit 200`, then
+  `acyclic show <id>` on the checkpoint after the change to get the turn
+  and the prompt that caused it.
+- "Bring back just file X from earlier": `acyclic restore <id> <path>`.
+  Only that path changes; the rest of the tree is untouched. Tell the user
+  a checkpoint recorded the restore, so it is itself undoable.
+
+Never guess at history from memory when the timeline can answer exactly.
+"#;
+
 const SELF_ROLLBACK_SKILL: &str = r#"---
 name: acyclic-self-rollback
 description: Use acyclic checkpoints to try risky changes safely - checkpoint before an attempt, rewind cleanly on failure instead of hand-reverting, and show a blast-radius diff before finishing. Use when a task is risky (migrations, refactors, codegen, dependency changes), when a failed attempt needs undoing, or before declaring multi-file work done.
@@ -174,6 +203,17 @@ Run `acyclic diff --stat` and review the blast radius: every file the
 session changed, including what scripts and generators wrote. Mention
 anything unexpected to the user.
 
+## History across the conversation
+Every checkpoint is linked to the conversation turn (prompt) that caused
+it, and history survives across sessions:
+- `acyclic turns` - which prompt led to which checkpoints.
+- `acyclic diff --turn N` - exactly what turn N changed.
+- `acyclic show <id>` - a checkpoint's session, turn, and prompt.
+- `acyclic restore <id> <path>` - bring back ONE file from any checkpoint
+  (an earlier abandoned approach, say) without touching the rest.
+The session-start brief in your context names the previous session's end
+checkpoint and any abandoned branches; use their ids directly.
+
 ## Rules
 - Rewind restores file contents and modes, not mtimes: expect rebuilds.
 - After a rewind, the user's editor may show stale buffers - say so.
@@ -191,6 +231,10 @@ included) is snapshotted by a local daemon. Useful commands:
     acyclic timeline                     recent checkpoints
     acyclic rewind <id> --yes            restore the tree exactly
     acyclic diff --stat                  everything changed this session
+    acyclic turns                        which prompt caused which checkpoints
+    acyclic diff --turn N                what one conversation turn changed
+    acyclic restore <id> <path>          bring back one file, leave the rest
+    acyclic brief                        where the previous session ended
 
 Before a risky change, checkpoint. After a failed attempt, rewind instead
 of hand-reverting. Before finishing, review `acyclic diff`.
@@ -238,7 +282,13 @@ mod tests {
                 .filter(|entry| is_ours(entry))
                 .count()
         };
-        for event in ["PreToolUse", "PostToolUse", "SessionStart", "SessionEnd"] {
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "UserPromptSubmit",
+            "SessionStart",
+            "SessionEnd",
+        ] {
             assert_eq!(ours(event), 1, "{event}");
         }
     }
