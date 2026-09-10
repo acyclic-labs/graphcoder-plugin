@@ -1215,7 +1215,7 @@ impl Server {
                 )
                 .await
                 .map_err(stringify)?;
-            self.rebase_fork(id, &overlay, snapshot, rebased, copy_dir).await?;
+            self.rebase_fork(id, snapshot, rebased, copy_dir).await?;
             let mut files: Vec<proto::ConflictEntry> = plan
                 .conflicted
                 .iter()
@@ -1318,12 +1318,11 @@ impl Server {
     }
 
     /// Makes the fork workspace equal to `rebased`: writes R − F into the
-    /// overlay (mount fork) or the directory (copy fork). The real tree is
-    /// never touched.
+    /// fork's directory, through the mount for a mounted fork. The real
+    /// tree is never touched.
     async fn rebase_fork(
         &self,
         id: &str,
-        overlay: &Arc<SharedLocalCheckout>,
         snapshot: acyclic_engine::GenerationId,
         rebased: acyclic_engine::GenerationId,
         copy_dir: Option<&Path>,
@@ -1345,38 +1344,18 @@ impl Server {
                 }
             }
             None => {
-                let entries: Vec<(PathBuf, Entry)> = roots
-                    .iter()
-                    .map(|path| (path.clone(), Entry::FromGeneration { generation: rebased }))
-                    .collect();
+                // A mounted fork: write THROUGH the mount, never behind it.
+                // The driver and the kernel keep name and attribute caches
+                // that only their own operations update; a write via the
+                // checkout leaves a file the fork had deleted invisible for
+                // good, and the FUSE transport has no invalidation at all.
+                let dir = fork::forks_mount_root(&self.repo_root)
+                    .ok_or("repo root has no parent for fork workspaces")?
+                    .join(id);
                 self.handle
-                    .apply_to_overlay(Arc::clone(overlay), entries)
+                    .materialize_paths(rebased, dir, roots)
                     .await
                     .map_err(stringify)?;
-                // The route stayed mounted throughout, so the kernel may
-                // hold stale attributes or a negative entry for a path the
-                // rebase recreated (a file the fork had deleted). Ask the
-                // driver to drop them; providers without invalidation
-                // (Linux FUSE) rely on their entry timeout instead.
-                let mount = self.fork_mount.lock().await;
-                if let Some(session) = mount.session.as_ref() {
-                    let mut targets: Vec<Vec<u8>> = vec![id.as_bytes().to_vec()];
-                    for root in &roots {
-                        let mut current = Some(root.as_path());
-                        while let Some(path) = current {
-                            if path.as_os_str().is_empty() {
-                                break;
-                            }
-                            targets.push(format!("{id}/{}", path.display()).into_bytes());
-                            current = path.parent();
-                        }
-                    }
-                    tokio::task::block_in_place(|| {
-                        for target in &targets {
-                            let _ = session.invalidate(target);
-                        }
-                    });
-                }
             }
         }
         Ok(())

@@ -1029,6 +1029,51 @@ pub fn ignored_paths(repo_root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Writes `paths` from `generation` into `dir` with plain filesystem
+/// operations (no staging or atomic swap): a path absent in the generation
+/// is removed, a present one replaced wholesale. For a fork workspace that
+/// is a live mount this is the only coherent way to change it: the mount
+/// driver and the kernel see writes they performed themselves, whereas a
+/// write through the checkout behind the mount's back is invisible to
+/// their name caches (and the FUSE transport cannot be told to drop them).
+pub async fn materialize_paths(
+    store: &Store,
+    generation: GenerationId,
+    dir: &Path,
+    paths: &[PathBuf],
+) -> Result<()> {
+    let mut checkout = store.checkout_exact(generation).await?;
+    let limits = checkout.volume_config().limits;
+    let cancel = CancellationToken::new();
+    for path in paths {
+        let namespace = namespace_of(path)?;
+        let destination = dir.join(path);
+        crate::rewind::remove_any(&destination)?;
+        let lookup = checkout
+            .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
+            .await
+            .map_err(EngineError::fs("lookup"))?
+            .value;
+        let Some(record) = lookup.record else {
+            continue;
+        };
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::rewind::write_node(
+            &mut checkout,
+            &namespace,
+            record.kind,
+            &record.payload,
+            &destination,
+            limits,
+            &cancel,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Collapses a sorted path list to its subtree roots.
 pub fn subtree_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut sorted = paths.to_vec();

@@ -141,6 +141,15 @@ enum Request {
         paths: Vec<PathBuf>,
         reply: oneshot::Sender<Result<Vec<(PathBuf, Option<Vec<u8>>)>>>,
     },
+    /// Plain writes of `paths` from `generation` into `root` (a mounted
+    /// fork's directory, written through the mount so its caches stay
+    /// coherent).
+    MaterializePaths {
+        generation: GenerationId,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Restores one path from `target` into `root` (a copy fork's directory).
     RestorePathInto {
         target: GenerationId,
@@ -392,6 +401,23 @@ impl PipelineHandle {
         )?
     }
 
+    /// Plain writes of `paths` from `generation` into `root`.
+    pub async fn materialize_paths(
+        &self,
+        generation: GenerationId,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        request!(
+            self,
+            MaterializePaths {
+                generation: generation,
+                root: root,
+                paths: paths
+            }
+        )?
+    }
+
     /// Restores one path from `target` into `root` rather than the working tree.
     pub async fn restore_path_into(
         &self,
@@ -599,6 +625,7 @@ fn fail_request(request: Request, message: &str) {
         Request::ApplyToOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ReadFiles { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePathInto { reply, .. } => drop(reply.send(Err(error()))),
+        Request::MaterializePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
@@ -869,6 +896,17 @@ impl Pipeline {
                     Ok(out)
                 })
                 .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::MaterializePaths {
+                generation,
+                root,
+                paths,
+                reply,
+            } => {
+                let result =
+                    Box::pin(crate::merge::materialize_paths(&self.store, generation, &root, &paths)).await;
                 let _ = reply.send(result);
                 false
             }

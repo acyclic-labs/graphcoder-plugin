@@ -149,7 +149,7 @@ pub async fn restore_path_into(
 
 /// Writes one checkpoint node (recursively for directories) to a fresh host
 /// path. Modes are applied; mtimes are not (same contract as a full rewind).
-fn write_node<'a>(
+pub(crate) fn write_node<'a>(
     checkout: &'a mut LocalCheckout,
     namespace: &'a NamespacePath,
     kind: FileKind,
@@ -295,7 +295,7 @@ pub(crate) fn namespace_path(
     NamespacePath::new(names, limits).map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
 }
 
-fn remove_any(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
         Ok(_) => std::fs::remove_file(path),

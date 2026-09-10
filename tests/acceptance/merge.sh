@@ -189,7 +189,7 @@ acy rewind -y "$SAFETY" >/dev/null || fail "G10: rewind to safety checkpoint"
 # --- G11: an unmoved mainline lands in place too: no swap, same inode -------
 A="$(fork)"
 printf 'swap\n' > "$(fork_path "$A")/src/auth.js"
-inode() { if stat -f %i / >/dev/null 2>&1; then stat -f %i "$1"; else stat -c %i "$1"; fi; }
+inode() { case "$(uname)" in Darwin) stat -f %i "$1" ;; *) stat -c %i "$1" ;; esac; }
 INODE_BEFORE="$(inode "$R")"
 OUT="$(promote_ok "$A" G11)"
 echo "$OUT" | grep -q '^promoted: 1 path(s) written in place' || fail "G11: unmoved mainline should land in place: $OUT"

@@ -417,3 +417,16 @@ Deliberate divergences:
   ignore cache and build noise; the paths stay listed because rewind
   restores them. `acyclic diff` also accepts generation hex prefixes,
   which is what `promote` prints and what an agent reached for.
+- **Rebases into mounted forks are written through the mount, not the
+  checkout (CI on FUSE, 2026-09-10).** Writing R − F into the shared
+  checkout behind the mount's back left the driver's and kernel's name
+  caches stale: a file the fork had deleted and the rebase recreated
+  stayed invisible for good on the macOS NFS driver even after
+  `invalidate` returned Ok, and the FUSE transport (Linux, FUSE-T on the
+  macOS runner) has no invalidation at all. The daemon now writes the
+  rebase into `<mount root>/<id>/…` with plain filesystem operations
+  (`merge::materialize_paths`), the same way copy forks get theirs, so
+  every cache saw the operation. Promote also no longer detaches the
+  route before working; it snapshots under the checkout lock and drops
+  the route only after the fork lands, which removed the negative-entry
+  window that hid re-attached forks on Linux.

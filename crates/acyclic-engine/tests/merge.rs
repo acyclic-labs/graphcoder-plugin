@@ -501,3 +501,52 @@ fn nested_directory_subtree_copies_into_merge_generation() {
     });
     rig.finish();
 }
+
+/// `materialize_paths` writes a generation's paths into a plain directory
+/// with ordinary filesystem operations: replaced files, recreated files
+/// that were absent, removed paths, and nested subtrees.
+#[test]
+fn materialize_paths_writes_a_generation_into_a_directory() {
+    let rig = Rig::start();
+    rig.runtime.block_on(async {
+        let seed = rig.handle.fork().await.expect("fork");
+        fork_write(&seed, "/src/shared.txt", b"rewritten\n").await;
+        fork_remove(&seed, "/del.txt").await;
+        {
+            let cancel = CancellationToken::new();
+            let mut guard = seed.shared.lock().await;
+            guard.create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
+            guard.create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
+        }
+        fork_write(&seed, "/docs/deep/file.md", b"deep\n").await;
+        let generation = snapshot(&rig, &seed).await;
+
+        // A workspace that currently mirrors the base: shared.txt old,
+        // del.txt present, no docs/, plus a stray file that must survive.
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/shared.txt"), b"1\n2\n3\n").unwrap();
+        std::fs::write(dir.path().join("del.txt"), b"delete me\n").unwrap();
+        std::fs::write(dir.path().join("untouched.txt"), b"keep\n").unwrap();
+        rig.handle
+            .materialize_paths(
+                generation,
+                dir.path().to_path_buf(),
+                vec![p("src/shared.txt"), p("del.txt"), p("docs")],
+            )
+            .await
+            .expect("materialize");
+        assert_eq!(std::fs::read(dir.path().join("src/shared.txt")).unwrap(), b"rewritten\n");
+        assert!(!dir.path().join("del.txt").exists(), "absent in the generation: removed");
+        assert_eq!(std::fs::read(dir.path().join("docs/deep/file.md")).unwrap(), b"deep\n");
+        assert_eq!(std::fs::read(dir.path().join("untouched.txt")).unwrap(), b"keep\n");
+        // Recreating a file that was removed from the directory works too.
+        std::fs::remove_file(dir.path().join("src/shared.txt")).unwrap();
+        rig.handle
+            .materialize_paths(generation, dir.path().to_path_buf(), vec![p("src/shared.txt")])
+            .await
+            .expect("materialize again");
+        assert_eq!(std::fs::read(dir.path().join("src/shared.txt")).unwrap(), b"rewritten\n");
+    });
+    rig.finish();
+}
