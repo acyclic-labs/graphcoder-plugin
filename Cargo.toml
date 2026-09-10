@@ -13,6 +13,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-acyclic-fs = { git = "https://github.com/acyclic-labs/sdk.git", rev = "bf1a8017b47a25d2e499aa74761b7fd5bfb3388a", features = ["local", "native-watch", "native-mount"] }
+acyclic-fs = { git = "https://github.com/acyclic-labs/sdk.git", rev = "8eced489729235929b769e831c1170c85aa1f7ba", features = ["local", "native-watch", "native-mount"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 
