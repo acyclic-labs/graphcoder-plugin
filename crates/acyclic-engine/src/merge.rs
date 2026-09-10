@@ -371,6 +371,29 @@ pub struct MergePlan {
 }
 
 impl MergePlan {
+    /// Drops refusals and conflicts on `ignored` paths (build artifacts,
+    /// caches, secrets: things `.gitignore` says are not merge payload) so
+    /// the mainline simply keeps its own copy. Returns the paths dropped.
+    pub fn keep_mainline_for(&mut self, ignored: &[PathBuf]) -> Vec<PathBuf> {
+        let mut kept = Vec::new();
+        self.refusals.retain(|refusal| {
+            let drop = ignored.contains(&refusal.path);
+            if drop {
+                kept.push(refusal.path.clone());
+            }
+            !drop
+        });
+        self.conflicted.retain(|file| {
+            let drop = ignored.contains(&file.path);
+            if drop {
+                kept.push(file.path.clone());
+            }
+            !drop
+        });
+        kept.sort();
+        kept
+    }
+
     /// True when the mainline would be byte-identical after landing.
     pub fn lands_nothing(&self) -> bool {
         self.take_ours.is_empty() && self.merged.is_empty() && self.conflicted.is_empty()
@@ -949,6 +972,63 @@ async fn read_regular_ns(
     Ok(out)
 }
 
+/// Which of `paths` the repo's `.gitignore` rules ignore, per
+/// `git check-ignore --no-index`. Empty when git is absent, the root is not
+/// a repository, or nothing matches: ignore rules are advisory here, never
+/// a reason to fail a promote.
+pub fn ignored_paths(repo_root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let mut input = Vec::new();
+    for path in paths {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            input.extend_from_slice(path.as_os_str().as_bytes());
+        }
+        #[cfg(not(unix))]
+        input.extend_from_slice(path.to_string_lossy().as_bytes());
+        input.push(0);
+    }
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&input);
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return Vec::new();
+    };
+    // Exit 1 means "none ignored"; 128 means not a repo. Either way the
+    // stdout list is authoritative for what it does contain.
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(chunk))
+            }
+            #[cfg(not(unix))]
+            PathBuf::from(String::from_utf8_lossy(chunk).into_owned())
+        })
+        .filter(|path| paths.contains(path))
+        .collect()
+}
+
 /// Collapses a sorted path list to its subtree roots.
 pub fn subtree_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut sorted = paths.to_vec();
@@ -1188,6 +1268,67 @@ mod tests {
         assert_eq!(merged_mode(Some(0o644), Some(0o755), Some(0o644)), Some(0o755));
         assert_eq!(merged_mode(Some(0o644), Some(0o700), Some(0o755)), Some(0o700));
         assert_eq!(merged_mode(Some(0o644), Some(0o644), Some(0o644)), Some(0o644));
+    }
+
+    #[test]
+    fn keep_mainline_for_drops_only_ignored_entries() {
+        let mut plan = MergePlan::default();
+        plan.refusals.push(Refusal { path: PathBuf::from("a.pyc"), reason: Reason::Binary });
+        plan.refusals.push(Refusal { path: PathBuf::from("b.bin"), reason: Reason::Binary });
+        plan.conflicted.push(ConflictedFile {
+            path: PathBuf::from(".env"),
+            bytes: Vec::new(),
+            hunks: 1,
+            kind: ConflictKind::Hunks,
+            mode: None,
+        });
+        plan.conflicted.push(ConflictedFile {
+            path: PathBuf::from("src/x.rs"),
+            bytes: Vec::new(),
+            hunks: 1,
+            kind: ConflictKind::Hunks,
+            mode: None,
+        });
+        let kept = plan.keep_mainline_for(&[PathBuf::from(".env"), PathBuf::from("a.pyc")]);
+        assert_eq!(kept, vec![PathBuf::from(".env"), PathBuf::from("a.pyc")]);
+        assert_eq!(plan.refusals.len(), 1);
+        assert_eq!(plan.refusals[0].path, PathBuf::from("b.bin"));
+        assert_eq!(plan.conflicted.len(), 1);
+        assert_eq!(plan.conflicted[0].path, PathBuf::from("src/x.rs"));
+    }
+
+    #[test]
+    fn ignored_paths_follow_the_repos_gitignore() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status();
+        if !init.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("git unavailable; skipping");
+            return;
+        }
+        std::fs::write(repo.path().join(".gitignore"), "__pycache__/\n*.log\n.env\n").unwrap();
+        let asked = vec![
+            PathBuf::from("src/__pycache__/m.cpython-313.pyc"),
+            PathBuf::from("src/m.py"),
+            PathBuf::from("run.log"),
+            PathBuf::from(".env"),
+        ];
+        let mut ignored = ignored_paths(repo.path(), &asked);
+        ignored.sort();
+        assert_eq!(
+            ignored,
+            vec![
+                PathBuf::from(".env"),
+                PathBuf::from("run.log"),
+                PathBuf::from("src/__pycache__/m.cpython-313.pyc"),
+            ]
+        );
+        // Not a repo: nothing is ignored, nothing fails.
+        let plain = tempfile::tempdir().expect("tempdir");
+        assert!(ignored_paths(plain.path(), &asked).is_empty());
+        assert!(ignored_paths(repo.path(), &[]).is_empty());
     }
 
     #[test]

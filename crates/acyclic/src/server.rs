@@ -594,7 +594,7 @@ impl Server {
                 let label = format!("promote fork {id}");
                 let result = self.promote_fork(&id, &fork, &label).await;
                 let landed = match result {
-                    Ok(Landed::Conflicted { theirs, ours, files }) => {
+                    Ok(Landed::Conflicted { theirs, ours, files, kept }) => {
                         // Nothing landed: the fork was rebased onto `theirs`
                         // with markers written in. Keep it, judged against
                         // the head it now sits on.
@@ -622,6 +622,7 @@ impl Server {
                             merged_files: 0,
                             conflicts: files,
                             fork_path: Some(fork_path),
+                            kept_mainline: kept,
                         }));
                     }
                     Err(message) => {
@@ -655,11 +656,13 @@ impl Server {
                         merged_files: 0,
                         conflicts: Vec::new(),
                         fork_path: None,
+                        kept_mainline: Vec::new(),
                     })),
                     Landed::Replayed {
                         generation,
                         paths,
                         merged,
+                        kept,
                     } => Ok(proto::Reply::Promote(proto::PromoteInfo {
                         generation: acyclic_engine::generation_hex(generation),
                         old_tree: None,
@@ -670,8 +673,9 @@ impl Server {
                         merged_files: merged,
                         conflicts: Vec::new(),
                         fork_path: None,
+                        kept_mainline: kept,
                     })),
-                    Landed::Nothing { generation } => {
+                    Landed::Nothing { generation, kept } => {
                         Ok(proto::Reply::Promote(proto::PromoteInfo {
                             generation: acyclic_engine::generation_hex(generation),
                             old_tree: None,
@@ -680,6 +684,7 @@ impl Server {
                             merged_files: 0,
                             conflicts: Vec::new(),
                             fork_path: None,
+                            kept_mainline: kept,
                         }))
                     }
                     Landed::Conflicted { .. } => unreachable!("handled above"),
@@ -814,6 +819,7 @@ impl Server {
                         merged_files: 0,
                         conflicts: Vec::new(),
                         fork_path: None,
+                        kept_mainline: Vec::new(),
                     })),
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
@@ -984,7 +990,7 @@ impl Server {
             PromoteOutcome::Promoted {
                 generation,
                 old_tree: None,
-            } => Ok(Landed::Nothing { generation }),
+            } => Ok(Landed::Nothing { generation, kept: Vec::new() }),
             PromoteOutcome::Conflict { message } => Err(message),
         }
     }
@@ -1158,18 +1164,33 @@ impl Server {
         label: &str,
     ) -> Result<Landed, String> {
         if !overlay.lock().await.has_pending_mutations() {
-            return Ok(Landed::Nothing { generation: head });
+            return Ok(Landed::Nothing { generation: head, kept: Vec::new() });
         }
         let snapshot = self
             .handle
             .snapshot_overlay(Arc::clone(&overlay))
             .await
             .map_err(stringify)?;
-        let plan = self
+        let mut plan = self
             .handle
             .merge_plan(base, head, snapshot, format!("fork {id}"))
             .await
             .map_err(stringify)?;
+        // Gitignored paths (bytecode caches, build output, .env) are not
+        // merge payload: a fork's copy never blocks a promote, the
+        // mainline keeps its own. Cheap: only the contested paths are asked.
+        let contested: Vec<PathBuf> = plan
+            .refusals
+            .iter()
+            .map(|refusal| refusal.path.clone())
+            .chain(plan.conflicted.iter().map(|file| file.path.clone()))
+            .collect();
+        let ignored = tokio::task::block_in_place(|| merge::ignored_paths(&self.repo_root, &contested));
+        let kept: Vec<String> = plan
+            .keep_mainline_for(&ignored)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
         if !plan.refusals.is_empty() {
             let mut lines: Vec<String> = plan
                 .refusals
@@ -1187,7 +1208,7 @@ impl Server {
             ));
         }
         if plan.lands_nothing() {
-            return Ok(Landed::Nothing { generation: head });
+            return Ok(Landed::Nothing { generation: head, kept });
         }
 
         // M = H + (fork-only subtrees from F) + (content-merged files).
@@ -1256,6 +1277,7 @@ impl Server {
                 theirs: head,
                 ours: snapshot,
                 files,
+                kept,
             });
         }
 
@@ -1315,6 +1337,7 @@ impl Server {
             generation: landed.generation,
             paths: written,
             merged: plan.merged.len() as u32,
+            kept,
         })
     }
 
@@ -1607,10 +1630,12 @@ enum Landed {
         generation: acyclic_engine::GenerationId,
         paths: u32,
         merged: u32,
+        kept: Vec<String>,
     },
     /// No content changes to land.
     Nothing {
         generation: acyclic_engine::GenerationId,
+        kept: Vec<String>,
     },
     /// Nothing landed: the fork was rebased onto `theirs` and `files`
     /// carry conflict markers in the fork workspace.
@@ -1618,6 +1643,7 @@ enum Landed {
         theirs: acyclic_engine::GenerationId,
         ours: acyclic_engine::GenerationId,
         files: Vec<proto::ConflictEntry>,
+        kept: Vec<String>,
     },
 }
 

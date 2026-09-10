@@ -291,10 +291,14 @@ effective values in ONE line before the first fork, e.g.
   a file both sides edited is merged three-way by content ("promoted by
   merge"). Only edits to the SAME LINES conflict: the promote then writes
   conflict markers into that fork and lands nothing; resolve them in the
-  fork and promote again. Assign ownership by file, or by region of a
-  shared file, in each child prompt so conflicts stay rare. Edits other
-  parts depend on (a type, an interface, a config key) go first as a
-  SEQUENCE step, then partition the rest.
+  fork and promote again. ADJACENT lines count as the same region (a
+  three-way merge cannot split one hunk), so a list of bullets or a
+  block of imports is one region: give it to one fork. Assign ownership
+  by file, or by region of a shared file, in each child prompt so
+  conflicts stay rare. Edits other parts depend on (a type, an
+  interface, a config key) go first as a SEQUENCE step, then partition
+  the rest. Gitignored files (bytecode caches, build output, .env) never
+  conflict: the mainline keeps its own copy and promote says so.
 - **SEQUENCE** — several dependent steps where a later step must not start
   until an earlier one is proven. One fork per step, promote, re-fork.
 

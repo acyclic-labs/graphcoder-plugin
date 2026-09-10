@@ -267,6 +267,10 @@ pub struct PromoteInfo {
     /// The fork workspace to resolve conflicts in (set with `conflicts`).
     #[serde(default)]
     pub fork_path: Option<String>,
+    /// Gitignored paths both sides changed: never merged or conflicted,
+    /// the mainline's copy was kept (and written into the fork on a rebase).
+    #[serde(default)]
+    pub kept_mainline: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

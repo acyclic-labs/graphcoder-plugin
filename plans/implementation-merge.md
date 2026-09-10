@@ -387,3 +387,21 @@ Deliberate divergences:
   `fork_path`; `ForkEntry` gained `conflict_paths` and `conflict`
   (base/ours/theirs). A conflicting promote returns a non-zero exit
   with the per-file report on stderr.
+- **Gitignored paths never conflict (found by a live `/fork` round,
+  2026-09-10).** Each fork's test run regenerated `__pycache__/*.pyc`;
+  three forks then all held a different binary at one path and every
+  later promote refused. The daemon now asks `git check-ignore
+  --no-index` about the contested paths only; ignored ones are dropped
+  from refusals and conflicts, the mainline keeps its own copy (a rebase
+  writes it into the fork), and promote reports `kept the mainline's
+  copy of N gitignored path(s)`. Without git, or outside a repo, nothing
+  changes. `merge.sh` G27 covers both the landing and the conflict path.
+- **Adjacent lines are one hunk.** The README's three bullets sit on
+  consecutive lines, so diff3 saw one region and the round conflicted
+  twice on it (resolved correctly by the agent both times). The skill
+  now says adjacent lines are one region and to give such blocks to one
+  fork. Inherent to three-way line merge; git behaves the same.
+- **Live e2e:** `tests/acceptance/claude-merge-e2e.sh` runs a real
+  `/fork` PARTITION round over one shared file and a deterministic
+  conflict the agent must resolve and promote; opt in with
+  `ACYCLIC_E2E=1` in `run-all.sh`.

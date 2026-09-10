@@ -688,6 +688,15 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             let proto::Reply::Promote(info) = reply else {
                 return Err("unexpected reply".into());
             };
+            let kept_note = if info.kept_mainline.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "kept the mainline's copy of {} gitignored path(s) both sides changed: {}\n",
+                    info.kept_mainline.len(),
+                    info.kept_mainline.join(", ")
+                )
+            };
             if !info.conflicts.is_empty() {
                 let mut report = format!(
                     "promote fork {id}: {} file(s) conflict; markers written into the fork, nothing landed\n",
@@ -701,8 +710,13 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     info.fork_path.as_deref().unwrap_or("the fork"),
                     &info.generation[..12]
                 ));
+                if !kept_note.is_empty() {
+                    report.push('\n');
+                    report.push_str(kept_note.trim_end());
+                }
                 return Err(report.into());
             }
+            print!("{kept_note}");
             match (info.old_tree, info.replayed_paths, info.merged_files) {
                 (Some(old_tree), _, _) => {
                     println!("promoted: working tree now at {}", &info.generation[..12]);

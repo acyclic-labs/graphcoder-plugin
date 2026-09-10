@@ -395,4 +395,36 @@ promote_ok "$B" G26 >/dev/null
 [ "$(head -1 "$R/src/nine.js")" = "l1 AB" ] || fail "G26: resolution did not land: $(cat "$R/src/nine.js")"
 [ "$(cat "$R/src/shared.js")" = $'line1 A\nline2\nline3 B' ] && [ "$(cat "$R/src/other.js")" = "ok" ] || fail "G26: the rest did not land with the resolution"
 
-pass "merge ($MODE mode): disjoint forks replay, same-file edits merge by line, same-line/modify-delete/add-add conflicts rebase the fork with diff3 markers and resolve-then-promote lands, binary/kind/ancestry overlaps are refused leaving the fork untouched, merges are undoable, CRLF survives, all-or-nothing holds"
+# --- G27: gitignored artifacts never conflict; the mainline's copy is kept --
+# A bytecode cache both forks regenerated differently and a .env both edited:
+# neither blocks the promote, neither is merged, the mainline keeps its own,
+# and the report names them. The repo needs git for its ignore rules.
+(cd "$R" && git init -q 2>/dev/null && git add -A >/dev/null 2>&1 && git -c user.email=a@b -c user.name=a commit -qm base >/dev/null 2>&1) || fail "G27: git init"
+printf '__pycache__/\n.env\ngenerated.bin\n' > "$R/.gitignore"
+mkdir -p "$R/src/__pycache__"; printf 'PYC0\000\n' > "$R/src/__pycache__/m.pyc"; acy checkpoint -m "G27 base" >/dev/null
+A="$(fork)"; B="$(fork)"
+printf 'PYC-A\000\n' > "$(fork_path "$A")/src/__pycache__/m.pyc"; printf 'SECRET=A\n' > "$(fork_path "$A")/.env"
+printf 'PYC-B\000\n' > "$(fork_path "$B")/src/__pycache__/m.pyc"; printf 'SECRET=B\n' > "$(fork_path "$B")/.env"
+sed -e 's/^l4$/l4 A/' "$R/src/nine.js" > "$(fork_path "$A")/src/nine.js"
+sed -e 's/^l6$/l6 B/' "$R/src/nine.js" > "$(fork_path "$B")/src/nine.js"
+promote_ok "$A" G27 >/dev/null
+OUT="$(promote_ok "$B" G27)"
+echo "$OUT" | grep -q 'kept the mainline.s copy of 2 gitignored path(s) both sides changed: .env, src/__pycache__/m.pyc' || fail "G27: kept report: $OUT"
+echo "$OUT" | grep -q 'promoted by merge: 1 file(s) merged' || fail "G27: the real edit must still merge: $OUT"
+grep -q '^l4 A$' "$R/src/nine.js" && grep -q '^l6 B$' "$R/src/nine.js" || fail "G27: merged content"
+cmp -s "$R/src/__pycache__/m.pyc" <(printf 'PYC-A\000\n') || fail "G27: mainline (A's) bytecode must be kept: $(od -c "$R/src/__pycache__/m.pyc")"
+[ "$(cat "$R/.env")" = "SECRET=A" ] || fail "G27: mainline's .env must be kept"
+acy forks | grep -q 'no live forks' || fail "G27: fork consumed"
+# The same on the conflict path: a real conflict plus an ignored one only
+# reports the real one, and the rebase gives the fork the mainline's artifact.
+A="$(fork)"; B="$(fork)"
+sed -e 's/^l5$/l5 AA/' "$R/src/nine.js" > "$(fork_path "$A")/src/nine.js"; printf 'PYC-AA\000\n' > "$(fork_path "$A")/src/__pycache__/m.pyc"
+sed -e 's/^l5$/l5 BB/' "$R/src/nine.js" > "$(fork_path "$B")/src/nine.js"; printf 'PYC-BB\000\n' > "$(fork_path "$B")/src/__pycache__/m.pyc"
+promote_ok "$A" G27 >/dev/null
+OUT="$(promote_refused "$B" G27)"
+echo "$OUT" | grep -q '1 file(s) conflict' || fail "G27: only the real conflict counts: $OUT"
+echo "$OUT" | grep -q 'kept the mainline.s copy of 1 gitignored path(s)' || fail "G27: kept report on conflict: $OUT"
+cmp -s "$(fork_path "$B")/src/__pycache__/m.pyc" <(printf 'PYC-AA\000\n') || fail "G27: rebase must give the fork the mainline's artifact"
+acy fork-drop "$B" >/dev/null
+
+pass "merge ($MODE mode): disjoint forks replay, same-file edits merge by line, same-line/modify-delete/add-add conflicts rebase the fork with diff3 markers and resolve-then-promote lands, binary/kind/ancestry overlaps are refused leaving the fork untouched, merges are undoable, CRLF survives, all-or-nothing holds, gitignored artifacts never block"
