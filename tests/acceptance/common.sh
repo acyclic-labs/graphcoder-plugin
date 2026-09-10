@@ -44,6 +44,13 @@ EXPLICIT_FAIL=0
 
 acy() {
   "$BIN" --repo "$R" "$@"
+  local code=$?
+  # A reader that stops early (`| head -1`, `| awk '{...; exit}'`, `| grep -q`)
+  # closes the pipe while the client is still writing; the client dies of
+  # SIGPIPE (141) and pipefail would call the whole pipeline a failure.
+  # That is the reader's choice, not a client error.
+  [ "$code" -eq 141 ] && return 0
+  return "$code"
 }
 
 daemon_pid() {
