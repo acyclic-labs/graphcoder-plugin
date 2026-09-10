@@ -30,6 +30,32 @@ pub struct Config {
     pub guarded_paths: Vec<String>,
     /// Parameters the fork-decomposition skill reads via `acyclic policy`.
     pub decompose: Decompose,
+    /// Content-merge knobs (`[merge]`).
+    pub merge: Merge,
+}
+
+/// `[merge]` table: limits for content-level merges at promote time.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Merge {
+    /// Largest file the three-way merge will read; bigger ones refuse.
+    pub max_file_bytes: u64,
+}
+
+impl Default for Merge {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: crate::merge::DEFAULT_MAX_FILE_BYTES,
+        }
+    }
+}
+
+impl Merge {
+    pub fn limits(&self) -> crate::merge::MergeLimits {
+        crate::merge::MergeLimits {
+            max_file_bytes: self.max_file_bytes,
+        }
+    }
 }
 
 /// Knobs for the `acyclic-fork-decompose` skill. The skill text is the
@@ -80,6 +106,7 @@ impl Default for Config {
             dry_run: false,
             guarded_paths: Vec::new(),
             decompose: Decompose::default(),
+            merge: Merge::default(),
         }
     }
 }
@@ -168,6 +195,21 @@ mod tests {
         assert_eq!(config.decompose.test_command.as_deref(), Some("cargo test"));
         assert_eq!(config.decompose.max_depth, 2);
         assert_eq!(config.decompose.tie_break, "smallest-diff");
+    }
+
+    #[test]
+    fn merge_table_overrides_the_size_cap() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::write(
+            repo.path().join(".acyclic/config.toml"),
+            "[merge]\nmax_file_bytes = 1024\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(None, repo.path()).expect("load");
+        assert_eq!(config.merge.max_file_bytes, 1024);
+        assert_eq!(config.merge.limits().max_file_bytes, 1024);
+        assert_eq!(Config::default().merge.max_file_bytes, 4 * 1024 * 1024);
     }
 
     #[test]

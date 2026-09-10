@@ -54,8 +54,20 @@ pub async fn restore_path(
     target: GenerationId,
     relative: &Path,
 ) -> Result<RestoreOutcome> {
+    let root = store.repo_root.clone();
+    restore_path_into(store, target, &root, relative).await
+}
+
+/// [`restore_path`] against an arbitrary root directory instead of the
+/// working tree: a copy-mode fork's directory during a rebase.
+pub async fn restore_path_into(
+    store: &Store,
+    target: GenerationId,
+    root: &Path,
+    relative: &Path,
+) -> Result<RestoreOutcome> {
     let components = validate_relative(relative)?;
-    let destination = store.repo_root.join(relative);
+    let destination = root.join(relative);
     let parent = destination
         .parent()
         .ok_or_else(|| EngineError::Restore("path has no parent".into()))?;
@@ -247,7 +259,7 @@ async fn apply_mode(
     Ok(())
 }
 
-fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
     let mut components = Vec::new();
     for component in relative.components() {
         match component {
@@ -269,7 +281,7 @@ fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
     Ok(components)
 }
 
-fn namespace_path(
+pub(crate) fn namespace_path(
     components: &[Vec<u8>],
     limits: acyclic_fs::model::VolumeLimits,
 ) -> Result<NamespacePath> {

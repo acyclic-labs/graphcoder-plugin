@@ -112,6 +112,42 @@ enum Request {
         shared: Arc<SharedLocalCheckout>,
         reply: oneshot::Sender<Result<GenerationId>>,
     },
+    /// Merge v2: the three-way plan of fork `ours` onto mainline `theirs`.
+    MergePlan {
+        base: GenerationId,
+        theirs: GenerationId,
+        ours: GenerationId,
+        ours_name: String,
+        reply: oneshot::Sender<Result<crate::merge::MergePlan>>,
+    },
+    /// Merge v2: a new unpublished generation equal to `from` with
+    /// `entries` written over it (the merge generation M, the rebase R).
+    BuildGeneration {
+        from: GenerationId,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+        reply: oneshot::Sender<Result<GenerationId>>,
+    },
+    /// Merge v2: writes `entries` into a live fork overlay (a rebase of a
+    /// mounted fork).
+    ApplyToOverlay {
+        shared: Arc<SharedLocalCheckout>,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Regular-file contents at `paths` in `generation` (None when absent
+    /// or not a regular file): the conflict-marker scan before a re-promote.
+    ReadFiles {
+        generation: GenerationId,
+        paths: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<Vec<(PathBuf, Option<Vec<u8>>)>>>,
+    },
+    /// Restores one path from `target` into `root` (a copy fork's directory).
+    RestorePathInto {
+        target: GenerationId,
+        root: PathBuf,
+        path: PathBuf,
+        reply: oneshot::Sender<Result<RestoreOutcome>>,
+    },
     /// Copy-mode fork: write `generation` out to `destination`.
     Materialize {
         generation: GenerationId,
@@ -292,6 +328,87 @@ impl PipelineHandle {
         request!(self, SnapshotOverlay { shared: shared })?
     }
 
+    /// Merge v2: plans fork `ours` onto mainline `theirs` from `base`.
+    pub async fn merge_plan(
+        &self,
+        base: GenerationId,
+        theirs: GenerationId,
+        ours: GenerationId,
+        ours_name: String,
+    ) -> Result<crate::merge::MergePlan> {
+        request!(
+            self,
+            MergePlan {
+                base: base,
+                theirs: theirs,
+                ours: ours,
+                ours_name: ours_name
+            }
+        )?
+    }
+
+    /// Merge v2: unpublished generation = `from` + `entries`.
+    pub async fn build_generation(
+        &self,
+        from: GenerationId,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+    ) -> Result<GenerationId> {
+        request!(
+            self,
+            BuildGeneration {
+                from: from,
+                entries: entries
+            }
+        )?
+    }
+
+    /// Merge v2: writes `entries` into a fork's overlay.
+    pub async fn apply_to_overlay(
+        &self,
+        shared: Arc<SharedLocalCheckout>,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+    ) -> Result<()> {
+        request!(
+            self,
+            ApplyToOverlay {
+                shared: shared,
+                entries: entries
+            }
+        )?
+    }
+
+    /// Regular-file contents at `paths` in `generation`.
+    pub async fn read_files(
+        &self,
+        generation: GenerationId,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+        request!(
+            self,
+            ReadFiles {
+                generation: generation,
+                paths: paths
+            }
+        )?
+    }
+
+    /// Restores one path from `target` into `root` rather than the working tree.
+    pub async fn restore_path_into(
+        &self,
+        target: GenerationId,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<RestoreOutcome> {
+        request!(
+            self,
+            RestorePathInto {
+                target: target,
+                root: root,
+                path: path
+            }
+        )?
+    }
+
     /// Copy-mode fork: materializes `generation` into `destination`.
     pub async fn materialize(&self, generation: GenerationId, destination: PathBuf) -> Result<()> {
         request!(
@@ -403,6 +520,11 @@ pub fn spawn(
     let (sender, receiver) = mpsc::channel(1024);
     let thread = std::thread::Builder::new()
         .name("acyclic-pipeline".into())
+        // The fs facade's futures are large and a few of them nest per
+        // request (a subtree copy, a restore); the 2 MiB default is tight
+        // in debug builds. Virtual reservation only: untouched pages cost
+        // nothing.
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -472,6 +594,11 @@ fn fail_request(request: Request, message: &str) {
         Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
         Request::ScratchCheckout { reply, .. } => drop(reply.send(Err(error()))),
         Request::PublishHead { reply } => drop(reply.send(Err(error()))),
+        Request::MergePlan { reply, .. } => drop(reply.send(Err(error()))),
+        Request::BuildGeneration { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ApplyToOverlay { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ReadFiles { reply, .. } => drop(reply.send(Err(error()))),
+        Request::RestorePathInto { reply, .. } => drop(reply.send(Err(error()))),
         Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
@@ -680,6 +807,78 @@ impl Pipeline {
                         .value)
                 }
                 .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::MergePlan {
+                base,
+                theirs,
+                ours,
+                ours_name,
+                reply,
+            } => {
+                // Boxed: the fs facade's futures are large, and inlining
+                // them into the pipeline's main state machine overflows the
+                // thread stack.
+                let limits = self.config.merge.limits();
+                let result = Box::pin(crate::merge::plan(
+                    &self.store,
+                    base,
+                    theirs,
+                    ours,
+                    &ours_name,
+                    &limits,
+                ))
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::BuildGeneration {
+                from,
+                entries,
+                reply,
+            } => {
+                let result = Box::pin(self.build_generation(from, entries)).await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::ApplyToOverlay {
+                shared,
+                entries,
+                reply,
+            } => {
+                let result = Box::pin(async {
+                    let mut guard = shared.lock().await;
+                    crate::merge::apply_entries(&self.store, &mut guard, &entries).await
+                })
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::ReadFiles {
+                generation,
+                paths,
+                reply,
+            } => {
+                let result = Box::pin(async {
+                    let mut out = Vec::with_capacity(paths.len());
+                    for path in paths {
+                        let bytes = crate::merge::read_file(&self.store, generation, &path).await?;
+                        out.push((path, bytes));
+                    }
+                    Ok(out)
+                })
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::RestorePathInto {
+                target,
+                root,
+                path,
+                reply,
+            } => {
+                let result = Box::pin(rewind::restore_path_into(&self.store, target, &root, &path)).await;
                 let _ = reply.send(result);
                 false
             }
@@ -1043,6 +1242,26 @@ impl Pipeline {
             checkout,
             MountPublication::Manual,
         )))
+    }
+
+    /// Merge v2: a scratch overlay at `from`, `entries` written over it,
+    /// checkpointed as an unpublished generation. The head never moves.
+    async fn build_generation(
+        &mut self,
+        from: GenerationId,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+    ) -> Result<GenerationId> {
+        let scratch = self.scratch_checkout(from).await?;
+        let mut guard = scratch.lock().await;
+        crate::merge::apply_entries(&self.store, &mut guard, &entries).await?;
+        if !guard.has_pending_mutations() {
+            return Ok(from);
+        }
+        Ok(guard
+            .checkpoint(WorkCounters::UNBOUNDED, &self.cancel)
+            .await
+            .map_err(EngineError::fs("build generation"))?
+            .value)
     }
 
     async fn fork(&mut self) -> Result<ForkSeed> {

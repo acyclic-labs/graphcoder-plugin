@@ -10,9 +10,11 @@ use acyclic_engine::fork::{
 };
 use acyclic_engine::guard::GuardedMountFilesystem;
 use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
+use acyclic_engine::merge::{self, Entry};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
+use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::{
     mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
     NativeMountRequest, NativeMountSession, RoutedMountSource,
@@ -28,11 +30,31 @@ use tokio::sync::{Mutex, Notify};
 /// all the routed design ever needs.
 struct ForkState {
     shared: Arc<SharedLocalCheckout>,
+    /// The generation promote is judged against. Starts at the fork's cut
+    /// point; a conflicting promote rebases the fork and moves it to the
+    /// head it was rebased onto.
     base: acyclic_engine::GenerationId,
     entry: proto::ForkEntry,
     /// Copy-mode forks only: the materialized directory the user works in.
     /// Captured back into `shared` at promote, removed at drop/promote.
     copy_dir: Option<PathBuf>,
+    /// Volume config and id the mount source needs, to re-attach a route
+    /// after a promote that did not land.
+    config: VolumeConfig,
+    volume_id: acyclic_fs::VolumeId,
+    /// True once a promote has rebased this fork: its overlay no longer
+    /// sits on the head it was cut from, so it lands through the
+    /// checkpoint-and-swap path instead of an optimistic commit.
+    rebased: bool,
+    /// Set by a conflicting promote until the markers are gone.
+    conflict: Option<OpenConflict>,
+}
+
+/// A conflict a promote wrote into a fork workspace (graphcoder's
+/// `FS_CONFLICT_OPENED` payload: base, ours, theirs, paths).
+#[derive(Clone, Debug)]
+struct OpenConflict {
+    paths: Vec<PathBuf>,
 }
 
 /// One Safe Mode session: its fork and the shadow mount that projects it
@@ -100,7 +122,12 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     let shutdown = Arc::new(Notify::new());
-    let mounts = fork::mount_capability();
+    let mut mounts = fork::mount_capability();
+    // Test hook: exercise the copy-fork paths on a host that has mounts.
+    if std::env::var_os("ACYCLIC_FORCE_COPY_FORKS").is_some() {
+        mounts.available = false;
+        mounts.reason = Some("ACYCLIC_FORCE_COPY_FORKS is set".into());
+    }
     if !mounts.available {
         eprintln!(
             "acyclic daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
@@ -516,61 +543,7 @@ impl Server {
                 for _ in 0..count {
                     let seed = self.handle.fork().await.map_err(stringify)?;
                     let id = short_id();
-                    // Mount-source construction spins up a callback runtime;
-                    // keep it (and any mount syscall) off async workers.
-                    let shared = Arc::clone(&seed.shared);
-                    let config = seed.config;
-                    let guarded_paths = self.config.guarded_paths.clone();
-                    let source = tokio::task::block_in_place(move || {
-                        let source = CheckoutMountSource::new(shared, config)
-                            .map_err(|error| format!("mount source: {error:?}"))?;
-                        Ok::<Arc<dyn MountFilesystem>, String>(
-                            if GuardedMountFilesystem::is_active(&guarded_paths) {
-                                Arc::new(GuardedMountFilesystem::new(
-                                    Arc::new(source),
-                                    &guarded_paths,
-                                ))
-                            } else {
-                                Arc::new(source)
-                            },
-                        )
-                    })?;
-                    let mut mount = self.fork_mount.lock().await;
-                    mount
-                        .router
-                        .add_route(id.clone().into_bytes(), source)
-                        .map_err(|error| format!("route: {error:?}"))?;
-                    // The ONE session, mounted lazily on the first fork. A
-                    // route insert is all later forks pay.
-                    if mount.session.is_none() {
-                        let _ = std::fs::remove_dir_all(&root);
-                        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-                        let router = Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
-                        let volume_id = seed.volume_id;
-                        let dest = root.clone();
-                        let session = tokio::task::block_in_place(move || {
-                            mount_native(
-                                NativeMountRequest {
-                                    mount_id: acyclic_engine::MountId::new(),
-                                    volume_id,
-                                    destination: dest,
-                                    writable: true,
-                                },
-                                router,
-                            )
-                            .map_err(|error| format!("mount: {error:?}"))
-                        });
-                        match session {
-                            Ok(session) => mount.session = Some(session),
-                            Err(error) => {
-                                tokio::task::block_in_place(|| {
-                                    mount.router.remove_route(id.as_bytes())
-                                });
-                                return Err(error);
-                            }
-                        }
-                    }
-                    drop(mount);
+                    self.attach_route(&id, Arc::clone(&seed.shared), seed.config, seed.volume_id).await?;
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
@@ -578,6 +551,8 @@ impl Server {
                         base: acyclic_engine::generation_hex(seed.base),
                         created_at: unix_now(),
                         session_id: session_id.clone(),
+                        conflict_paths: Vec::new(),
+                        conflict: None,
                     };
                     self.forks.lock().await.insert(
                         id,
@@ -586,6 +561,10 @@ impl Server {
                             base: seed.base,
                             entry: clone_entry(&entry),
                             copy_dir: None,
+                            config: seed.config,
+                            volume_id: seed.volume_id,
+                            rebased: false,
+                            conflict: None,
                         },
                     );
                     created.push(entry);
@@ -610,15 +589,60 @@ impl Server {
             }
             proto::Op::Promote { id } => {
                 let mut forks = self.forks.lock().await;
-                let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
+                let mut fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
                 let label = format!("promote fork {id}");
                 let result = self.promote_fork(&id, &fork, &label).await;
+                let landed = match result {
+                    Ok(Landed::Conflicted { theirs, ours, files }) => {
+                        // Nothing landed: the fork was rebased onto `theirs`
+                        // with markers written in. Keep it, judged against
+                        // the head it now sits on.
+                        let conflict_base = fork.base;
+                        fork.conflict = Some(OpenConflict {
+                            paths: files.iter().map(|file| PathBuf::from(&file.path)).collect(),
+                        });
+                        fork.base = theirs;
+                        fork.rebased = true;
+                        fork.entry.base = acyclic_engine::generation_hex(theirs);
+                        fork.entry.conflict_paths =
+                            files.iter().map(|file| file.path.clone()).collect();
+                        fork.entry.conflict = Some(proto::ConflictInfo {
+                            base: acyclic_engine::generation_hex(conflict_base),
+                            ours: acyclic_engine::generation_hex(ours),
+                            theirs: acyclic_engine::generation_hex(theirs),
+                        });
+                        let fork_path = fork.entry.path.clone();
+                        self.keep_fork(id, fork).await?;
+                        return Ok(proto::Reply::Promote(proto::PromoteInfo {
+                            generation: acyclic_engine::generation_hex(theirs),
+                            old_tree: None,
+                            warning: String::new(),
+                            replayed_paths: 0,
+                            merged_files: 0,
+                            conflicts: files,
+                            fork_path: Some(fork_path),
+                        }));
+                    }
+                    Err(message) => {
+                        // A refusal (or a failure) leaves the fork exactly as
+                        // it was, still promotable once the cause is fixed.
+                        // A resolved conflict stays resolved.
+                        if fork.conflict.is_some() && !message.starts_with("unresolved conflict markers") {
+                            fork.conflict = None;
+                            fork.entry.conflict_paths.clear();
+                            fork.entry.conflict = None;
+                        }
+                        self.keep_fork(id, fork).await?;
+                        return Err(message);
+                    }
+                    Ok(landed) => landed,
+                };
                 if let Some(dir) = fork.copy_dir.as_deref() {
                     let _ = std::fs::remove_dir_all(dir);
                     Self::remove_if_empty(dir.parent());
                 }
-                match result? {
+                match landed {
                     Landed::Swapped {
                         generation,
                         old_tree,
@@ -628,25 +652,37 @@ impl Server {
                         warning: "reload your editor: open files still point at the replaced tree"
                             .into(),
                         replayed_paths: 0,
+                        merged_files: 0,
+                        conflicts: Vec::new(),
+                        fork_path: None,
                     })),
-                    Landed::Replayed { generation, paths } => {
-                        Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(generation),
-                            old_tree: None,
-                            warning: "the mainline had moved; the fork's paths were written \
-                                      in place, no directory swap"
-                                .into(),
-                            replayed_paths: paths,
-                        }))
-                    }
+                    Landed::Replayed {
+                        generation,
+                        paths,
+                        merged,
+                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
+                        generation: acyclic_engine::generation_hex(generation),
+                        old_tree: None,
+                        warning: "the mainline had moved; the fork's paths were written \
+                                  in place, no directory swap"
+                            .into(),
+                        replayed_paths: paths,
+                        merged_files: merged,
+                        conflicts: Vec::new(),
+                        fork_path: None,
+                    })),
                     Landed::Nothing { generation } => {
                         Ok(proto::Reply::Promote(proto::PromoteInfo {
                             generation: acyclic_engine::generation_hex(generation),
                             old_tree: None,
                             warning: String::new(),
                             replayed_paths: 0,
+                            merged_files: 0,
+                            conflicts: Vec::new(),
+                            fork_path: None,
                         }))
                     }
+                    Landed::Conflicted { .. } => unreachable!("handled above"),
                 }
             }
             proto::Op::ForkDiff { id } => {
@@ -775,6 +811,9 @@ impl Server {
                         warning: "reload your editor: open files still point at the replaced tree"
                             .into(),
                         replayed_paths: 0,
+                        merged_files: 0,
+                        conflicts: Vec::new(),
+                        fork_path: None,
                     })),
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
@@ -870,6 +909,8 @@ impl Server {
                 base: acyclic_engine::generation_hex(seed.base),
                 created_at: unix_now(),
                 session_id: session_id.clone(),
+                conflict_paths: Vec::new(),
+                conflict: None,
             };
             self.forks.lock().await.insert(
                 id,
@@ -878,6 +919,10 @@ impl Server {
                     base: seed.base,
                     entry: clone_entry(&entry),
                     copy_dir: Some(dir),
+                    config: seed.config,
+                    volume_id: seed.volume_id,
+                    rebased: false,
+                    conflict: None,
                 },
             );
             created.push(entry);
@@ -885,11 +930,12 @@ impl Server {
         Ok(proto::Reply::Forks(created))
     }
 
-    /// Lands a fork. Three outcomes: the mainline is still at the fork's
-    /// base and the whole tree is swapped (mounted forks use the engine's
-    /// promote, copy forks the resolve/apply pair); the mainline moved but
-    /// nothing overlaps and the fork's paths are replayed in place; or the
-    /// fork had no content changes. Overlap is an error naming the paths.
+    /// Lands a fork. Outcomes: the mainline is still at the fork's base and
+    /// the whole tree is swapped; the mainline moved and the fork merges
+    /// onto it (paths replayed in place, files merged by content); the
+    /// merge conflicts and the fork is rebased with markers (nothing
+    /// lands); the fork had no content changes. A refusal is an error
+    /// naming the paths and leaves everything untouched.
     async fn promote_fork(
         &self,
         id: &str,
@@ -908,11 +954,18 @@ impl Server {
                 Arc::clone(&fork.shared)
             }
         };
+        // A rebased fork must have resolved its markers before it can land
+        // anywhere, moved mainline or not.
+        if let Some(conflict) = fork.conflict.as_ref() {
+            self.refuse_unresolved_markers(&overlay, conflict).await?;
+        }
         let head = self.handle.publish_head().await.map_err(stringify)?;
         if head != fork.base {
-            return self.replay_onto_head(id, overlay, fork.base, head, label).await;
+            return self
+                .merge_onto_head(id, overlay, fork.base, head, fork.copy_dir.as_deref(), label)
+                .await;
         }
-        let outcome = if fork.copy_dir.is_some() {
+        let outcome = if fork.copy_dir.is_some() || fork.rebased {
             self.land_overlay(overlay, fork.base, label).await?
         } else {
             self.handle
@@ -933,6 +986,116 @@ impl Server {
                 old_tree: None,
             } => Ok(Landed::Nothing { generation }),
             PromoteOutcome::Conflict { message } => Err(message),
+        }
+    }
+
+    /// Re-inserts a fork that did not land, restoring its mount route.
+    async fn keep_fork(&self, id: String, fork: ForkState) -> Result<(), String> {
+        if fork.copy_dir.is_none() {
+            self.attach_route(&id, Arc::clone(&fork.shared), fork.config, fork.volume_id).await?;
+        }
+        self.forks.lock().await.insert(id, fork);
+        Ok(())
+    }
+
+    /// Builds the mount source for a fork's shared checkout and routes it
+    /// under the one native session (mounting it on the first route).
+    async fn attach_route(
+        &self,
+        id: &str,
+        shared: Arc<SharedLocalCheckout>,
+        config: VolumeConfig,
+        volume_id: acyclic_fs::VolumeId,
+    ) -> Result<(), String> {
+        let root = fork::forks_mount_root(&self.repo_root)
+            .ok_or("repo root has no parent for fork workspaces")?;
+        // Mount-source construction spins up a callback runtime;
+        // keep it (and any mount syscall) off async workers.
+        let guarded_paths = self.config.guarded_paths.clone();
+        let source = tokio::task::block_in_place(move || {
+            let source = CheckoutMountSource::new(shared, config)
+                .map_err(|error| format!("mount source: {error:?}"))?;
+            Ok::<Arc<dyn MountFilesystem>, String>(
+                if GuardedMountFilesystem::is_active(&guarded_paths) {
+                    Arc::new(GuardedMountFilesystem::new(
+                        Arc::new(source),
+                        &guarded_paths,
+                    ))
+                } else {
+                    Arc::new(source)
+                },
+            )
+        })?;
+        let mut mount = self.fork_mount.lock().await;
+        mount
+            .router
+            .add_route(id.to_string().into_bytes(), source)
+            .map_err(|error| format!("route: {error:?}"))?;
+        // The ONE session, mounted lazily on the first fork. A route
+        // insert is all later forks pay.
+        if mount.session.is_none() {
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+            let router = Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
+            let dest = root.clone();
+            let session = tokio::task::block_in_place(move || {
+                mount_native(
+                    NativeMountRequest {
+                        mount_id: acyclic_engine::MountId::new(),
+                        volume_id,
+                        destination: dest,
+                        writable: true,
+                    },
+                    router,
+                )
+                .map_err(|error| format!("mount: {error:?}"))
+            });
+            match session {
+                Ok(session) => mount.session = Some(session),
+                Err(error) => {
+                    tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a re-promote while any path of the open conflict still holds
+    /// markers in the fork. A deleted path counts as resolved.
+    async fn refuse_unresolved_markers(
+        &self,
+        overlay: &Arc<SharedLocalCheckout>,
+        conflict: &OpenConflict,
+    ) -> Result<(), String> {
+        if !overlay.lock().await.has_pending_mutations() {
+            // Nothing written since the rebase: the markers are still there.
+            return Err(unresolved_message(&conflict.paths));
+        }
+        let snapshot = self
+            .handle
+            .snapshot_overlay(Arc::clone(overlay))
+            .await
+            .map_err(stringify)?;
+        let files = self
+            .handle
+            .read_files(snapshot, conflict.paths.clone())
+            .await
+            .map_err(stringify)?;
+        let unresolved: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|(_, bytes)| {
+                bytes
+                    .as_deref()
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .is_some_and(merge::has_conflict_markers)
+            })
+            .map(|(path, _)| path)
+            .collect();
+        if unresolved.is_empty() {
+            Ok(())
+        } else {
+            Err(unresolved_message(&unresolved))
         }
     }
 
@@ -977,19 +1140,21 @@ impl Server {
             .map_err(stringify)
     }
 
-    /// The merge primitive, v1: path-disjoint replay. The mainline moved
-    /// past the fork's base. Diff both sides against the base; if no path on
-    /// one side is the same as, or inside, a path on the other, write the
-    /// fork's changed paths onto the current tree one by one (each write is
-    /// the same atomic single-path restore a `restore` uses), then checkpoint
-    /// and publish. Any overlap is a conflict that names the paths: content
-    /// merging is a later launch.
-    async fn replay_onto_head(
+    /// The merge primitive (v2, content-level). The mainline moved past the
+    /// fork's base. Plan the three-way merge of base/head/fork in full
+    /// before writing anything. Any refusal: error naming the paths, fork
+    /// and tree untouched. Any conflict: the fork is rebased onto the head
+    /// (R = head + fork's paths + merged files + marker-bearing files) and
+    /// nothing lands. Otherwise M = head + fork's paths + merged files is
+    /// written onto the real tree path by path with the same atomic
+    /// single-path restore a `restore` uses, then checkpointed and published.
+    async fn merge_onto_head(
         &self,
         id: &str,
         overlay: Arc<SharedLocalCheckout>,
         base: acyclic_engine::GenerationId,
         head: acyclic_engine::GenerationId,
+        copy_dir: Option<&Path>,
         label: &str,
     ) -> Result<Landed, String> {
         if !overlay.lock().await.has_pending_mutations() {
@@ -997,75 +1162,135 @@ impl Server {
         }
         let snapshot = self
             .handle
-            .snapshot_overlay(overlay)
+            .snapshot_overlay(Arc::clone(&overlay))
             .await
             .map_err(stringify)?;
-        let fork_changes: Vec<PathBuf> = content_changes(self.handle.diff(base, snapshot).await.map_err(stringify)?)
-            .into_iter()
-            .map(|change| change.path)
-            .collect();
-        if fork_changes.is_empty() {
-            return Ok(Landed::Nothing { generation: head });
-        }
-        let head_changes: Vec<PathBuf> = content_changes(self.handle.diff(base, head).await.map_err(stringify)?)
-            .into_iter()
-            .map(|change| change.path)
-            .collect();
-        let mut overlaps: Vec<String> = fork_changes
-            .iter()
-            .filter(|fork_path| {
-                head_changes
-                    .iter()
-                    .any(|head_path| fork_path.starts_with(head_path) || head_path.starts_with(fork_path))
-            })
-            .map(|path| path.display().to_string())
-            .collect();
-        if !overlaps.is_empty() {
-            overlaps.sort();
-            let shown: Vec<&str> = overlaps.iter().take(8).map(String::as_str).collect();
-            let more = overlaps.len().saturating_sub(shown.len());
+        let plan = self
+            .handle
+            .merge_plan(base, head, snapshot, format!("fork {id}"))
+            .await
+            .map_err(stringify)?;
+        if !plan.refusals.is_empty() {
+            let mut lines: Vec<String> = plan
+                .refusals
+                .iter()
+                .map(|refusal| format!("  {}: {}", refusal.path.display(), refusal.reason))
+                .collect();
+            lines.sort();
             return Err(format!(
-                "the working tree moved past the fork's base ({}) and both sides changed {} path(s): {}{}. \
-                 Merge is path-disjoint in v1: re-fork from the current tree and re-apply those paths, \
-                 or rewind to the base",
+                "the working tree moved past the fork's base ({}) and {} path(s) cannot be merged:\n{}\n\
+                 One fork must own those paths: re-fork from the current tree and redo that part, \
+                 or rewind to the base. The fork is untouched",
                 acyclic_engine::generation_hex(base),
-                overlaps.len(),
-                shown.join(", "),
-                if more > 0 { format!(" (+{more} more)") } else { String::new() }
+                plan.refusals.len(),
+                lines.join("\n")
             ));
         }
-        // A subtree restore covers its descendants: restore each changed
-        // path only if no ancestor of it is also being restored.
-        let mut roots: Vec<PathBuf> = Vec::new();
-        for path in &fork_changes {
-            if !roots.iter().any(|root| path.starts_with(root)) {
-                roots.push(path.clone());
-            }
+        if plan.lands_nothing() {
+            return Ok(Landed::Nothing { generation: head });
         }
+
+        // M = H + (fork-only subtrees from F) + (content-merged files).
+        let mut entries: Vec<(PathBuf, Entry)> = plan
+            .take_ours
+            .iter()
+            .map(|path| (path.clone(), Entry::FromGeneration { generation: snapshot }))
+            .collect();
+        entries.extend(plan.merged.iter().map(|file| {
+            (
+                file.path.clone(),
+                Entry::Regular {
+                    bytes: file.bytes.clone(),
+                    mode: file.mode,
+                },
+            )
+        }));
+        let merged = self
+            .handle
+            .build_generation(head, entries)
+            .await
+            .map_err(stringify)?;
+
+        if !plan.conflicted.is_empty() {
+            // R = M + marker-bearing files; the fork becomes R.
+            let entries: Vec<(PathBuf, Entry)> = plan
+                .conflicted
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        Entry::Regular {
+                            bytes: file.bytes.clone(),
+                            mode: file.mode,
+                        },
+                    )
+                })
+                .collect();
+            let rebased = self
+                .handle
+                .build_generation(merged, entries)
+                .await
+                .map_err(stringify)?;
+            self.handle
+                .record_generation(
+                    rebased,
+                    format!(
+                        "fork {id} rebased onto {} ({} conflict(s))",
+                        &acyclic_engine::generation_hex(head)[..12],
+                        plan.conflicted.len()
+                    ),
+                )
+                .await
+                .map_err(stringify)?;
+            self.rebase_fork(&overlay, snapshot, rebased, copy_dir).await?;
+            let mut files: Vec<proto::ConflictEntry> = plan
+                .conflicted
+                .iter()
+                .map(|file| proto::ConflictEntry {
+                    path: file.path.display().to_string(),
+                    detail: file.describe(),
+                })
+                .collect();
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            return Ok(Landed::Conflicted {
+                theirs: head,
+                ours: snapshot,
+                files,
+            });
+        }
+
         let target = self
             .handle
-            .record_generation(snapshot, format!("fork {id} snapshot"))
+            .record_generation(
+                merged,
+                format!(
+                    "fork {id} merge ({} merged, {} replayed)",
+                    plan.merged.len(),
+                    plan.take_ours.len()
+                ),
+            )
             .await
             .map_err(stringify)?;
         self.handle
             .checkpoint(
                 CheckpointKind::PreRewind,
                 Attribution {
-                    label: Some(format!("before {label} (replay)")),
+                    label: Some(format!("before {label} (merge)")),
                     ..Attribution::default()
                 },
             )
             .await
             .map_err(stringify)?;
         let mut written = 0u32;
-        for root in &roots {
+        for root in plan.landing_paths() {
             self.handle
                 .restore_path(target.clone(), root.clone())
                 .await
                 .map_err(|error| {
                     format!(
-                        "replay stopped at {} after {written} path(s): {error}. The tree is partially \
-                         merged; `acyclic rewind --last` returns to the pre-replay safety checkpoint",
+                        "merge stopped at {} after {written} path(s): {error}. The tree is partially \
+                         merged; `acyclic rewind <id>` of the `before promote ... (merge)` row in \
+                         `acyclic timeline` returns to the pre-merge tree",
                         root.display()
                     )
                 })?;
@@ -1076,7 +1301,10 @@ impl Server {
             .checkpoint(
                 CheckpointKind::Manual,
                 Attribution {
-                    label: Some(format!("{label} (replayed {written} paths onto moved mainline)")),
+                    label: Some(format!(
+                        "{label} (merged {} file(s), replayed {written} path(s) onto moved mainline)",
+                        plan.merged.len()
+                    )),
                     ..Attribution::default()
                 },
             )
@@ -1086,7 +1314,48 @@ impl Server {
         Ok(Landed::Replayed {
             generation: landed.generation,
             paths: written,
+            merged: plan.merged.len() as u32,
         })
+    }
+
+    /// Makes the fork workspace equal to `rebased`: writes R − F into the
+    /// overlay (mount fork) or the directory (copy fork). The real tree is
+    /// never touched.
+    async fn rebase_fork(
+        &self,
+        overlay: &Arc<SharedLocalCheckout>,
+        snapshot: acyclic_engine::GenerationId,
+        rebased: acyclic_engine::GenerationId,
+        copy_dir: Option<&Path>,
+    ) -> Result<(), String> {
+        let changed: Vec<PathBuf> = content_changes(
+            self.handle.diff(snapshot, rebased).await.map_err(stringify)?,
+        )
+        .into_iter()
+        .map(|change| change.path)
+        .collect();
+        let roots = merge::subtree_roots(&changed);
+        match copy_dir {
+            Some(dir) => {
+                for root in &roots {
+                    self.handle
+                        .restore_path_into(rebased, dir.to_path_buf(), root.clone())
+                        .await
+                        .map_err(stringify)?;
+                }
+            }
+            None => {
+                let entries: Vec<(PathBuf, Entry)> = roots
+                    .iter()
+                    .map(|path| (path.clone(), Entry::FromGeneration { generation: rebased }))
+                    .collect();
+                self.handle
+                    .apply_to_overlay(Arc::clone(overlay), entries)
+                    .await
+                    .map_err(stringify)?;
+            }
+        }
+        Ok(())
     }
 
     /// Drops whatever backs a fork: its route for mounted forks, its
@@ -1332,15 +1601,33 @@ enum Landed {
         generation: acyclic_engine::GenerationId,
         old_tree: PathBuf,
     },
-    /// Path-by-path replay onto a moved mainline; no swap.
+    /// Path-by-path replay onto a moved mainline; no swap. `merged` of
+    /// the paths were produced by a three-way content merge.
     Replayed {
         generation: acyclic_engine::GenerationId,
         paths: u32,
+        merged: u32,
     },
     /// No content changes to land.
     Nothing {
         generation: acyclic_engine::GenerationId,
     },
+    /// Nothing landed: the fork was rebased onto `theirs` and `files`
+    /// carry conflict markers in the fork workspace.
+    Conflicted {
+        theirs: acyclic_engine::GenerationId,
+        ours: acyclic_engine::GenerationId,
+        files: Vec<proto::ConflictEntry>,
+    },
+}
+
+fn unresolved_message(paths: &[PathBuf]) -> String {
+    let shown: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+    format!(
+        "unresolved conflict markers in: {}. Resolve every <<<<<<< / ||||||| / ======= / >>>>>>> block \
+         in the fork (or delete the file) and promote again",
+        shown.join(", ")
+    )
 }
 
 fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
@@ -1351,6 +1638,8 @@ fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
         base: entry.base.clone(),
         created_at: entry.created_at,
         session_id: entry.session_id.clone(),
+        conflict_paths: entry.conflict_paths.clone(),
+        conflict: entry.conflict.clone(),
     }
 }
 

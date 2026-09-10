@@ -285,14 +285,15 @@ effective values in ONE line before the first fork, e.g.
 - **RACE** — one goal, 2 or more genuinely different approaches, and a
   wrong choice would be expensive. Fork `fan_out` ways, one approach each,
   land ONE.
-- **PARTITION** — independent parts that touch DIFFERENT files. Fork one
-  per part, land EVERY passing fork. Promote merges path-disjoint forks
-  onto the moved mainline ("promoted by replay"). If two forks touched the
-  same path, or one touched a path inside a directory the other changed,
-  the second promote fails naming the paths: re-fork from the current
-  tree and redo only that part. Assign ownership by file in each child
-  prompt so overlap never happens by accident. Never partition a change
-  to a shared file (a type, an interface, a config): do that first as a
+- **PARTITION** — independent parts. Fork one per part, land EVERY
+  passing fork. Promote merges each fork onto the moved mainline: paths
+  only that fork touched are written in place ("promoted by replay"), and
+  a file both sides edited is merged three-way by content ("promoted by
+  merge"). Only edits to the SAME LINES conflict: the promote then writes
+  conflict markers into that fork and lands nothing; resolve them in the
+  fork and promote again. Assign ownership by file, or by region of a
+  shared file, in each child prompt so conflicts stay rare. Edits other
+  parts depend on (a type, an interface, a config key) go first as a
   SEQUENCE step, then partition the rest.
 - **SEQUENCE** — several dependent steps where a later step must not start
   until an earlier one is proven. One fork per step, promote, re-fork.
@@ -308,11 +309,12 @@ Depth starts at 1 and increases by one per round.
 3. Dispatch ALL subagents in one turn, one per fork, using the CHILD
    PROMPT below. Do not keep one approach for yourself.
 4. **Freeze.** Make NO edits to the real tree while forks are live. A
-   single edit moves the mainline and every promote will conflict.
+   real-tree edit merges like another fork would: fine when disjoint,
+   a conflict to resolve when it touches the same lines.
 5. When all reports are in, `acyclic fork-diff <id>` for each fork.
 6. RACE: pick the winner by the SELECTION RULE and `acyclic promote <winner>`.
    PARTITION: `acyclic promote <id>` for every fork that passed, in
-   dispatch order. The first swaps the tree; the rest replay in place.
+   dispatch order. The first swaps the tree; the rest merge in place.
 7. Run `cd "$PWD"`. A swap-style promote replaces the repo directory; a
    shell left in the old inode silently runs every later command in the
    replaced tree. Harmless after a replay, so always do it.
@@ -334,8 +336,9 @@ Do not read or write the real repository at <absolute repo root>.
 GOAL: <one sentence, verbatim from the task>
 YOUR APPROACH (<kebab-case-id>): <one or two sentences naming this
 approach and what makes it different from the alternatives>
-YOU OWN: <PARTITION only: the files or directories this fork may change;
-touch nothing else, or the merge will refuse your fork>
+YOU OWN: <PARTITION only: the files, directories, or regions of a shared
+file this fork may change; touch nothing else, or your promote will
+conflict with a sibling's>
 DEPTH: <depth> of <max_depth>
 
 Do the work. Make your first tool call a write to the file you own most.
@@ -384,11 +387,19 @@ anything a script or generator wrote.
 
 ## 6. Failure and fallback
 
-- A promote that names overlapping paths means two sides changed the
-  same file or directory: a PARTITION child stepped outside what it owns,
-  or you edited the real tree. The conflicting fork is discarded by the
-  engine, its changes included. Re-fork from the current tree and redo
-  that part with tighter ownership; do not try to salvage it.
+- A promote that reports `N file(s) conflict` has written conflict
+  markers into THAT FORK (the mainline is untouched) and moved the fork
+  onto the current tree. Open each named file in the fork, resolve every
+  `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` block (the middle block is
+  the original), leave no markers, then `acyclic promote <id>` again. A
+  `(deleted)` label means one side deleted the file: keep it without
+  markers or delete it. `unresolved conflict markers` means a block is
+  still there.
+- A promote that says paths `cannot be merged` (binary, too large, a kind
+  change, a directory deleted on one side and changed inside on the
+  other) cannot be resolved in place: one fork must own that path. The
+  fork is untouched; re-fork from the current tree and redo that part
+  with tighter ownership.
 - `acyclic forks` says none are live after a daemon restart: every fork is
   lost. Re-run the round; nothing was landed.
 - `acyclic fork` fails with a mounts error: read `acyclic status`, tell the
@@ -403,7 +414,8 @@ anything a script or generator wrote.
 | 2+ genuinely different designs, expensive to guess wrong | RACE |
 | Dependent steps, each must be proven first | SEQUENCE |
 | Independent parts, different files | PARTITION |
-| Independent parts that share a file | SEQUENCE the shared file first, then PARTITION |
+| Independent parts that share a file, different regions | PARTITION; the merge is line-level |
+| Independent parts that share lines, or a type/interface others use | SEQUENCE that edit first, then PARTITION |
 | depth == max_depth and work remains | Stop, report, ask |
 | forks used == max_forks | Stop, report, ask |
 | Winner's fork-diff is empty | Drop it; the round was DO |

@@ -659,8 +659,16 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 return Ok(());
             }
             for entry in entries {
+                let conflict = if entry.conflict_paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  conflict: {} path(s), resolve then promote",
+                        entry.conflict_paths.len()
+                    )
+                };
                 println!(
-                    "{}  {}  {}  {}  base {}",
+                    "{}  {}  {}  {}  base {}{conflict}",
                     entry.id,
                     entry.mode,
                     age(entry.created_at),
@@ -676,24 +684,46 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Promote { id } => {
-            let reply = client.call(proto::Op::Promote { id })?;
+            let reply = client.call(proto::Op::Promote { id: id.clone() })?;
             let proto::Reply::Promote(info) = reply else {
                 return Err("unexpected reply".into());
             };
-            match (info.old_tree, info.replayed_paths) {
-                (Some(old_tree), _) => {
+            if !info.conflicts.is_empty() {
+                let mut report = format!(
+                    "promote fork {id}: {} file(s) conflict; markers written into the fork, nothing landed\n",
+                    info.conflicts.len()
+                );
+                for conflict in &info.conflicts {
+                    report.push_str(&format!("  {}: {}\n", conflict.path, conflict.detail));
+                }
+                report.push_str(&format!(
+                    "Resolve the markers in {} and run `acyclic promote {id}` again (the fork now sits on {})",
+                    info.fork_path.as_deref().unwrap_or("the fork"),
+                    &info.generation[..12]
+                ));
+                return Err(report.into());
+            }
+            match (info.old_tree, info.replayed_paths, info.merged_files) {
+                (Some(old_tree), _, _) => {
                     println!("promoted: working tree now at {}", &info.generation[..12]);
                     println!("old tree kept at {old_tree}");
                     println!("note: {}", info.warning);
                 }
-                (None, paths) if paths > 0 => {
+                (None, paths, merged) if merged > 0 => {
+                    println!(
+                        "promoted by merge: {merged} file(s) merged, {paths} path(s) written in place, tree now at {}",
+                        &info.generation[..12]
+                    );
+                    println!("note: {}", info.warning);
+                }
+                (None, paths, _) if paths > 0 => {
                     println!(
                         "promoted by replay: {paths} path(s) written in place, tree now at {}",
                         &info.generation[..12]
                     );
                     println!("note: {}", info.warning);
                 }
-                (None, _) => println!("fork had no changes; nothing to land"),
+                (None, _, _) => println!("fork had no changes; nothing to land"),
             }
             Ok(())
         }

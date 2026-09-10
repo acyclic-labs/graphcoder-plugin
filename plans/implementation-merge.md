@@ -26,6 +26,10 @@ which maps every rule here to its graphcoder source).
    atomic replay, timeline rows, rewind undo, mount and copy modes) is
    reused unchanged.
 
+**Status (2026-09-10):** implemented. Phases C0–C3 landed together; the
+"as built" notes at the end record where the build deviated from this
+plan.
+
 **Out (later launches, listed so nobody re-litigates them mid-build):**
 rename detection; semantic or AST merges; markers written into the
 *mainline*; Safe Mode `apply_session` onto a moved mainline (keeps the
@@ -300,7 +304,7 @@ Acceptance (`merge.sh`, each from a fresh fork set):
 | G21 | binary on one side | refused with `binary`; fork alive and unchanged |
 | G22 | three forks all edit `src/shared.js` in disjoint regions, promoted in sequence | all three land; third merges against the merged result |
 | G23 | merge + disjoint paths in one promote | both counts printed; all paths correct |
-| G24 | `rewind --last` after a landed merge | tree back at the safety row |
+| G24 | rewind to the `before promote … (merge)` row after a landed merge | tree back at the pre-merge file (`--last` targets the landed row itself, by design) |
 | G25 | CRLF file merged through the CLI | bytes unchanged apart from the two edits |
 | G26 | one mergeable and one conflicting file in one fork | nothing lands; only the conflicting file gets markers; the mergeable one is merged in the fork (it is part of R) |
 
@@ -352,3 +356,34 @@ Deliberate divergences:
   be wired. This plan implements that contract against the fork
   workspace, which is the only place the plugin can write without
   touching the mainline.
+
+## As built (deviations from the plan above)
+
+- **Base label.** diffy labels the middle block `||||||| original`, and
+  graphcoder's `merge3` only rewrites the ours/theirs labels, so its real
+  output says `original`, not `base` as its doc comment claims. The port
+  matches the code; the modify/delete block is built by hand with the
+  same label.
+- **Landing.** M = H + entries is built as an unpublished generation and
+  landed with `restore_path` per landing path, as planned. R is built
+  from M with the marker files on top. A rebase writes R − F into the
+  fork: through the shared checkout for a mount fork (route detached
+  during promote, re-attached after), via `restore_path_into` for a copy
+  fork.
+- **Rebased forks land by checkpoint-and-swap.** A rebased mount fork's
+  checkout still sits on the head it was cut from, so an optimistic
+  commit against the new head would conflict. `ForkState.rebased` routes
+  such forks through the same resolve/apply pair copy forks use.
+- **Subtree copy and removal are iterative.** The fs facade's futures
+  are large enough that three nested levels overflowed the pipeline
+  thread's 2 MiB stack in a debug build. Both walks use an explicit work
+  list, and the pipeline thread reserves 32 MiB.
+- **`rewind --last` is not the undo.** It targets the latest real
+  checkpoint, which after a merge is the landed row. The undo is the
+  `before promote <id> (merge)` safety row, exactly as for a replay.
+- **`ACYCLIC_FORCE_COPY_FORKS`** makes a mount-capable host use copy
+  forks so `merge.sh` runs both modes on one machine.
+- **Wire.** `PromoteInfo` gained `merged_files`, `conflicts`, and
+  `fork_path`; `ForkEntry` gained `conflict_paths` and `conflict`
+  (base/ours/theirs). A conflicting promote returns a non-zero exit
+  with the per-file report on stderr.

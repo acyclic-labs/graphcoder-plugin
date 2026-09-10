@@ -17,6 +17,7 @@ thiserror = "2"
 hex = "0.4"
 blake3 = "1"
 bytes = "1"
+diffy = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

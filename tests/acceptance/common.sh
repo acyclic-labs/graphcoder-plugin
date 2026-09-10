@@ -16,6 +16,10 @@ STORES="$WORK/stores"
 
 fail() {
   echo "FAIL($(basename "$0")): $*" >&2
+  # The daemon's stderr is the only record of a panic; show its tail.
+  for log in "$STORES"/*/daemon.log; do
+    [ -f "$log" ] && { echo "--- daemon.log (tail) ---" >&2; tail -40 "$log" >&2; }
+  done
   exit 1
 }
 

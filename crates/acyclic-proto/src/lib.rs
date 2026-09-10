@@ -219,6 +219,31 @@ pub struct ForkEntry {
     /// Owning session, if this is a scratch tree tied to one.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Paths still carrying conflict markers from a rebased promote; empty
+    /// when the fork has no open conflict.
+    #[serde(default)]
+    pub conflict_paths: Vec<String>,
+    /// The open conflict's three generations (hex), when one is open.
+    #[serde(default)]
+    pub conflict: Option<ConflictInfo>,
+}
+
+/// An open conflict on a fork: the generations it was judged between.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictInfo {
+    pub base: String,
+    /// The fork's snapshot at the conflicting promote.
+    pub ours: String,
+    /// The mainline head the fork was rebased onto.
+    pub theirs: String,
+}
+
+/// One file a promote could not merge cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictEntry {
+    pub path: String,
+    /// "3 conflicting hunk(s)", "mainline deleted, fork modified", ...
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,6 +257,16 @@ pub struct PromoteInfo {
     /// base and nothing overlapped. 0 for a plain swap or a no-op.
     #[serde(default)]
     pub replayed_paths: u32,
+    /// Files whose content was merged three-way before landing.
+    #[serde(default)]
+    pub merged_files: u32,
+    /// Non-empty when nothing landed: the fork was rebased onto the current
+    /// head and these files carry conflict markers in the fork workspace.
+    #[serde(default)]
+    pub conflicts: Vec<ConflictEntry>,
+    /// The fork workspace to resolve conflicts in (set with `conflicts`).
+    #[serde(default)]
+    pub fork_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
