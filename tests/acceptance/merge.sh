@@ -189,7 +189,6 @@ acy rewind -y "$SAFETY" >/dev/null || fail "G10: rewind to safety checkpoint"
 # --- G11: an unmoved mainline lands in place too: no swap, same inode -------
 A="$(fork)"
 printf 'swap\n' > "$(fork_path "$A")/src/auth.js"
-inode() { case "$(uname)" in Darwin) stat -f %i "$1" ;; *) stat -c %i "$1" ;; esac; }
 INODE_BEFORE="$(inode "$R")"
 OUT="$(promote_ok "$A" G11)"
 echo "$OUT" | grep -q '^promoted: 1 path(s) written in place' || fail "G11: unmoved mainline should land in place: $OUT"
@@ -354,7 +353,7 @@ grep -q '^l2 A$' "$R/src/nine.js" && grep -q '^l8 B$' "$R/src/nine.js" || fail "
 # --- G24: a landed content merge is undoable via its safety row -------------
 A="$(fork)"
 sed -e 's/^l3$/l3 fork/' "$R/src/nine.js" > "$(fork_path "$A")/src/nine.js"
-sed -i '' -e 's/^l7$/l7 main/' "$R/src/nine.js"; acy checkpoint --wait -m "G24 mainline" >/dev/null
+sed -e 's/^l7$/l7 main/' "$R/src/nine.js" > "$R/src/nine.tmp" && mv "$R/src/nine.tmp" "$R/src/nine.js"; acy checkpoint --wait -m "G24 mainline" >/dev/null
 BEFORE="$(cat "$R/src/nine.js")"
 OUT="$(promote_ok "$A" G24)"
 echo "$OUT" | grep -q 'promoted by merge: 1 file' || fail "G24: expected a merge: $OUT"

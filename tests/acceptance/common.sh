@@ -15,6 +15,7 @@ R="$WORK/repo"
 STORES="$WORK/stores"
 
 fail() {
+  EXPLICIT_FAIL=1
   echo "FAIL($(basename "$0")): $*" >&2
   # The daemon's stderr is the only record of a panic; show its tail.
   for log in "$STORES"/*/daemon.log; do
@@ -27,6 +28,20 @@ pass() {
   echo "PASS($(basename "$0")): $*"
 }
 
+# Portable inode of a path (macOS stat and GNU stat disagree on flags).
+inode() {
+  case "$(uname)" in
+    Darwin) stat -f %i "$1" ;;
+    *) stat -c %i "$1" ;;
+  esac
+}
+
+# `set -e` exits silently on an unexpected command failure. Report it from
+# the EXIT path (an ERR trap also fires for failures the script expects
+# inside `if` tests), so a CI log names the command that died rather than
+# just "N script(s) failed".
+EXPLICIT_FAIL=0
+
 acy() {
   "$BIN" --repo "$R" "$@"
 }
@@ -36,6 +51,13 @@ daemon_pid() {
 }
 
 teardown() {
+  local code=$? cmd="$BASH_COMMAND"
+  if [ "$code" -ne 0 ] && [ "${EXPLICIT_FAIL:-0}" -eq 0 ]; then
+    echo "FAIL($(basename "$0")): unexpected exit $code from: $cmd" >&2
+    for log in "$STORES"/*/daemon.log; do
+      [ -f "$log" ] && { echo "--- daemon.log (tail) ---" >&2; tail -20 "$log" >&2; }
+    done
+  fi
   acy stop >/dev/null 2>&1 || true
   local pid
   pid="$(daemon_pid)"
