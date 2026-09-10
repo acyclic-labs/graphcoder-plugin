@@ -73,11 +73,12 @@ Unmounts, discards the overlay, removes the workspace dir. Unknown id → error.
    fork, and lands nothing; the fork stays live for resolve-and-promote.
    A refusal (binary, too large, kind change, directory ancestry) is a
    legible error naming the paths; fork and tree untouched.
-5. Otherwise → fork overlay publishes (head `H2`); mainline tree is
-   replaced with `H2` via the journaled rewind swap (safety `pre_rewind`
-   row first); a `manual` row labeled `promote <id>` records it; watcher
-   re-baselines. Byte-verified content, gitignored files included; the
-   same mtime/editor caveats as rewind.
+5. Otherwise (mainline unmoved) → the fork's changed paths are written
+   onto the real tree one at a time with the same atomic single-path
+   restore, checkpointed and published; a `manual` row labeled
+   `promote <id> (N path(s) written in place)` records it. The repo
+   directory is never replaced by a promote (Safe Mode `session-apply`
+   still swaps and says so). Gitignored files included.
 
 ### Daemon stop / crash
 Stop unmounts all forks and removes workspace dirs before the pipeline

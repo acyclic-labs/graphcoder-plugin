@@ -338,6 +338,23 @@ impl Index {
     }
 
     /// Most recent checkpoint of any non-failed kind.
+    /// Latest row whose generation hex starts with `prefix` (case-insensitive).
+    pub fn by_generation_prefix(&self, prefix: &str) -> Result<Option<CheckpointRow>> {
+        let pattern = format!("{}%", prefix.to_uppercase());
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
+                     WHERE hex(generation) LIKE ?1 AND kind != 'failed'
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![pattern],
+                row_to_checkpoint,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn latest(&self) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(

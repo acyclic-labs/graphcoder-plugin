@@ -318,10 +318,10 @@ Depth starts at 1 and increases by one per round.
 5. When all reports are in, `acyclic fork-diff <id>` for each fork.
 6. RACE: pick the winner by the SELECTION RULE and `acyclic promote <winner>`.
    PARTITION: `acyclic promote <id>` for every fork that passed, in
-   dispatch order. The first swaps the tree; the rest merge in place.
-7. Run `cd "$PWD"`. A swap-style promote replaces the repo directory; a
-   shell left in the old inode silently runs every later command in the
-   replaced tree. Harmless after a replay, so always do it.
+   dispatch order. Every promote writes the fork's paths into the real
+   tree in place; the repo directory is never replaced.
+7. Read each promote's output: `promoted` / `promoted by merge` landed;
+   `N file(s) conflict` wrote markers into that fork (see section 6).
 8. `acyclic fork-drop <id>` for every fork you will not land, immediately.
 9. Report the round in the ROUND REPORT shape.
 10. If work remains and depth < max_depth and forks used < max_forks,
@@ -369,7 +369,8 @@ Reply with exactly this shape and nothing else:
    named in each child's approach text, then stop and report. Never
    promote a partial without saying so in the report.
 4. If several remain, apply `tie_break`:
-   - `smallest-diff`: fewest paths in `acyclic fork-diff`, then fewest RISKS.
+   - `smallest-diff`: fewest paths in `acyclic fork-diff`, not counting
+     `m` (metadata) lines or `(gitignored)` lines, then fewest RISKS.
    - `first-passing`: the first fork id in dispatch order that passed.
    - `ask-user`: show each candidate's fork-diff and RISKS, ask, wait.
 5. A fork must be clearly better than doing nothing. If the winner's

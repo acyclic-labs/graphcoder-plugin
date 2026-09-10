@@ -42,10 +42,6 @@ struct ForkState {
     /// after a promote that did not land.
     config: VolumeConfig,
     volume_id: acyclic_fs::VolumeId,
-    /// True once a promote has rebased this fork: its overlay no longer
-    /// sits on the head it was cut from, so it lands through the
-    /// checkpoint-and-swap path instead of an optimistic commit.
-    rebased: bool,
     /// Set by a conflicting promote until the markers are gone.
     conflict: Option<OpenConflict>,
 }
@@ -439,24 +435,47 @@ impl Server {
                     warning: outcome.warning.to_string(),
                 }))
             }
-            proto::Op::Diff { before, after } => {
-                let index = self.open_index()?;
-                let before_row = match before {
-                    Some(id) => index
-                        .by_id(id)
-                        .map_err(stringify)?
-                        .ok_or(format!("no checkpoint #{id}"))?,
-                    None => self.default_diff_base(&index)?,
-                };
-                let after_row = match after {
-                    Some(id) => index
-                        .by_id(id)
-                        .map_err(stringify)?
-                        .ok_or(format!("no checkpoint #{id}"))?,
-                    None => index
-                        .latest()
-                        .map_err(stringify)?
-                        .ok_or("no checkpoints yet")?,
+            proto::Op::Diff {
+                before,
+                after,
+                before_hex,
+                after_hex,
+            } => {
+                // Resolve both rows before the first await: the SQLite
+                // handle is not Sync and must not live across it.
+                let (before_row, after_row) = {
+                    let index = self.open_index()?;
+                    let resolve = |id: Option<i64>, hex: Option<String>| -> Result<Option<CheckpointRow>, String> {
+                        match (id, hex) {
+                            (Some(id), _) => Ok(Some(
+                                index
+                                    .by_id(id)
+                                    .map_err(stringify)?
+                                    .ok_or(format!("no checkpoint #{id}"))?,
+                            )),
+                            (None, Some(hex)) => Ok(Some(
+                                index
+                                    .by_generation_prefix(&hex)
+                                    .map_err(stringify)?
+                                    .ok_or(format!(
+                                        "no checkpoint has a generation starting {hex}; `acyclic timeline` lists row ids"
+                                    ))?,
+                            )),
+                            (None, None) => Ok(None),
+                        }
+                    };
+                    let before_row = match resolve(before, before_hex)? {
+                        Some(row) => row,
+                        None => self.default_diff_base(&index)?,
+                    };
+                    let after_row = match resolve(after, after_hex)? {
+                        Some(row) => row,
+                        None => index
+                            .latest()
+                            .map_err(stringify)?
+                            .ok_or("no checkpoints yet")?,
+                    };
+                    (before_row, after_row)
                 };
                 let changes = self
                     .handle
@@ -464,7 +483,7 @@ impl Server {
                     .await
                     .map_err(stringify)?;
                 Ok(proto::Reply::Diff(
-                    changes.into_iter().map(diff_entry).collect(),
+                    self.annotate_ignored(changes.into_iter().map(diff_entry).collect()),
                 ))
             }
             proto::Op::SessionStart { session_id, host } => {
@@ -563,7 +582,6 @@ impl Server {
                             copy_dir: None,
                             config: seed.config,
                             volume_id: seed.volume_id,
-                            rebased: false,
                             conflict: None,
                         },
                     );
@@ -603,7 +621,6 @@ impl Server {
                             paths: files.iter().map(|file| PathBuf::from(&file.path)).collect(),
                         });
                         fork.base = theirs;
-                        fork.rebased = true;
                         fork.entry.base = acyclic_engine::generation_hex(theirs);
                         fork.entry.conflict_paths =
                             files.iter().map(|file| file.path.clone()).collect();
@@ -623,6 +640,7 @@ impl Server {
                             conflicts: files,
                             fork_path: Some(fork_path),
                             kept_mainline: kept,
+                            mainline_moved: true,
                         }));
                     }
                     Err(message) => {
@@ -644,36 +662,26 @@ impl Server {
                     Self::remove_if_empty(dir.parent());
                 }
                 match landed {
-                    Landed::Swapped {
-                        generation,
-                        old_tree,
-                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
-                        generation: acyclic_engine::generation_hex(generation),
-                        old_tree: Some(old_tree.display().to_string()),
-                        warning: "reload your editor: open files still point at the replaced tree"
-                            .into(),
-                        replayed_paths: 0,
-                        merged_files: 0,
-                        conflicts: Vec::new(),
-                        fork_path: None,
-                        kept_mainline: Vec::new(),
-                    })),
                     Landed::Replayed {
                         generation,
                         paths,
                         merged,
                         kept,
+                        moved,
                     } => Ok(proto::Reply::Promote(proto::PromoteInfo {
                         generation: acyclic_engine::generation_hex(generation),
                         old_tree: None,
-                        warning: "the mainline had moved; the fork's paths were written \
-                                  in place, no directory swap"
-                            .into(),
+                        warning: if moved {
+                            "the mainline had moved; the fork's paths were merged onto it in place".into()
+                        } else {
+                            String::new()
+                        },
                         replayed_paths: paths,
                         merged_files: merged,
                         conflicts: Vec::new(),
                         fork_path: None,
                         kept_mainline: kept,
+                        mainline_moved: moved,
                     })),
                     Landed::Nothing { generation, kept } => {
                         Ok(proto::Reply::Promote(proto::PromoteInfo {
@@ -685,6 +693,7 @@ impl Server {
                             conflicts: Vec::new(),
                             fork_path: None,
                             kept_mainline: kept,
+                            mainline_moved: false,
                         }))
                     }
                     Landed::Conflicted { .. } => unreachable!("handled above"),
@@ -725,13 +734,15 @@ impl Server {
                 // Timestamps differ on a copy fork by construction; only
                 // content is a blast radius.
                 Ok(proto::Reply::Diff(
-                    changes
-                        .into_iter()
-                        .filter(|change| {
-                            change.change != acyclic_engine::diff::ChangeKind::MetadataOnly
-                        })
-                        .map(diff_entry)
-                        .collect(),
+                    self.annotate_ignored(
+                        changes
+                            .into_iter()
+                            .filter(|change| {
+                                change.change != acyclic_engine::diff::ChangeKind::MetadataOnly
+                            })
+                            .map(diff_entry)
+                            .collect(),
+                    ),
                 ))
             }
             proto::Op::SessionFork { session_id } => {
@@ -820,6 +831,7 @@ impl Server {
                         conflicts: Vec::new(),
                         fork_path: None,
                         kept_mainline: Vec::new(),
+                        mainline_moved: false,
                     })),
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
@@ -927,7 +939,6 @@ impl Server {
                     copy_dir: Some(dir),
                     config: seed.config,
                     volume_id: seed.volume_id,
-                    rebased: false,
                     conflict: None,
                 },
             );
@@ -936,12 +947,12 @@ impl Server {
         Ok(proto::Reply::Forks(created))
     }
 
-    /// Lands a fork. Outcomes: the mainline is still at the fork's base and
-    /// the whole tree is swapped; the mainline moved and the fork merges
-    /// onto it (paths replayed in place, files merged by content); the
-    /// merge conflicts and the fork is rebased with markers (nothing
-    /// lands); the fork had no content changes. A refusal is an error
-    /// naming the paths and leaves everything untouched.
+    /// Lands a fork in place. The fork's paths are merged onto the current
+    /// head (a three-way merge when the mainline moved; a plain write of
+    /// the fork's paths when it did not) and written onto the real tree
+    /// one path at a time. The repo directory is never replaced. A content
+    /// conflict rebases the fork with markers and lands nothing; a refusal
+    /// is an error naming the paths and leaves everything untouched.
     async fn promote_fork(
         &self,
         id: &str,
@@ -960,39 +971,23 @@ impl Server {
                 Arc::clone(&fork.shared)
             }
         };
-        // A rebased fork must have resolved its markers before it can land
-        // anywhere, moved mainline or not.
+        // A rebased fork must have resolved its markers before it can land.
         if let Some(conflict) = fork.conflict.as_ref() {
             self.refuse_unresolved_markers(&overlay, conflict).await?;
         }
         let head = self.handle.publish_head().await.map_err(stringify)?;
-        if head != fork.base {
-            return self
-                .merge_onto_head(id, overlay, fork.base, head, fork.copy_dir.as_deref(), label)
-                .await;
+        self.merge_onto_head(id, overlay, fork.base, head, fork.copy_dir.as_deref(), label)
+            .await
+    }
+
+    /// Marks the entries the repo's `.gitignore` covers. One git call.
+    fn annotate_ignored(&self, mut entries: Vec<proto::DiffEntry>) -> Vec<proto::DiffEntry> {
+        let paths: Vec<PathBuf> = entries.iter().map(|entry| PathBuf::from(&entry.path)).collect();
+        let ignored = merge::ignored_paths(&self.repo_root, &paths);
+        for entry in &mut entries {
+            entry.ignored = ignored.iter().any(|path| path == Path::new(&entry.path));
         }
-        let outcome = if fork.copy_dir.is_some() || fork.rebased {
-            self.land_overlay(overlay, fork.base, label).await?
-        } else {
-            self.handle
-                .promote(overlay, fork.base, label.to_string())
-                .await
-                .map_err(stringify)?
-        };
-        match outcome {
-            PromoteOutcome::Promoted {
-                generation,
-                old_tree: Some(old_tree),
-            } => Ok(Landed::Swapped {
-                generation,
-                old_tree,
-            }),
-            PromoteOutcome::Promoted {
-                generation,
-                old_tree: None,
-            } => Ok(Landed::Nothing { generation, kept: Vec::new() }),
-            PromoteOutcome::Conflict { message } => Err(message),
-        }
+        entries
     }
 
     /// Re-inserts a fork that did not land, restoring its mount route.
@@ -1105,47 +1100,6 @@ impl Server {
         }
     }
 
-    /// Unmoved mainline, overlay-backed fork: commit the overlay as an
-    /// unpublished generation and land it with the Safe Mode swap. A
-    /// materialized copy carries fresh timestamps, so metadata-only
-    /// differences count as "no changes" rather than swapping for nothing.
-    async fn land_overlay(
-        &self,
-        overlay: Arc<SharedLocalCheckout>,
-        base: acyclic_engine::GenerationId,
-        label: &str,
-    ) -> Result<PromoteOutcome, String> {
-        let resolved = self
-            .handle
-            .resolve_session(overlay, base, label.to_string())
-            .await
-            .map_err(stringify)?;
-        let generation = match resolved {
-            SessionResolveOutcome::NoChanges => {
-                return Ok(PromoteOutcome::Promoted {
-                    generation: base,
-                    old_tree: None,
-                })
-            }
-            SessionResolveOutcome::Conflict { message } => {
-                return Ok(PromoteOutcome::Conflict { message })
-            }
-            SessionResolveOutcome::Resolved { generation } => generation,
-        };
-        if content_changes(self.handle.diff(base, generation).await.map_err(stringify)?)
-            .is_empty()
-        {
-            return Ok(PromoteOutcome::Promoted {
-                generation: base,
-                old_tree: None,
-            });
-        }
-        self.handle
-            .apply_session(generation, base, label.to_string())
-            .await
-            .map_err(stringify)
-    }
-
     /// The merge primitive (v2, content-level). The mainline moved past the
     /// fork's base. Plan the three-way merge of base/head/fork in full
     /// before writing anything. Any refusal: error naming the paths, fork
@@ -1163,6 +1117,7 @@ impl Server {
         copy_dir: Option<&Path>,
         label: &str,
     ) -> Result<Landed, String> {
+        let moved = head != base;
         if !overlay.lock().await.has_pending_mutations() {
             return Ok(Landed::Nothing { generation: head, kept: Vec::new() });
         }
@@ -1206,6 +1161,11 @@ impl Server {
                 plan.refusals.len(),
                 lines.join("\n")
             ));
+        }
+        if !moved && !plan.conflicted.is_empty() {
+            // Cannot happen (nothing changed on the mainline side), but
+            // never let a bug write markers anywhere.
+            return Err("internal: conflicts against an unmoved mainline".into());
         }
         if plan.lands_nothing() {
             return Ok(Landed::Nothing { generation: head, kept });
@@ -1285,11 +1245,15 @@ impl Server {
             .handle
             .record_generation(
                 merged,
-                format!(
-                    "fork {id} merge ({} merged, {} replayed)",
-                    plan.merged.len(),
-                    plan.take_ours.len()
-                ),
+                if moved {
+                    format!(
+                        "fork {id} merge ({} merged, {} replayed)",
+                        plan.merged.len(),
+                        plan.take_ours.len()
+                    )
+                } else {
+                    format!("fork {id} snapshot ({} paths)", plan.take_ours.len())
+                },
             )
             .await
             .map_err(stringify)?;
@@ -1297,7 +1261,11 @@ impl Server {
             .checkpoint(
                 CheckpointKind::PreRewind,
                 Attribution {
-                    label: Some(format!("before {label} (merge)")),
+                    label: Some(if moved {
+                        format!("before {label} (merge)")
+                    } else {
+                        format!("before {label}")
+                    }),
                     ..Attribution::default()
                 },
             )
@@ -1318,26 +1286,42 @@ impl Server {
                 })?;
             written += 1;
         }
+        let landed_label = if moved {
+            format!(
+                "{label} (merged {} file(s), replayed {written} path(s) onto moved mainline)",
+                plan.merged.len()
+            )
+        } else {
+            format!("{label} ({written} path(s) written in place)")
+        };
         let landed = self
             .handle
             .checkpoint(
                 CheckpointKind::Manual,
                 Attribution {
-                    label: Some(format!(
-                        "{label} (merged {} file(s), replayed {written} path(s) onto moved mainline)",
-                        plan.merged.len()
-                    )),
+                    label: Some(landed_label.clone()),
                     ..Attribution::default()
                 },
             )
             .await
             .map_err(stringify)?;
+        // Each restore_path already captured its write, so the landing
+        // checkpoint above usually finds nothing new and comes back as a
+        // noop row. Promote must be a real rewind target (spec I6): record
+        // the landed generation as a manual row under the same label.
+        if landed.kind == CheckpointKind::Noop {
+            self.handle
+                .record_generation(landed.generation, landed_label)
+                .await
+                .map_err(stringify)?;
+        }
         self.handle.commit().await.map_err(stringify)?;
         Ok(Landed::Replayed {
             generation: landed.generation,
             paths: written,
             merged: plan.merged.len() as u32,
             kept,
+            moved,
         })
     }
 
@@ -1619,18 +1603,15 @@ fn unix_now() -> i64 {
 
 /// How a fork ended up in the real tree.
 enum Landed {
-    /// Whole-tree swap; the old tree is in trash.
-    Swapped {
-        generation: acyclic_engine::GenerationId,
-        old_tree: PathBuf,
-    },
-    /// Path-by-path replay onto a moved mainline; no swap. `merged` of
-    /// the paths were produced by a three-way content merge.
+    /// Path-by-path write onto the current head; never a directory swap.
+    /// `merged` of the paths were produced by a three-way content merge;
+    /// `moved` says whether the mainline had moved past the fork's base.
     Replayed {
         generation: acyclic_engine::GenerationId,
         paths: u32,
         merged: u32,
         kept: Vec<String>,
+        moved: bool,
     },
     /// No content changes to land.
     Nothing {
@@ -1693,6 +1674,7 @@ fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
         }
         .to_string(),
         file_kind: format!("{:?}", change.file_kind).to_lowercase(),
+        ignored: false,
     }
 }
 

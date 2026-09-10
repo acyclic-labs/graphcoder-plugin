@@ -74,7 +74,7 @@ printf 'auth v1\n' > "$(fork_path "$A")/src/auth.js"
 printf 'billing v1\n' > "$(fork_path "$B")/src/billing.js"
 rm "$(fork_path "$B")/docs/old.md"
 OUT="$(promote_ok "$A" G1)"
-echo "$OUT" | grep -q '^promoted: working tree now at' || fail "G1: first promote should swap: $OUT"
+echo "$OUT" | grep -q '^promoted: 1 path(s) written in place' || fail "G1: first promote should land in place: $OUT"
 OUT="$(promote_ok "$B" G1)"
 echo "$OUT" | grep -q 'promoted by replay: 2 path' || fail "G1: second promote should replay 2 paths: $OUT"
 tree_unchanged_except G1 src/auth.js='auth v1' src/billing.js='billing v1' docs/old.md='<absent>'
@@ -186,12 +186,18 @@ acy rewind -y "$SAFETY" >/dev/null || fail "G10: rewind to safety checkpoint"
 [ ! -e "$R/undo.txt" ] || fail "G10: rewind did not undo the replay"
 [ "$(cat "$R/moved.txt")" = "moved" ] || fail "G10: rewind lost the mainline's own change"
 
-# --- G11: an unmoved mainline still lands by whole-tree swap ----------------
+# --- G11: an unmoved mainline lands in place too: no swap, same inode -------
 A="$(fork)"
 printf 'swap\n' > "$(fork_path "$A")/src/auth.js"
+INODE_BEFORE="$(stat -f %i "$R" 2>/dev/null || stat -c %i "$R")"
 OUT="$(promote_ok "$A" G11)"
-echo "$OUT" | grep -q '^promoted: working tree now at' || fail "G11: unmoved mainline should swap, not replay: $OUT"
-echo "$OUT" | grep -q 'old tree kept at' || fail "G11: swap should keep the old tree: $OUT"
+echo "$OUT" | grep -q '^promoted: 1 path(s) written in place' || fail "G11: unmoved mainline should land in place: $OUT"
+echo "$OUT" | grep -q 'old tree kept at' && fail "G11: no directory swap expected: $OUT"
+[ "$(stat -f %i "$R" 2>/dev/null || stat -c %i "$R")" = "$INODE_BEFORE" ] || fail "G11: repo directory was replaced"
+[ "$(cat "$R/src/auth.js")" = "swap" ] || fail "G11: content"
+TL="$(acy timeline)"
+echo "$TL" | grep -q "promote fork $A (1 path(s) written in place)" || fail "G11: landed row: $(echo "$TL" | head -3)"
+echo "$TL" | grep "promote fork $A (1 path(s) written in place)" | grep -q ' manual ' || fail "G11: landed row must be a real (manual) checkpoint, not noop: $(echo "$TL" | head -3)"
 
 # --- G12: a fork with no content change lands nothing, moved or not ---------
 A="$(fork)"
@@ -415,6 +421,25 @@ grep -q '^l4 A$' "$R/src/nine.js" && grep -q '^l6 B$' "$R/src/nine.js" || fail "
 cmp -s "$R/src/__pycache__/m.pyc" <(printf 'PYC-A\000\n') || fail "G27: mainline (A's) bytecode must be kept: $(od -c "$R/src/__pycache__/m.pyc")"
 [ "$(cat "$R/.env")" = "SECRET=A" ] || fail "G27: mainline's .env must be kept"
 acy forks | grep -q 'no live forks' || fail "G27: fork consumed"
+# Diff output marks ignored paths and keeps them out of the blast-radius
+# count; and diff accepts a generation hex prefix (what promote prints).
+GEN="$(echo "$OUT" | sed -n 's/.*tree now at \([0-9a-f]*\).*/\1/p')"
+[ -n "$GEN" ] || fail "G27: no generation in promote output: $OUT"
+BASE_ROW="$(acy timeline | awk '/G27 base/{print $1; exit}' | tr -d '#')"
+D="$(acy diff "$BASE_ROW" "$GEN")" || fail "G27: diff must accept a generation hex prefix: $D"
+echo "$D" | grep -q '^M src/nine.js$' || fail "G27: diff content: $D"
+echo "$D" | grep -q '^M src/__pycache__/m.pyc  (gitignored)$' || fail "G27: ignored paths must be marked: $D"
+echo "$D" | grep -q '^M .env  (gitignored)$' || fail "G27: .env must be marked: $D"
+echo "$D" | grep -q 'paths changed (3 gitignored)' || fail "G27: count must separate ignored (.env, the cache dir, the .pyc): $D"
+if OUT2="$(acy diff "$BASE_ROW" zzzz 2>&1)"; then fail "G27: junk arg accepted: $OUT2"; fi
+echo "$OUT2" | grep -q 'neither a checkpoint row id' || fail "G27: junk arg message: $OUT2"
+if OUT2="$(acy diff "$BASE_ROW" 0123456789ab 2>&1)"; then fail "G27: unknown hex accepted: $OUT2"; fi
+echo "$OUT2" | grep -q 'no checkpoint has a generation starting 0123456789ab' || fail "G27: unknown hex message: $OUT2"
+A="$(fork)"; printf 'PYC-X\000\n' > "$(fork_path "$A")/src/__pycache__/m.pyc"; printf 'y\n' > "$(fork_path "$A")/y.txt"
+FD="$(acy fork-diff "$A")"
+echo "$FD" | grep -q '^M src/__pycache__/m.pyc  (gitignored)$' || fail "G27: fork-diff must mark ignored: $FD"
+echo "$FD" | grep -q '^A y.txt$' && echo "$FD" | grep -q '2 paths changed (1 gitignored)' || fail "G27: fork-diff count: $FD"
+acy fork-drop "$A" >/dev/null
 # The same on the conflict path: a real conflict plus an ignored one only
 # reports the real one, and the rebase gives the fork the mainline's artifact.
 A="$(fork)"; B="$(fork)"

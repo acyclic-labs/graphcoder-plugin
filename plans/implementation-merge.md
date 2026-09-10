@@ -405,3 +405,15 @@ Deliberate divergences:
   `/fork` PARTITION round over one shared file and a deterministic
   conflict the agent must resolve and promote; opt in with
   `ACYCLIC_E2E=1` in `run-all.sh`.
+- **No directory swap on promote (rough-edge pass, 2026-09-10).** An
+  unmoved mainline used to land by whole-tree swap, which replaced the
+  repo directory and needed the skill's `cd "$PWD"` step. Promote now
+  always goes through the merge path: with an unmoved head the plan is
+  "take every fork path" and they are written in place. Safe Mode's
+  `session-apply` is the only remaining swap. `merge.sh` G11 asserts
+  the repo inode survives a promote.
+- **Diff output marks gitignored paths** with a `(gitignored)` suffix
+  and a `(K gitignored)` count so the skill's smallest-diff rule can
+  ignore cache and build noise; the paths stay listed because rewind
+  restores them. `acyclic diff` also accepts generation hex prefixes,
+  which is what `promote` prints and what an agent reached for.

@@ -114,8 +114,10 @@ enum Command {
     },
     /// Blast radius: what changed between two checkpoints, or in one turn.
     Diff {
-        before: Option<i64>,
-        after: Option<i64>,
+        /// A checkpoint row id from `acyclic timeline`, or a generation hex
+        /// prefix as printed by `promote`/`status`.
+        before: Option<String>,
+        after: Option<String>,
         /// What one conversation turn changed (latest session unless --session).
         #[arg(long, conflicts_with_all = ["before", "after"])]
         turn: Option<i64>,
@@ -602,28 +604,27 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             session,
             ..
         } => {
-            let (before, after) = match turn {
-                Some(turn) => turn_range(client, session, turn)?,
-                None => (before, after),
+            let (before, after, before_hex, after_hex) = match turn {
+                Some(turn) => {
+                    let (before, after) = turn_range(client, session, turn)?;
+                    (before, after, None, None)
+                }
+                None => {
+                    let (before, before_hex) = checkpoint_ref(before.as_deref())?;
+                    let (after, after_hex) = checkpoint_ref(after.as_deref())?;
+                    (before, after, before_hex, after_hex)
+                }
             };
-            let reply = client.call(proto::Op::Diff { before, after })?;
+            let reply = client.call(proto::Op::Diff {
+                before,
+                after,
+                before_hex,
+                after_hex,
+            })?;
             let proto::Reply::Diff(entries) = reply else {
                 return Err("unexpected reply".into());
             };
-            if entries.is_empty() {
-                println!("no changes");
-                return Ok(());
-            }
-            for entry in &entries {
-                let tag = match entry.change.as_str() {
-                    "added" => "A",
-                    "removed" => "D",
-                    "modified" => "M",
-                    _ => "m",
-                };
-                println!("{tag} {}", entry.path);
-            }
-            println!("{} paths changed", entries.len());
+            print_diff(&entries);
             Ok(())
         }
         Command::Fork { count } => {
@@ -730,12 +731,18 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     );
                     println!("note: {}", info.warning);
                 }
-                (None, paths, _) if paths > 0 => {
+                (None, paths, _) if paths > 0 && info.mainline_moved => {
                     println!(
                         "promoted by replay: {paths} path(s) written in place, tree now at {}",
                         &info.generation[..12]
                     );
                     println!("note: {}", info.warning);
+                }
+                (None, paths, _) if paths > 0 => {
+                    println!(
+                        "promoted: {paths} path(s) written in place, tree now at {}",
+                        &info.generation[..12]
+                    );
                 }
                 (None, _, _) => println!("fork had no changes; nothing to land"),
             }
@@ -746,20 +753,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             let proto::Reply::Diff(entries) = reply else {
                 return Err("unexpected reply".into());
             };
-            if entries.is_empty() {
-                println!("no changes");
-                return Ok(());
-            }
-            for entry in &entries {
-                let tag = match entry.change.as_str() {
-                    "added" => "A",
-                    "removed" => "D",
-                    "modified" => "M",
-                    _ => "m",
-                };
-                println!("{tag} {}", entry.path);
-            }
-            println!("{} paths changed", entries.len());
+            print_diff(&entries);
             Ok(())
         }
         Command::Status => {
@@ -863,6 +857,53 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
 
 /// Resolves `--turn N` to (base, last) checkpoint ids: the latest real
 /// checkpoint before the turn's first one, and the turn's last one.
+/// Prints one diff listing: a tag per path, `(gitignored)` on paths the
+/// repo ignores, and a count that separates real blast radius from noise.
+fn print_diff(entries: &[proto::DiffEntry]) {
+    if entries.is_empty() {
+        println!("no changes");
+        return;
+    }
+    let mut ignored = 0usize;
+    for entry in entries {
+        let tag = match entry.change.as_str() {
+            "added" => "A",
+            "removed" => "D",
+            "modified" => "M",
+            _ => "m",
+        };
+        if entry.ignored {
+            ignored += 1;
+            println!("{tag} {}  (gitignored)", entry.path);
+        } else {
+            println!("{tag} {}", entry.path);
+        }
+    }
+    if ignored > 0 {
+        println!("{} paths changed ({ignored} gitignored)", entries.len());
+    } else {
+        println!("{} paths changed", entries.len());
+    }
+}
+
+/// A checkpoint argument: a row id, or a generation hex prefix (at least
+/// six hex digits, as `promote` and `status` print).
+fn checkpoint_ref(arg: Option<&str>) -> Result<(Option<i64>, Option<String>), String> {
+    let Some(arg) = arg else {
+        return Ok((None, None));
+    };
+    let arg = arg.trim().trim_start_matches('#');
+    if let Ok(id) = arg.parse::<i64>() {
+        return Ok((Some(id), None));
+    }
+    if arg.len() >= 6 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok((None, Some(arg.to_string())));
+    }
+    Err(format!(
+        "{arg:?} is neither a checkpoint row id (see `acyclic timeline`) nor a generation hex prefix of at least 6 digits"
+    ))
+}
+
 fn turn_range(
     client: &mut Client,
     session: Option<String>,

@@ -90,6 +90,12 @@ pub enum Op {
         before: Option<i64>,
         #[serde(default)]
         after: Option<i64>,
+        /// Alternatively, generation hex prefixes (what `promote` and
+        /// `status` print); resolved to the latest row holding them.
+        #[serde(default)]
+        before_hex: Option<String>,
+        #[serde(default)]
+        after_hex: Option<String>,
     },
     SessionStart {
         session_id: String,
@@ -271,6 +277,10 @@ pub struct PromoteInfo {
     /// the mainline's copy was kept (and written into the fork on a rebase).
     #[serde(default)]
     pub kept_mainline: Vec<String>,
+    /// Whether the mainline had moved past the fork's base (the fork's
+    /// paths were merged onto it) or not (they were written as-is).
+    #[serde(default)]
+    pub mainline_moved: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -426,6 +436,10 @@ pub struct DiffEntry {
     /// "added" | "removed" | "modified" | "metadata"
     pub change: String,
     pub file_kind: String,
+    /// Matched by the repo's `.gitignore` (caches, build output, secrets):
+    /// shown, since rewind restores it, but not blast radius.
+    #[serde(default)]
+    pub ignored: bool,
 }
 
 fn default_fork_mode() -> String {
