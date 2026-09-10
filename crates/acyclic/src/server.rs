@@ -212,10 +212,30 @@ impl Server {
     }
 
     async fn dispatch(&self, op: proto::Op) -> proto::Payload {
-        match self.dispatch_inner(op).await {
-            Ok(reply) => proto::Payload::Ok(reply),
-            Err(message) => err(message),
-        }
+        let name = op_name(&op);
+        let started = std::time::Instant::now();
+        acyclic_engine::trace!("daemon", "op {name} received");
+        let payload = match self.dispatch_inner(op).await {
+            Ok(reply) => {
+                acyclic_engine::trace!(
+                    "daemon",
+                    "op {name} -> {} in {:.1}ms",
+                    reply_name(&reply),
+                    acyclic_engine::trace::ms(started)
+                );
+                proto::Payload::Ok(reply)
+            }
+            Err(message) => {
+                acyclic_engine::trace!(
+                    "daemon",
+                    "op {name} -> error in {:.1}ms: {}",
+                    acyclic_engine::trace::ms(started),
+                    message.lines().next().unwrap_or("")
+                );
+                err(message)
+            }
+        };
+        payload
     }
 
     async fn dispatch_inner(&self, op: proto::Op) -> Result<proto::Reply, String> {
@@ -253,6 +273,7 @@ impl Server {
                     rewind_target: None,
                 };
                 if wait {
+                    acyclic_engine::trace!("daemon", "checkpoint: WAIT path (reply after the capture lands; durable={durable})");
                     let outcome = self
                         .handle
                         .checkpoint(kind, attribution)
@@ -271,6 +292,7 @@ impl Server {
                     // happens BEFORE the ack, so a stop arriving after the
                     // ack queues behind the capture instead of dropping it.
                     // Failures land in the index as `failed`.
+                    acyclic_engine::trace!("daemon", "checkpoint: ENQUEUE path (ack on admission, capture runs behind)");
                     self.handle
                         .checkpoint_enqueued(kind, attribution)
                         .await
@@ -971,8 +993,27 @@ impl Server {
             self.refuse_unresolved_markers(&overlay, conflict).await?;
         }
         let head = self.handle.publish_head().await.map_err(stringify)?;
-        self.merge_onto_head(id, overlay, fork.base, head, fork.copy_dir.as_deref(), label)
-            .await
+        acyclic_engine::trace!(
+            "daemon",
+            "promote {id}: {} fork, mainline {} since the fork's base",
+            if fork.copy_dir.is_some() { "copy" } else { "mount" },
+            if head == fork.base { "UNMOVED (plain in-place write)" } else { "MOVED (three-way merge)" }
+        );
+        let landed = self
+            .merge_onto_head(id, overlay, fork.base, head, fork.copy_dir.as_deref(), label)
+            .await;
+        acyclic_engine::trace!(
+            "daemon",
+            "promote {id}: outcome {}",
+            match &landed {
+                Ok(Landed::Replayed { paths, merged, kept, .. }) =>
+                    format!("LANDED ({paths} path(s) written, {merged} merged by content, {} ignored kept)", kept.len()),
+                Ok(Landed::Nothing { .. }) => "NOTHING to land".to_string(),
+                Ok(Landed::Conflicted { files, .. }) => format!("CONFLICT: {} file(s) rebased into the fork with markers", files.len()),
+                Err(message) => format!("REFUSED: {}", message.lines().next().unwrap_or("")),
+            }
+        );
+        landed
     }
 
     /// Marks the entries the repo's `.gitignore` covers. One git call.
@@ -1138,6 +1179,16 @@ impl Server {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
+        acyclic_engine::trace!(
+            "daemon",
+            "merge plan: take_ours={} take_theirs={} merged={} conflicted={} refused={} kept_mainline={}",
+            plan.take_ours.len(),
+            plan.take_theirs.len(),
+            plan.merged.len(),
+            plan.conflicted.len(),
+            plan.refusals.len(),
+            kept.len()
+        );
         if !plan.refusals.is_empty() {
             let mut lines: Vec<String> = plan
                 .refusals
@@ -1622,6 +1673,25 @@ enum Landed {
         files: Vec<proto::ConflictEntry>,
         kept: Vec<String>,
     },
+}
+
+/// The variant name of an op, for trace lines.
+fn op_name(op: &proto::Op) -> String {
+    let debug = format!("{op:?}");
+    debug
+        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .next()
+        .unwrap_or("?")
+        .to_string()
+}
+
+fn reply_name(reply: &proto::Reply) -> String {
+    let debug = format!("{reply:?}");
+    debug
+        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .next()
+        .unwrap_or("?")
+        .to_string()
 }
 
 fn unresolved_message(paths: &[PathBuf]) -> String {

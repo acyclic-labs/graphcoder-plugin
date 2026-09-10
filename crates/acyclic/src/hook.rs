@@ -47,6 +47,11 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     } else {
         Spawn::Never
     };
+    acyclic_engine::trace!(
+        "hook",
+        "event {event}: daemon spawn {}; pre-tool waits (bounded), post-tool enqueues (ack before capture)",
+        if matches!(spawn, Spawn::Allowed) { "allowed" } else { "never" }
+    );
     let Ok(mut client) = connect(repo, spawn) else {
         // No daemon (not initialized, or stopped): checkpointing is off.
         // Stay quiet — hooks fire on every tool call.

@@ -430,3 +430,25 @@ Deliberate divergences:
   route before working; it snapshots under the checkout lock and drops
   the route only after the fork lands, which removed the negative-entry
   window that hid re-attached forks on Linux.
+- **Latency gate was measuring the wrong branch (2026-09-10).** The
+  macOS CI gate went from 8 ms to 115–294 ms at ce39008, which made plain
+  `acyclic checkpoint` wait for the capture by default. The gate ran plain
+  `checkpoint`, so it timed the drain loop's 50 ms quiesce window plus a
+  20k-file snapshot instead of the hook's enqueue-ack. Bisected with
+  release builds of four commits, then proven with `ACYCLIC_TRACE=1`: the
+  wait path costs ~77 ms even on 300 files, the enqueue path and the real
+  post-tool hook ack in 0.1–0.3 ms. The gate now samples `--no-wait` and
+  prints the wait-path p95 as information.
+- **Path tracing.** `ACYCLIC_TRACE=1` makes the CLI, hook, daemon, and
+  pipeline log every branch taken and its cost (client connect/spawn,
+  op dispatch and reply, WAIT vs ENQUEUE checkpoint, shadowed noop,
+  recovery baseline, watcher drain polls/batches/stop reason, snapshot,
+  index, publish, promote mode and outcome, merge plan counts, root
+  hints). Daemon lines land in the store's `daemon.log`.
+- **Safe Mode S9 race.** After an empty session resolve unmounted the
+  shadow and installed a fresh watcher, a late mount-teardown event for
+  the repo root itself reached the next drain, and the engine refused a
+  mutation targeting the volume root. Root-targeted hints are now
+  stripped before capture: metadata-only ones dropped, structural ones
+  (root created/removed/renamed, i.e. a mount came or went) trigger a
+  fresh watcher and a recovery baseline instead of a failed request.
