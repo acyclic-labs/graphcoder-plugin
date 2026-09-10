@@ -38,10 +38,6 @@ struct ForkState {
     /// Copy-mode forks only: the materialized directory the user works in.
     /// Captured back into `shared` at promote, removed at drop/promote.
     copy_dir: Option<PathBuf>,
-    /// Volume config and id the mount source needs, to re-attach a route
-    /// after a promote that did not land.
-    config: VolumeConfig,
-    volume_id: acyclic_fs::VolumeId,
     /// Set by a conflicting promote until the markers are gone.
     conflict: Option<OpenConflict>,
 }
@@ -580,8 +576,6 @@ impl Server {
                             base: seed.base,
                             entry: clone_entry(&entry),
                             copy_dir: None,
-                            config: seed.config,
-                            volume_id: seed.volume_id,
                             conflict: None,
                         },
                     );
@@ -657,9 +651,10 @@ impl Server {
                     }
                     Ok(landed) => landed,
                 };
-                if let Some(dir) = fork.copy_dir.as_deref() {
-                    let _ = std::fs::remove_dir_all(dir);
-                    Self::remove_if_empty(dir.parent());
+                // Landed: the fork is consumed. Drop its route (mount fork)
+                // or its directory (copy fork).
+                if let Err(error) = self.discard_fork_workspace(&id, fork.copy_dir.as_deref()).await {
+                    eprintln!("acyclic daemon: discard fork {id} after promote: {error}");
                 }
                 match landed {
                     Landed::Replayed {
@@ -937,8 +932,6 @@ impl Server {
                     base: seed.base,
                     entry: clone_entry(&entry),
                     copy_dir: Some(dir),
-                    config: seed.config,
-                    volume_id: seed.volume_id,
                     conflict: None,
                 },
             );
@@ -959,17 +952,19 @@ impl Server {
         fork: &ForkState,
         label: &str,
     ) -> Result<Landed, String> {
-        // Freeze the fork's writes and get at its overlay.
+        // Get at the fork's overlay. A mounted fork keeps serving while we
+        // work: its snapshot is taken under the checkout lock, and the
+        // route is detached only once the fork has landed. (Detaching
+        // first and re-attaching on a conflict left the kernel's negative
+        // name cache hiding the fork on Linux FUSE, which cannot
+        // invalidate a route name.)
         let overlay = match fork.copy_dir.as_deref() {
             Some(dir) => {
                 let scratch = self.handle.scratch_checkout(fork.base).await.map_err(stringify)?;
                 fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
                 scratch
             }
-            None => {
-                self.detach_route(id).await?;
-                Arc::clone(&fork.shared)
-            }
+            None => Arc::clone(&fork.shared),
         };
         // A rebased fork must have resolved its markers before it can land.
         if let Some(conflict) = fork.conflict.as_ref() {
@@ -990,11 +985,8 @@ impl Server {
         entries
     }
 
-    /// Re-inserts a fork that did not land, restoring its mount route.
+    /// Re-inserts a fork that did not land. Its route was never detached.
     async fn keep_fork(&self, id: String, fork: ForkState) -> Result<(), String> {
-        if fork.copy_dir.is_none() {
-            self.attach_route(&id, Arc::clone(&fork.shared), fork.config, fork.volume_id).await?;
-        }
         self.forks.lock().await.insert(id, fork);
         Ok(())
     }
@@ -1223,7 +1215,7 @@ impl Server {
                 )
                 .await
                 .map_err(stringify)?;
-            self.rebase_fork(&overlay, snapshot, rebased, copy_dir).await?;
+            self.rebase_fork(id, &overlay, snapshot, rebased, copy_dir).await?;
             let mut files: Vec<proto::ConflictEntry> = plan
                 .conflicted
                 .iter()
@@ -1330,6 +1322,7 @@ impl Server {
     /// never touched.
     async fn rebase_fork(
         &self,
+        id: &str,
         overlay: &Arc<SharedLocalCheckout>,
         snapshot: acyclic_engine::GenerationId,
         rebased: acyclic_engine::GenerationId,
@@ -1360,6 +1353,30 @@ impl Server {
                     .apply_to_overlay(Arc::clone(overlay), entries)
                     .await
                     .map_err(stringify)?;
+                // The route stayed mounted throughout, so the kernel may
+                // hold stale attributes or a negative entry for a path the
+                // rebase recreated (a file the fork had deleted). Ask the
+                // driver to drop them; providers without invalidation
+                // (Linux FUSE) rely on their entry timeout instead.
+                let mount = self.fork_mount.lock().await;
+                if let Some(session) = mount.session.as_ref() {
+                    let mut targets: Vec<Vec<u8>> = vec![id.as_bytes().to_vec()];
+                    for root in &roots {
+                        let mut current = Some(root.as_path());
+                        while let Some(path) = current {
+                            if path.as_os_str().is_empty() {
+                                break;
+                            }
+                            targets.push(format!("{id}/{}", path.display()).into_bytes());
+                            current = path.parent();
+                        }
+                    }
+                    tokio::task::block_in_place(|| {
+                        for target in &targets {
+                            let _ = session.invalidate(target);
+                        }
+                    });
+                }
             }
         }
         Ok(())
