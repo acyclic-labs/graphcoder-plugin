@@ -141,6 +141,24 @@ jobs:
         with:
           subject-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}
 
+      # SPDX SBOM from the locked dependency graph the binary was built from.
+      # Generated per target so each binary's SBOM attestation names exactly
+      # the lockfile that produced it; the lists are identical across targets.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          file: Cargo.lock
+          format: spdx-json
+          output-file: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}
+          sbom-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}.spdx.json
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: acyclic-${{ matrix.os }}-${{ matrix.cpu }}
@@ -164,12 +182,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Assemble SHA256SUMS
+      - name: Assemble SHA256SUMS and the release SBOM
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
           cd dist
+          # One SBOM ships with the release (the per-target ones are identical
+          # and each stays attested against its own binary).
+          mv acyclic-linux-x64.spdx.json "acyclic-${VERSION}.spdx.json"
+          rm -f ./*-*.spdx.json
           cat ./*.sha256 > SHA256SUMS
           rm ./*.sha256
+          shasum -a 256 "acyclic-${VERSION}.spdx.json" >> SHA256SUMS
           shasum -a 256 -c SHA256SUMS
           ls -l
 

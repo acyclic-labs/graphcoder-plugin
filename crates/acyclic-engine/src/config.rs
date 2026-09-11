@@ -28,6 +28,11 @@ pub struct Config {
     /// Safe Mode: path prefixes (relative to the repo root) no fork or
     /// scratch tree may write to, enforced at the native mount layer.
     pub guarded_paths: Vec<String>,
+    /// Snapshot exclusions: repo-relative paths (a file, or a directory and
+    /// everything under it) that never enter a checkpoint. For secrets and
+    /// bulky generated state the store must not shadow. A full rewind
+    /// carries the live copies over untouched. See `crate::exclude`.
+    pub exclude: Vec<String>,
     /// Parameters the fork-decomposition skill reads via `acyclic policy`.
     pub decompose: Decompose,
     /// Content-merge knobs (`[merge]`).
@@ -105,6 +110,7 @@ impl Default for Config {
             store_dir: None,
             dry_run: false,
             guarded_paths: Vec::new(),
+            exclude: Vec::new(),
             decompose: Decompose::default(),
             merge: Merge::default(),
         }
@@ -179,6 +185,20 @@ mod tests {
         let config = Config::load_layered(None, repo.path()).expect("load");
         assert!(config.dry_run);
         assert_eq!(config.guarded_paths, vec![".env", "migrations/"]);
+    }
+
+    #[test]
+    fn exclude_list_parses_from_repo_config() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::write(
+            repo.path().join(".acyclic/config.toml"),
+            "exclude = [\".env\", \"secrets/\"]\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(None, repo.path()).expect("load");
+        assert_eq!(config.exclude, vec![".env", "secrets/"]);
+        assert!(Config::default().exclude.is_empty());
     }
 
     #[test]

@@ -96,6 +96,11 @@ expected. Retry before assuming the publish failed.
 6. The workflow ends with a fresh `npm install` of the launcher from the
    public registry and runs `acyclic --version`. If that step is green, the
    release is live.
+7. `scripts/install.sh` resolves `releases/latest/download/` by default, so
+   the curl installer picks the new release up with no further step. Rehearse
+   it offline first: `scripts/install-smoke.sh dist/bin` runs the installer on
+   a bare Debian container against a local copy of the release assets and
+   drives init → checkpoint → rewind.
 
 ## What the workflow enforces
 
@@ -108,6 +113,8 @@ expected. Retry before assuming the publish failed.
 | Build uses `--locked`, so Cargo.lock is authoritative | build step |
 | Binary must report the release version before it is kept | smoke test step |
 | SLSA provenance attestation for every binary | `attest-build-provenance` |
+| SPDX SBOM from `Cargo.lock` per target, attested against its binary; one copy attached to the release and listed in `SHA256SUMS` | `sbom-action` + `attest-sbom` |
+| Licenses, advisories, and sources checked against `deny.toml` on every push | `ci.yml` `deny` job |
 | Publish job re-verifies attestations and checksums before packaging | verify step |
 | npm token visible only to the `npm` environment job | `environment: npm` |
 | npm lifecycle scripts disabled everywhere | `npm config set ignore-scripts true` and `--ignore-scripts` |

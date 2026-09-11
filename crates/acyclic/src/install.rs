@@ -29,8 +29,7 @@ fn claude_code(repo: &Path) -> Result<(), String> {
 
     merge_hooks(&claude_dir.join("settings.json"))?;
     std::fs::write(claude_dir.join("commands/rewind.md"), REWIND_COMMAND).map_err(stringify)?;
-    std::fs::write(claude_dir.join("commands/timeline.md"), TIMELINE_COMMAND)
-        .map_err(stringify)?;
+    std::fs::write(claude_dir.join("commands/timeline.md"), TIMELINE_COMMAND).map_err(stringify)?;
     std::fs::write(
         claude_dir.join("skills/acyclic-self-rollback/SKILL.md"),
         SELF_ROLLBACK_SKILL,
@@ -229,11 +228,14 @@ checkpoint and any abandoned branches; use their ids directly.
   the next command. Both swap the repo directory; a shell left in the old
   inode silently operates on the replaced tree.
 - Rewind restores file contents and modes, not mtimes: expect rebuilds.
+- Paths listed under `exclude` in .acyclic/config.toml (secrets, bulky
+  generated state) are never checkpointed: a rewind leaves them exactly
+  as they are now, and `acyclic restore` refuses them. Do not rely on a
+  checkpoint to undo an edit to an excluded file.
 - After a rewind, the user's editor may show stale buffers - say so.
 - If `acyclic` reports the daemon is not running, checkpointing is off;
   tell the user to run `acyclic init` rather than working around it.
 "#;
-
 
 const FORK_COMMAND: &str = r#"---
 description: Race N approaches to a task in isolated forks and land the winner, or run one risky step in a fork first
@@ -442,7 +444,9 @@ included) is snapshotted by a local daemon. Useful commands:
     acyclic brief                        where the previous session ended
 
 Before a risky change, checkpoint. After a failed attempt, rewind instead
-of hand-reverting. Before finishing, review `acyclic diff`.
+of hand-reverting. Before finishing, review `acyclic diff`. Paths under
+`exclude` in .acyclic/config.toml are never checkpointed; a rewind leaves
+them untouched.
 "#;
 #[cfg(test)]
 mod tests {

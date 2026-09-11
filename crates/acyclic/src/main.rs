@@ -212,8 +212,62 @@ fn main() {
         eprintln!("acyclic: bad repo path: {error}");
         std::process::exit(1);
     });
+    if cli.repo.is_none() && stranded_in_trash(&repo) {
+        // A rewind or promote swaps the repo directory's inode; a shell that
+        // was inside it now resolves its cwd to the replaced tree in trash.
+        // Every verb would otherwise target a store that does not exist.
+        eprintln!(
+            "acyclic: your shell is inside a tree that a rewind replaced ({});\n  re-enter the repo first:  cd \"$PWD\"",
+            repo.display()
+        );
+        std::process::exit(1);
+    }
     let code = run(cli, &repo);
     std::process::exit(code);
+}
+
+/// True when `repo` (canonical) lies inside a store's trash (an ancestor
+/// named `trash` whose parent is a store root, marked by `meta.json`), or
+/// inside a rewind's sibling fallback trash directory (`.<name>.acyclic-trash-*`).
+fn stranded_in_trash(repo: &Path) -> bool {
+    repo.ancestors().any(|ancestor| {
+        let Some(name) = ancestor.file_name().map(|name| name.to_string_lossy()) else {
+            return false;
+        };
+        if name == "trash" {
+            return ancestor
+                .parent()
+                .map(|store| store.join("meta.json").is_file())
+                .unwrap_or(false);
+        }
+        name.starts_with('.') && name.contains(".acyclic-trash-")
+    })
+}
+
+#[cfg(test)]
+mod stranded_tests {
+    use super::stranded_in_trash;
+
+    #[test]
+    fn store_trash_and_sibling_trash_are_detected() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let store = work.path().join("stores/944d51144ca00be5");
+        let trashed = store.join("trash/demo-1789144724/src");
+        std::fs::create_dir_all(&trashed).expect("trash tree");
+        std::fs::write(store.join("meta.json"), b"{}").expect("meta");
+        assert!(stranded_in_trash(&trashed));
+        assert!(stranded_in_trash(trashed.parent().unwrap()));
+
+        let sibling = work.path().join(".demo.acyclic-trash-1789144724/src");
+        std::fs::create_dir_all(&sibling).expect("sibling");
+        assert!(stranded_in_trash(&sibling));
+
+        // A directory merely named trash, with no store above it, is fine.
+        let plain = work.path().join("project/trash/notes");
+        std::fs::create_dir_all(&plain).expect("plain");
+        assert!(!stranded_in_trash(&plain));
+        assert!(!stranded_in_trash(&work.path().join("demo")));
+    }
 }
 
 fn run(cli: Cli, repo: &Path) -> i32 {
@@ -284,7 +338,10 @@ fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
 fn print_mount_capability() {
     let capability = acyclic_engine::fork::mount_capability();
     if capability.available {
-        println!("mounts:        {} (forks and Safe Mode available)", capability.provider);
+        println!(
+            "mounts:        {} (forks and Safe Mode available)",
+            capability.provider
+        );
     } else {
         println!(
             "mounts:        unavailable ({})",
@@ -467,14 +524,22 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             let proto::Reply::Inspect(info) = reply else {
                 return Err("unexpected reply".into());
             };
-            println!("checkpoint:  #{}  ({}{})", info.id, info.kind, if info.published { "" } else { ", unpublished" });
+            println!(
+                "checkpoint:  #{}  ({}{})",
+                info.id,
+                info.kind,
+                if info.published { "" } else { ", unpublished" }
+            );
             println!("generation:  {}", info.generation);
             println!("created:     {}", age(info.created_at));
             match &info.session_id {
                 Some(session) => println!(
                     "session:     {}{}",
                     session,
-                    info.host.as_ref().map(|host| format!("  ({host})")).unwrap_or_default()
+                    info.host
+                        .as_ref()
+                        .map(|host| format!("  ({host})"))
+                        .unwrap_or_default()
                 ),
                 None => println!("session:     none (outside any host session)"),
             }
@@ -488,7 +553,10 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             if let Some(tool) = &info.tool_name {
                 println!(
                     "tool:        {tool}{}",
-                    info.tool_call_id.as_ref().map(|id| format!("  ({id})")).unwrap_or_default()
+                    info.tool_call_id
+                        .as_ref()
+                        .map(|id| format!("  ({id})"))
+                        .unwrap_or_default()
                 );
             }
             if let Some(label) = &info.label {
@@ -772,7 +840,10 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             println!("unpublished:   {}", info.unpublished);
             println!("store size:    {}", human_bytes(info.store_bytes));
             if info.mount_available {
-                println!("mounts:        {} (forks mount, Safe Mode on)", info.mount_provider);
+                println!(
+                    "mounts:        {} (forks mount, Safe Mode on)",
+                    info.mount_provider
+                );
             } else {
                 println!(
                     "mounts:        unavailable ({}) — forks copy, Safe Mode off",

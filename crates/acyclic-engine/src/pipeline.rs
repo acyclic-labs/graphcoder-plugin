@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::diff::{self, FileChange};
+use crate::exclude::Exclusions;
 use crate::fork::{ForkSeed, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RestoreOutcome, RewindOutcome};
@@ -573,12 +574,16 @@ fn strip_root_hints(batch: WatchBatch) -> (WatchBatch, RootHint) {
         .filter(|change| {
             let root_hint = match change {
                 WatchChange::MetadataChanged(path) if is_root(path) => RootHint::MetadataOnly,
-                WatchChange::Created(path) | WatchChange::Modified(path) | WatchChange::Removed(path)
+                WatchChange::Created(path)
+                | WatchChange::Modified(path)
+                | WatchChange::Removed(path)
                     if is_root(path) =>
                 {
                     RootHint::Structural
                 }
-                WatchChange::Renamed { from, to } if is_root(from) || is_root(to) => RootHint::Structural,
+                WatchChange::Renamed { from, to } if is_root(from) || is_root(to) => {
+                    RootHint::Structural
+                }
                 _ => RootHint::None,
             };
             if root_hint == RootHint::None {
@@ -631,6 +636,8 @@ struct Pipeline {
     config: Config,
     watch: NativeWatch,
     options: CaptureOptions,
+    /// Paths that never enter a checkpoint (`exclude` in the config).
+    exclusions: Exclusions,
     cancel: CancellationToken,
     state: State,
     last_generation: GenerationId,
@@ -735,12 +742,14 @@ impl Pipeline {
             maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
         };
 
+        let exclusions = Exclusions::parse(&config.exclude)?;
         let mut pipeline = Self {
             store,
             index,
             config,
             watch,
             options,
+            exclusions,
             cancel,
             state: State::Baselining,
             last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
@@ -756,7 +765,10 @@ impl Pipeline {
     /// Full baseline: capture the whole tree, checkpoint, finish the watcher
     /// rescan, publish. Used at startup and after RescanRequired/rewind.
     async fn baseline(&mut self, kind: CheckpointKind) -> Result<()> {
-        crate::trace!("pipeline", "baseline kind={kind:?}: full-tree rescan starting");
+        crate::trace!(
+            "pipeline",
+            "baseline kind={kind:?}: full-tree rescan starting"
+        );
         let baseline_started = Instant::now();
         self.state = State::Baselining;
         // A baseline requires a clean checkout. Mid-session (watcher
@@ -771,6 +783,7 @@ impl Pipeline {
         )
         .await
         .map_err(EngineError::fs("capture baseline"))?;
+        self.scrub_exclusions().await?;
         let generation = self.checkpoint_engine().await?;
         let row = self
             .index
@@ -787,7 +800,10 @@ impl Pipeline {
         // A root hint here is already covered by the rescan that just ran.
         let (batch, root) = strip_root_hints(batch);
         if root != RootHint::None {
-            crate::trace!("pipeline", "rescan tail: root hint ({root:?}) dropped, covered by the rescan");
+            crate::trace!(
+                "pipeline",
+                "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
+            );
         }
         if let WatchBatch::Changes { ref changes, .. } = batch {
             if !changes.is_empty() {
@@ -800,11 +816,16 @@ impl Pipeline {
                 )
                 .await
                 .map_err(EngineError::fs("capture rescan tail"))?;
+                self.scrub_exclusions().await?;
             }
         }
         self.commit_engine().await?;
         self.state = State::Ready;
-        crate::trace!("pipeline", "baseline done in {:.1}ms; state Ready", crate::trace::ms(baseline_started));
+        crate::trace!(
+            "pipeline",
+            "baseline done in {:.1}ms; state Ready",
+            crate::trace::ms(baseline_started)
+        );
         Ok(())
     }
 
@@ -982,8 +1003,13 @@ impl Pipeline {
                 paths,
                 reply,
             } => {
-                let result =
-                    Box::pin(crate::merge::materialize_paths(&self.store, generation, &root, &paths)).await;
+                let result = Box::pin(crate::merge::materialize_paths(
+                    &self.store,
+                    generation,
+                    &root,
+                    &paths,
+                ))
+                .await;
                 let _ = reply.send(result);
                 false
             }
@@ -993,7 +1019,8 @@ impl Pipeline {
                 path,
                 reply,
             } => {
-                let result = Box::pin(rewind::restore_path_into(&self.store, target, &root, &path)).await;
+                let result =
+                    Box::pin(rewind::restore_path_into(&self.store, target, &root, &path)).await;
                 let _ = reply.send(result);
                 false
             }
@@ -1090,7 +1117,11 @@ impl Pipeline {
             // real tree is frozen and the watcher sees only fork/mount noise.
             // Record a noop so the hook gets a clean reply, but never drain
             // the watcher or snapshot the mainline mid-session.
-            crate::trace!("pipeline", "checkpoint kind={:?}: shadowed -> noop row, watcher untouched", kind);
+            crate::trace!(
+                "pipeline",
+                "checkpoint kind={:?}: shadowed -> noop row, watcher untouched",
+                kind
+            );
             let row = self
                 .index
                 .record(self.last_generation, CheckpointKind::Noop, attribution)?;
@@ -1104,7 +1135,12 @@ impl Pipeline {
         if self.state != State::Ready {
             // A failed recovery leaves state at Baselining; a request is the
             // natural moment to retry rather than staying down forever.
-            crate::trace!("pipeline", "checkpoint kind={:?}: state {:?} -> reset watch + recovery baseline first", kind, self.state);
+            crate::trace!(
+                "pipeline",
+                "checkpoint kind={:?}: state {:?} -> reset watch + recovery baseline first",
+                kind,
+                self.state
+            );
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
@@ -1166,13 +1202,20 @@ impl Pipeline {
                 .value;
             let (batch, root) = strip_root_hints(batch);
             if root != RootHint::None {
-                crate::trace!("pipeline", "drain: watcher hinted at the volume root ({root:?}); dropped");
+                crate::trace!(
+                    "pipeline",
+                    "drain: watcher hinted at the volume root ({root:?}); dropped"
+                );
             }
+            let (batch, scrub) = self.exclusions.filter_batch(batch);
             if root == RootHint::Structural {
                 // The repo directory itself changed identity (a mount came
                 // or went): re-baseline on a fresh watcher rather than apply
                 // hints that may describe another tree.
-                crate::trace!("pipeline", "drain: structural root hint -> fresh watcher + recovery baseline");
+                crate::trace!(
+                    "pipeline",
+                    "drain: structural root hint -> fresh watcher + recovery baseline"
+                );
                 self.reset_watch().await?;
                 self.baseline(CheckpointKind::Recovered).await?;
                 return Ok(true);
@@ -1190,6 +1233,9 @@ impl Pipeline {
                     )
                     .await
                     .map_err(EngineError::fs("capture watch batch"))?;
+                    if scrub {
+                        self.scrub_exclusions().await?;
+                    }
                     changed = true;
                     last_change = Instant::now();
                 }
@@ -1216,6 +1262,19 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// Drops excluded paths a capture may have pulled into the checkout,
+    /// before the generation they would otherwise land in is checkpointed.
+    async fn scrub_exclusions(&mut self) -> Result<()> {
+        let removed = self.exclusions.scrub(&mut self.store.checkout).await?;
+        if removed > 0 {
+            crate::trace!(
+                "pipeline",
+                "exclusions: scrubbed {removed} excluded path(s) from the checkout"
+            );
+        }
+        Ok(())
     }
 
     /// `checkpoint()`: snapshot without authority publish. The fast path.
@@ -1292,8 +1351,13 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
-        let outcome =
-            rewind::execute(&self.store, target.generation, self.config.trash_ttl_days).await;
+        let outcome = rewind::execute(
+            &self.store,
+            target.generation,
+            self.config.trash_ttl_days,
+            &self.exclusions,
+        )
+        .await;
 
         // The swap replaced the repo directory's inode: the pinned root
         // identity and the watcher both point at the old tree. Rebuild both,
@@ -1320,6 +1384,12 @@ impl Pipeline {
                 "a Safe Mode session is shadowing the repo root; resolve it first".into(),
             ));
         }
+        if self.exclusions.covers_host(path) {
+            return Err(EngineError::Restore(format!(
+                "{} is excluded from snapshots (`exclude` in .acyclic/config.toml); no checkpoint holds it",
+                path.display()
+            )));
+        }
         if self.state != State::Ready {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
@@ -1330,7 +1400,11 @@ impl Pipeline {
                 safety,
                 CheckpointKind::Manual,
                 &Attribution {
-                    label: Some(format!("before restore {} from #{}", path.display(), target.id)),
+                    label: Some(format!(
+                        "before restore {} from #{}",
+                        path.display(),
+                        target.id
+                    )),
                     ..Attribution::default()
                 },
             )?;
@@ -1560,7 +1634,13 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(&self.store, generation, self.config.trash_ttl_days).await;
+        let swap = rewind::execute(
+            &self.store,
+            generation,
+            self.config.trash_ttl_days,
+            &self.exclusions,
+        )
+        .await;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         let swap = swap?;
@@ -1684,7 +1764,13 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(&self.store, generation, self.config.trash_ttl_days).await;
+        let swap = rewind::execute(
+            &self.store,
+            generation,
+            self.config.trash_ttl_days,
+            &self.exclusions,
+        )
+        .await;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         let swap = swap?;
@@ -1697,7 +1783,10 @@ impl Pipeline {
     /// Reopens the watcher and recomputes the capture root identity — needed
     /// whenever the repo directory inode may have changed (after a rewind).
     async fn reset_watch(&mut self) -> Result<()> {
-        crate::trace!("pipeline", "reset_watch: reopening the native watcher (old queue discarded)");
+        crate::trace!(
+            "pipeline",
+            "reset_watch: reopening the native watcher (old queue discarded)"
+        );
         let repo_root = self.store.repo_root.clone();
         self.options.expected_root_identity =
             capture_root_identity(&repo_root).map_err(EngineError::fs("root identity"))?;
@@ -1729,7 +1818,12 @@ mod root_hint_tests {
 
     fn file(name: &str) -> NamespacePath {
         let limits = VolumeLimits::default();
-        let name = LogicalName::new(NameEncoding::PosixBytes, name.as_bytes().to_vec(), limits.maximum_component_bytes).unwrap();
+        let name = LogicalName::new(
+            NameEncoding::PosixBytes,
+            name.as_bytes().to_vec(),
+            limits.maximum_component_bytes,
+        )
+        .unwrap();
         NamespacePath::new(vec![name], limits).unwrap()
     }
 
@@ -1772,8 +1866,14 @@ mod root_hint_tests {
             WatchChange::Removed(root()),
             WatchChange::Created(root()),
             WatchChange::Modified(root()),
-            WatchChange::Renamed { from: root(), to: file("x") },
-            WatchChange::Renamed { from: file("x"), to: root() },
+            WatchChange::Renamed {
+                from: root(),
+                to: file("x"),
+            },
+            WatchChange::Renamed {
+                from: file("x"),
+                to: root(),
+            },
         ] {
             let (out, hint) = strip_root_hints(batch(vec![
                 WatchChange::MetadataChanged(root()),

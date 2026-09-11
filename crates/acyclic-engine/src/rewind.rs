@@ -5,11 +5,14 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use acyclic_fs::kernel::{FileKind, FilePayload, LogicalName, MetadataField, NameEncoding, NamespacePath};
+use acyclic_fs::kernel::{
+    FileKind, FilePayload, LogicalName, MetadataField, NameEncoding, NamespacePath,
+};
 use acyclic_fs::{materialize_checkout, ByteRange, MaterializeOptions};
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
+use crate::exclude::Exclusions;
 use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
 
@@ -101,9 +104,12 @@ pub async fn restore_path_into(
                     action: RestoreAction::Removed,
                 })
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(EngineError::Restore(
-                format!("{} does not exist at that checkpoint or in the tree", relative.display()),
-            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(EngineError::Restore(format!(
+                    "{} does not exist at that checkpoint or in the tree",
+                    relative.display()
+                )))
+            }
             Err(error) => Err(error.into()),
         };
     };
@@ -114,7 +120,16 @@ pub async fn restore_path_into(
     std::fs::create_dir_all(parent)?;
     let staged = parent.join(format!(".{name}.acyclic-restore-{}", std::process::id()));
     let _ = remove_any(&staged);
-    let written = write_node(&mut checkout, &namespace, record.kind, &record.payload, &staged, limits, &cancel).await;
+    let written = write_node(
+        &mut checkout,
+        &namespace,
+        record.kind,
+        &record.payload,
+        &staged,
+        limits,
+        &cancel,
+    )
+    .await;
     if let Err(error) = written {
         let _ = remove_any(&staged);
         return Err(error);
@@ -164,7 +179,11 @@ pub(crate) fn write_node<'a>(
                 let length = match payload {
                     FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
                     FilePayload::Regular { logical_bytes, .. } => *logical_bytes,
-                    _ => return Err(EngineError::Restore("regular file with foreign payload".into())),
+                    _ => {
+                        return Err(EngineError::Restore(
+                            "regular file with foreign payload".into(),
+                        ))
+                    }
                 };
                 let mut file = std::fs::File::create(host)?;
                 let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
@@ -174,7 +193,10 @@ pub(crate) fn write_node<'a>(
                     let read = checkout
                         .read_file_range(
                             namespace,
-                            ByteRange { offset, length: take },
+                            ByteRange {
+                                offset,
+                                length: take,
+                            },
                             WorkCounters::UNBOUNDED,
                             cancel,
                         )
@@ -227,7 +249,16 @@ pub(crate) fn write_node<'a>(
                     let child = NamespacePath::new(components, limits)
                         .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?;
                     let child_host = host.join(logical_to_os(&name));
-                    write_node(checkout, &child, kind, &payload, &child_host, limits, cancel).await?;
+                    write_node(
+                        checkout,
+                        &child,
+                        kind,
+                        &payload,
+                        &child_host,
+                        limits,
+                        cancel,
+                    )
+                    .await?;
                 }
                 apply_mode(checkout, namespace, host, cancel).await
             }
@@ -288,11 +319,16 @@ pub(crate) fn namespace_path(
     let names = components
         .iter()
         .map(|bytes| {
-            LogicalName::new(NameEncoding::PosixBytes, bytes.clone(), limits.maximum_component_bytes)
-                .map_err(|error| EngineError::Restore(format!("bad path component: {error:?}")))
+            LogicalName::new(
+                NameEncoding::PosixBytes,
+                bytes.clone(),
+                limits.maximum_component_bytes,
+            )
+            .map_err(|error| EngineError::Restore(format!("bad path component: {error:?}")))
         })
         .collect::<Result<Vec<_>>>()?;
-    NamespacePath::new(names, limits).map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
+    NamespacePath::new(names, limits)
+        .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
 }
 
 pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
@@ -345,12 +381,59 @@ pub struct Journal {
     pub repo_root: PathBuf,
     pub tmp: PathBuf,
     pub phase: Phase,
+    /// Excluded paths (repo-relative) moved from the live tree into `tmp`
+    /// before the swap. Absent in journals written before exclusions.
+    #[serde(default)]
+    pub carried: Vec<PathBuf>,
+}
+
+/// Moves each `relative` path from `from` to `into`, replacing whatever the
+/// materialized tree had there (the live copy wins). Stops at the first
+/// failure; the caller unwinds with [`move_back`].
+fn carry(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
+    for path in relative {
+        let source = from.join(path);
+        let destination = into.join(path);
+        if std::fs::symlink_metadata(&source).is_err() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = remove_any(&destination);
+        std::fs::rename(&source, &destination).map_err(|error| {
+            EngineError::Restore(format!("carry excluded path {}: {error}", path.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// Best-effort inverse of [`carry`]: every listed path present in `from`
+/// and absent in `into` goes back. Used by crash recovery, where the only
+/// wrong answer is losing a live copy.
+fn move_back(from: &Path, into: &Path, relative: &[PathBuf]) {
+    for path in relative {
+        let source = from.join(path);
+        let destination = into.join(path);
+        if std::fs::symlink_metadata(&source).is_err()
+            || std::fs::symlink_metadata(&destination).is_ok()
+        {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(&source, &destination);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Phase {
     /// Materializing into tmp; repo untouched. Recovery: delete tmp.
     Materializing,
+    /// Excluded paths moving from repo into tmp. Recovery: move back any
+    /// that already moved, then delete tmp.
+    Carrying,
     /// Atomic exchange in flight (or two-step: repo moved aside to tmp2).
     /// Recovery: if repo missing, move tmp into place; else delete tmp.
     Swapping,
@@ -386,11 +469,14 @@ pub async fn materialize_into(
 }
 
 /// Executes a rewind against the store's repo. Called from the pipeline with
-/// captures paused; the caller re-baselines afterwards.
+/// captures paused; the caller re-baselines afterwards. Excluded paths are
+/// carried from the live tree into the restored one: no checkpoint holds
+/// them, so the working copy is the only copy.
 pub async fn execute(
     store: &Store,
     target: GenerationId,
     trash_ttl_days: u32,
+    exclusions: &Exclusions,
 ) -> Result<RewindOutcome> {
     let repo = &store.repo_root;
     let parent = repo
@@ -414,6 +500,7 @@ pub async fn execute(
             repo_root: repo.clone(),
             tmp: tmp.clone(),
             phase: Phase::Materializing,
+            carried: Vec::new(),
         },
     )?;
     let mut checkout = store.checkout_exact(target).await?;
@@ -436,7 +523,34 @@ pub async fn execute(
         EngineError::Restore(format!("materialize: {error:?}"))
     })?;
 
-    // 2. Atomic exchange: repo <-> tmp. After this the old tree is at `tmp`.
+    // 2. Carry the live excluded paths into the new tree. Journaled first,
+    // so a crash mid-carry can move them back.
+    let carried: Vec<PathBuf> = exclusions
+        .host_paths()
+        .into_iter()
+        .filter(|relative| std::fs::symlink_metadata(repo.join(relative)).is_ok())
+        .collect();
+    if !carried.is_empty() {
+        write_journal(
+            &journal_path,
+            &Journal {
+                target_generation: hex::encode(target.digest().as_bytes()),
+                repo_root: repo.clone(),
+                tmp: tmp.clone(),
+                phase: Phase::Carrying,
+                carried: carried.clone(),
+            },
+        )?;
+        if let Err(error) = carry(repo, &tmp, &carried) {
+            // Undo what moved, then abandon the rewind with the repo whole.
+            move_back(&tmp, repo, &carried);
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_file(&journal_path);
+            return Err(error);
+        }
+    }
+
+    // 3. Atomic exchange: repo <-> tmp. After this the old tree is at `tmp`.
     write_journal(
         &journal_path,
         &Journal {
@@ -444,11 +558,12 @@ pub async fn execute(
             repo_root: repo.clone(),
             tmp: tmp.clone(),
             phase: Phase::Swapping,
+            carried: carried.clone(),
         },
     )?;
     atomic_exchange(repo, &tmp)?;
 
-    // 3. Old tree to trash (best effort: EXDEV falls back to a sibling path).
+    // 4. Old tree to trash (best effort: EXDEV falls back to a sibling path).
     let trash_root = store.paths.trash();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -488,14 +603,24 @@ pub fn recover(journal_path: &Path) -> Result<Option<Journal>> {
             // Repo untouched; the partial tmp tree is garbage.
             let _ = std::fs::remove_dir_all(&journal.tmp);
         }
+        Phase::Carrying => {
+            // Some excluded paths may already sit in tmp: bring them home,
+            // then drop the unused new tree.
+            move_back(&journal.tmp, &journal.repo_root, &journal.carried);
+            let _ = std::fs::remove_dir_all(&journal.tmp);
+        }
         Phase::Swapping => {
             if !journal.repo_root.exists() && journal.tmp.exists() {
-                // Two-step fallback died between renames: finish it.
+                // Two-step fallback died between renames: finish it. The
+                // carried paths are inside tmp and come along.
                 std::fs::rename(&journal.tmp, &journal.repo_root)?;
             } else {
                 // Exchange is atomic: repo is whole; tmp holds either the old
                 // tree (swap done — keep it out of the way) or the unused new
                 // tree (swap never happened). Either way it is not the repo.
+                // Carried paths live in whichever tree is new: if that is
+                // still tmp, they must come back before tmp goes.
+                move_back(&journal.tmp, &journal.repo_root, &journal.carried);
                 let _ = std::fs::remove_dir_all(&journal.tmp);
             }
         }
@@ -592,6 +717,7 @@ mod tests {
             repo_root: repo.to_path_buf(),
             tmp: tmp.to_path_buf(),
             phase,
+            carried: Vec::new(),
         }
     }
 
@@ -642,5 +768,90 @@ mod tests {
         assert!(recover(&work.path().join("missing.json"))
             .expect("recover")
             .is_none());
+    }
+
+    #[test]
+    fn recover_mid_carry_returns_excluded_paths_to_the_repo() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir_all(repo.join("secrets")).expect("repo");
+        std::fs::create_dir_all(tmp.join("secrets")).expect("tmp");
+        // .env already moved into tmp; secrets/key.pem had not moved yet.
+        std::fs::write(tmp.join(".env"), b"LIVE").expect("moved");
+        std::fs::write(repo.join("secrets/key.pem"), b"KEY").expect("unmoved");
+        let journal_path = work.path().join("journal.json");
+        let mut entry = journal(&repo, &tmp, Phase::Carrying);
+        entry.carried = vec![PathBuf::from(".env"), PathBuf::from("secrets/key.pem")];
+        write(&journal_path, &entry);
+
+        recover(&journal_path).expect("recover");
+        assert_eq!(std::fs::read(repo.join(".env")).expect("back"), b"LIVE");
+        assert_eq!(
+            std::fs::read(repo.join("secrets/key.pem")).expect("kept"),
+            b"KEY"
+        );
+        assert!(!tmp.exists(), "unused new tree removed");
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn recover_before_the_swap_keeps_carried_paths_out_of_the_discarded_tree() {
+        // Swapping phase, but the exchange never ran: repo is the old tree
+        // (minus the carried paths), tmp is the new tree holding them.
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        std::fs::write(repo.join("file.txt"), b"old").expect("old");
+        std::fs::write(tmp.join("file.txt"), b"new").expect("new");
+        std::fs::write(tmp.join(".env"), b"LIVE").expect("carried");
+        let journal_path = work.path().join("journal.json");
+        let mut entry = journal(&repo, &tmp, Phase::Swapping);
+        entry.carried = vec![PathBuf::from(".env")];
+        write(&journal_path, &entry);
+
+        recover(&journal_path).expect("recover");
+        assert_eq!(std::fs::read(repo.join("file.txt")).expect("repo"), b"old");
+        assert_eq!(
+            std::fs::read(repo.join(".env")).expect("carried back"),
+            b"LIVE"
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn recover_after_the_swap_leaves_carried_paths_in_the_new_tree() {
+        // Exchange completed: repo is the new tree with the carried paths,
+        // tmp is the old tree without them. Nothing moves; tmp goes.
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        std::fs::write(repo.join("file.txt"), b"new").expect("new");
+        std::fs::write(repo.join(".env"), b"LIVE").expect("carried");
+        std::fs::write(tmp.join("file.txt"), b"old").expect("old");
+        let journal_path = work.path().join("journal.json");
+        let mut entry = journal(&repo, &tmp, Phase::Swapping);
+        entry.carried = vec![PathBuf::from(".env")];
+        write(&journal_path, &entry);
+
+        recover(&journal_path).expect("recover");
+        assert_eq!(std::fs::read(repo.join("file.txt")).expect("repo"), b"new");
+        assert_eq!(
+            std::fs::read(repo.join(".env")).expect("still here"),
+            b"LIVE"
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn journals_written_before_exclusions_still_decode() {
+        let text =
+            r#"{"target_generation":"00","repo_root":"/r","tmp":"/t","phase":"Materializing"}"#;
+        let journal: Journal = serde_json::from_str(text).expect("decode");
+        assert!(journal.carried.is_empty());
     }
 }

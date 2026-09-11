@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod diff;
+pub mod exclude;
 pub mod fork;
 pub mod guard;
 pub mod index;
