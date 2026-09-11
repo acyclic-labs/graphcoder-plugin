@@ -2,7 +2,7 @@
 
 **A local product with plugin distribution.** The product is an agent-native state engine that runs on your machine — snapshots, forks, and indexing over your working tree. The plugins are thin adapters that deliver it through Claude Code, Codex, OpenCode, and any agent that can run a shell command. The engine is the moat; the plugins are the channel.
 
-> Status: design phase. The spec lives on the [Acyclic plugins docs page](https://acyclic.dev/docs/plugins); this repo is where it becomes code.
+> Status: Launches 1–4 built (Rewind, Timeline, Forks, Safe Mode), acceptance suites green on macOS and Linux, packaged for npm as `@acyclic-labs/plugin`. Remaining before public release: Phase 4 hardening (retention/GC, snapshot exclusions and purge, signed artifacts, install.sh). Launch 5 (Monorepo) is spec. The spec lives on the [Acyclic plugins docs page](https://acyclic.dev/docs/plugins).
 
 ## Thesis
 
@@ -15,17 +15,19 @@ V1 is entirely local: no sandboxes, no managed sessions, no cloud sync. It ships
 One engine, thin adapters:
 
 - **`acyclic` CLI + daemon** — watcher, Merkle-DAG snapshot store, index. Host-agnostic.
-- **Per-host adapters** — Claude Code (hooks + slash commands + skill), Codex (AGENTS.md + CLI/MCP), OpenCode (plugin), anything else (`acyclic install --agents-md`).
+- **Per-host adapters** — Claude Code (built: hooks, `/rewind` `/timeline` `/fork`, two skills; `acyclic install claude-code`), anything shell-capable (built: `acyclic install agents-md`), Codex and OpenCode (planned).
 
 ## Launch plan
 
-| Launch | Name | Engine increment | Story |
-|---|---|---|---|
-| 1 | Rewind | Merkle snapshot store + host hooks | Never fear letting the agent loose |
-| 2 | Timeline | Turn-linked metadata index | The repo at any point in the conversation |
-| 3 | Forks | Copy-on-write materialization | N parallel attempts, pick the winner |
-| 4 | Safe Mode | Session redirection + interposition | Agents on the codebase, not agents' mistakes in it |
-| 5 | Monorepo | Merkle-aware content + symbol index | The repo that finally works with agents |
+| Launch | Name | Engine increment | Story | Status |
+|---|---|---|---|---|
+| 1 | Rewind | Merkle snapshot store + host hooks | Never fear letting the agent loose | built (`tests/acceptance/journey.sh`, `crash.sh`, `soak.sh`, `latency.sh`, `claude-e2e.sh`) |
+| 2 | Timeline | Turn-linked metadata index | The repo at any point in the conversation | built (`timeline.sh`) |
+| 3 | Forks | Copy-on-write materialization | N parallel attempts, pick the winner | built: mounted forks, promote with three-way merge (`forks.sh`, `merge.sh`, `claude-merge-e2e.sh`) |
+| 4 | Safe Mode | Session redirection + interposition | Agents on the codebase, not agents' mistakes in it | built, needs the native mount layer (`safe-mode.sh`) |
+| 5 | Monorepo | Merkle-aware content + symbol index | The repo that finally works with agents | not started |
+
+Run everything with `tests/acceptance/run-all.sh`; the live Claude Code scenarios are gated by `ACYCLIC_E2E=1`.
 
 Full feature lists, user journeys, and technical requirements per launch: [docs/plugins](https://acyclic.dev/docs/plugins).
 
