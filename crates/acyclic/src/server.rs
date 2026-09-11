@@ -19,6 +19,7 @@ use acyclic_fs::{
     mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
     NativeMountRequest, NativeMountSession, RoutedMountSource,
 };
+use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -122,7 +123,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     }
     if !mounts.available {
         eprintln!(
-            "acyclic daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
+            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
             mounts.reason.as_deref().unwrap_or("unknown reason")
         );
     }
@@ -476,7 +477,7 @@ impl Server {
                                     .by_generation_prefix(&hex)
                                     .map_err(stringify)?
                                     .ok_or(format!(
-                                        "no checkpoint has a generation starting {hex}; `acyclic timeline` lists row ids"
+                                        "no checkpoint has a generation starting {hex}; `{NAME} timeline` lists row ids"
                                     ))?,
                             )),
                             (None, None) => Ok(None),
@@ -536,7 +537,7 @@ impl Server {
                     let fork = self.forks.lock().await.remove(&id);
                     let copy_dir = fork.and_then(|fork| fork.copy_dir);
                     if let Err(error) = self.discard_fork_workspace(&id, copy_dir.as_deref()).await {
-                        eprintln!("acyclic daemon: drop scratch fork {id}: {error}");
+                        eprintln!("{NAME} daemon: drop scratch fork {id}: {error}");
                     }
                 }
                 Ok(proto::Reply::Unit)
@@ -676,7 +677,7 @@ impl Server {
                 // Landed: the fork is consumed. Drop its route (mount fork)
                 // or its directory (copy fork).
                 if let Err(error) = self.discard_fork_workspace(&id, fork.copy_dir.as_deref()).await {
-                    eprintln!("acyclic daemon: discard fork {id} after promote: {error}");
+                    eprintln!("{NAME} daemon: discard fork {id} after promote: {error}");
                 }
                 match landed {
                     Landed::Replayed {
@@ -1322,8 +1323,8 @@ impl Server {
                 .map_err(|error| {
                     format!(
                         "merge stopped at {} after {written} path(s): {error}. The tree is partially \
-                         merged; `acyclic rewind <id>` of the `before promote ... (merge)` row in \
-                         `acyclic timeline` returns to the pre-merge tree",
+                         merged; `{NAME} rewind <id>` of the `before promote ... (merge)` row in \
+                         `{NAME} timeline` returns to the pre-merge tree",
                         root.display()
                     )
                 })?;
@@ -1443,7 +1444,7 @@ impl Server {
         // (FSKit caches until told otherwise): invalidate it eagerly.
         if let Some(session) = mount.session.as_ref() {
             if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes())) {
-                eprintln!("acyclic daemon: invalidate {id}: {error:?}");
+                eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
             }
         }
         if mount.router.is_empty() {
@@ -1474,7 +1475,7 @@ impl Server {
         let row = row.ok_or_else(|| "no matching checkpoint".to_string())?;
         if !row.is_restorable() {
             return Err(format!(
-                "checkpoint #{} records a failed capture, not a tree state; pick another from `acyclic timeline`",
+                "checkpoint #{} records a failed capture, not a tree state; pick another from `{NAME} timeline`",
                 row.id
             ));
         }

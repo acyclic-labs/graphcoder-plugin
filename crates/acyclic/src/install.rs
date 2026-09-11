@@ -7,6 +7,7 @@
 //! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
 //! shell-capable agent.
 
+use acyclic_engine::product::{self, NAME};
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -24,21 +25,23 @@ pub fn run(repo: &Path, host: &str) -> Result<(), String> {
 fn claude_code(repo: &Path) -> Result<(), String> {
     let claude_dir = repo.join(".claude");
     std::fs::create_dir_all(claude_dir.join("commands")).map_err(stringify)?;
-    std::fs::create_dir_all(claude_dir.join("skills/acyclic-self-rollback")).map_err(stringify)?;
-    std::fs::create_dir_all(claude_dir.join("skills/acyclic-fork-decompose")).map_err(stringify)?;
+    let rollback_skill = format!("skills/{NAME}-self-rollback");
+    let decompose_skill = format!("skills/{NAME}-fork-decompose");
+    std::fs::create_dir_all(claude_dir.join(&rollback_skill)).map_err(stringify)?;
+    std::fs::create_dir_all(claude_dir.join(&decompose_skill)).map_err(stringify)?;
 
     merge_hooks(&claude_dir.join("settings.json"))?;
-    std::fs::write(claude_dir.join("commands/rewind.md"), REWIND_COMMAND).map_err(stringify)?;
-    std::fs::write(claude_dir.join("commands/timeline.md"), TIMELINE_COMMAND).map_err(stringify)?;
+    std::fs::write(claude_dir.join("commands/rewind.md"), product::render(REWIND_COMMAND)).map_err(stringify)?;
+    std::fs::write(claude_dir.join("commands/timeline.md"), product::render(TIMELINE_COMMAND)).map_err(stringify)?;
     std::fs::write(
-        claude_dir.join("skills/acyclic-self-rollback/SKILL.md"),
-        SELF_ROLLBACK_SKILL,
+        claude_dir.join(format!("{rollback_skill}/SKILL.md")),
+        product::render(SELF_ROLLBACK_SKILL),
     )
     .map_err(stringify)?;
-    std::fs::write(claude_dir.join("commands/fork.md"), FORK_COMMAND).map_err(stringify)?;
+    std::fs::write(claude_dir.join("commands/fork.md"), product::render(FORK_COMMAND)).map_err(stringify)?;
     std::fs::write(
-        claude_dir.join("skills/acyclic-fork-decompose/SKILL.md"),
-        FORK_DECOMPOSE_SKILL,
+        claude_dir.join(format!("{decompose_skill}/SKILL.md")),
+        product::render(FORK_DECOMPOSE_SKILL),
     )
     .map_err(stringify)?;
 
@@ -48,7 +51,7 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     );
     println!("  hooks:    .claude/settings.json (pre/post tool, prompt, session)");
     println!("  commands: /rewind, /timeline, /fork");
-    println!("  skills:   acyclic-self-rollback, acyclic-fork-decompose");
+    println!("  skills:   {NAME}-self-rollback, {NAME}-fork-decompose");
     println!("check these files in so the whole team inherits checkpointing.");
     Ok(())
 }
@@ -68,16 +71,16 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
         (
             "PreToolUse",
             Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            "acyclic hook pre-tool",
+            &format!("{NAME} hook pre-tool"),
         ),
         (
             "PostToolUse",
             Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            "acyclic hook post-tool",
+            &format!("{NAME} hook post-tool"),
         ),
-        ("UserPromptSubmit", None, "acyclic hook user-prompt"),
-        ("SessionStart", None, "acyclic hook session-start"),
-        ("SessionEnd", None, "acyclic hook session-end"),
+        ("UserPromptSubmit", None, &format!("{NAME} hook user-prompt")),
+        ("SessionStart", None, &format!("{NAME} hook session-start")),
+        ("SessionEnd", None, &format!("{NAME} hook session-end")),
     ];
 
     let hooks = settings
@@ -116,23 +119,23 @@ fn is_ours(entry: &Value) -> bool {
         .into_iter()
         .flatten()
         .filter_map(|hook| hook["command"].as_str())
-        .any(|command| command == "acyclic" || command.starts_with("acyclic hook"))
+        .any(|command| command == NAME || command.starts_with(&format!("{NAME} hook")))
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
     let path = repo.join("AGENTS.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.contains("## Acyclic checkpoints") {
-        println!("AGENTS.md already carries the acyclic block");
+    if existing.contains(&format!("## {NAME} checkpoints")) {
+        println!("AGENTS.md already carries the {NAME} block");
         return Ok(());
     }
     let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(AGENTS_MD_BLOCK);
+    content.push_str(&product::render(AGENTS_MD_BLOCK));
     std::fs::write(&path, content).map_err(stringify)?;
-    println!("acyclic block appended to {}", path.display());
+    println!("{NAME} block appended to {}", path.display());
     Ok(())
 }
 
@@ -144,12 +147,12 @@ const REWIND_COMMAND: &str = r#"---
 description: Restore the working tree to an earlier checkpoint (untracked and gitignored files included)
 ---
 
-Restore this repo to an earlier acyclic checkpoint. Follow exactly:
+Restore this repo to an earlier {{name}} checkpoint. Follow exactly:
 
-1. Run `acyclic timeline` and show the user the recent checkpoints.
+1. Run `{{name}} timeline` and show the user the recent checkpoints.
 2. Ask which checkpoint to restore (or confirm if they already named one:
    $ARGUMENTS).
-3. Run `acyclic rewind <id> --yes`.
+3. Run `{{name}} rewind <id> --yes`.
 4. Run `cd "$PWD"` in your shell. A rewind swaps the repo directory, and a
    shell that stays in the old inode silently runs every later command in
    the replaced tree.
@@ -164,21 +167,21 @@ const TIMELINE_COMMAND: &str = r#"---
 description: Show the repo's history as conversation turns, diff what a turn changed, or restore one file from an earlier point
 ---
 
-Answer the user's history question with acyclic's timeline. Request:
+Answer the user's history question with {{name}}'s timeline. Request:
 $ARGUMENTS
 
 Pick the matching step:
 
-- "What happened / what did each turn do": run `acyclic turns` (add
-  `--session <id>` for an older session from `acyclic sessions`) and
+- "What happened / what did each turn do": run `{{name}} turns` (add
+  `--session <id>` for an older session from `{{name}} sessions`) and
   summarize which prompt led to which checkpoints.
 - "What did turn N change" or "what did approach X look like": run
-  `acyclic diff --turn N` and list the files; for an abandoned attempt the
-  session brief names its checkpoint range, so `acyclic diff <a> <b>`.
-- "Why did file X change": run `acyclic timeline --limit 200`, then
-  `acyclic show <id>` on the checkpoint after the change to get the turn
+  `{{name}} diff --turn N` and list the files; for an abandoned attempt the
+  session brief names its checkpoint range, so `{{name}} diff <a> <b>`.
+- "Why did file X change": run `{{name}} timeline --limit 200`, then
+  `{{name}} show <id>` on the checkpoint after the change to get the turn
   and the prompt that caused it.
-- "Bring back just file X from earlier": `acyclic restore <id> <path>`.
+- "Bring back just file X from earlier": `{{name}} restore <id> <path>`.
   Only that path changes; the rest of the tree is untouched. Tell the user
   a checkpoint recorded the restore, so it is itself undoable.
 
@@ -186,84 +189,84 @@ Never guess at history from memory when the timeline can answer exactly.
 "#;
 
 const SELF_ROLLBACK_SKILL: &str = r#"---
-name: acyclic-self-rollback
-description: Use acyclic checkpoints to try risky changes safely - checkpoint before an attempt, rewind cleanly on failure instead of hand-reverting, and show a blast-radius diff before finishing. Use when a task is risky (migrations, refactors, codegen, dependency changes), when a failed attempt needs undoing, or before declaring multi-file work done.
+name: {{name}}-self-rollback
+description: Use {{name}} checkpoints to try risky changes safely - checkpoint before an attempt, rewind cleanly on failure instead of hand-reverting, and show a blast-radius diff before finishing. Use when a task is risky (migrations, refactors, codegen, dependency changes), when a failed attempt needs undoing, or before declaring multi-file work done.
 ---
 
-# Self-rollback with acyclic
+# Self-rollback with {{name}}
 
-This repo checkpoints automatically around your tool calls (an acyclic
+This repo checkpoints automatically around your tool calls (an {{name}}
 daemon snapshots the working tree, including untracked and gitignored
 files). You can also use it deliberately:
 
 ## Before a risky attempt
-Run `acyclic checkpoint --wait -m "before <attempt>"`. Note the printed
+Run `{{name}} checkpoint --wait -m "before <attempt>"`. Note the printed
 checkpoint id.
 
 ## When an attempt fails
 Do NOT hand-revert edits (more edits poison the tree). Instead:
-1. `acyclic timeline` - find the checkpoint from before the attempt.
-2. `acyclic rewind <id> --yes` - the tree is back exactly, including
+1. `{{name}} timeline` - find the checkpoint from before the attempt.
+2. `{{name}} rewind <id> --yes` - the tree is back exactly, including
    generated files and Bash side effects.
 3. Try the next approach from the clean state.
 
 ## Before declaring work done
-Run `acyclic diff --stat` and review the blast radius: every file the
+Run `{{name}} diff --stat` and review the blast radius: every file the
 session changed, including what scripts and generators wrote. Mention
 anything unexpected to the user.
 
 ## History across the conversation
 Every checkpoint is linked to the conversation turn (prompt) that caused
 it, and history survives across sessions:
-- `acyclic turns` - which prompt led to which checkpoints.
-- `acyclic diff --turn N` - exactly what turn N changed.
-- `acyclic show <id>` - a checkpoint's session, turn, and prompt.
-- `acyclic restore <id> <path>` - bring back ONE file from any checkpoint
+- `{{name}} turns` - which prompt led to which checkpoints.
+- `{{name}} diff --turn N` - exactly what turn N changed.
+- `{{name}} show <id>` - a checkpoint's session, turn, and prompt.
+- `{{name}} restore <id> <path>` - bring back ONE file from any checkpoint
   (an earlier abandoned approach, say) without touching the rest.
 The session-start brief in your context names the previous session's end
 checkpoint and any abandoned branches; use their ids directly.
 
 ## Rules
-- After ANY `acyclic rewind` or `acyclic promote`, run `cd "$PWD"` before
+- After ANY `{{name}} rewind` or `{{name}} promote`, run `cd "$PWD"` before
   the next command. Both swap the repo directory; a shell left in the old
   inode silently operates on the replaced tree.
 - Rewind restores file contents and modes, not mtimes: expect rebuilds.
-- Paths listed under `exclude` in .acyclic/config.toml (secrets, bulky
+- Paths listed under `exclude` in .{{name}}/config.toml (secrets, bulky
   generated state) are never checkpointed: a rewind leaves them exactly
-  as they are now, and `acyclic restore` refuses them. Do not rely on a
+  as they are now, and `{{name}} restore` refuses them. Do not rely on a
   checkpoint to undo an edit to an excluded file.
 - After a rewind, the user's editor may show stale buffers - say so.
-- If `acyclic` reports the daemon is not running, checkpointing is off;
-  tell the user to run `acyclic init` rather than working around it.
+- If `{{name}}` reports the daemon is not running, checkpointing is off;
+  tell the user to run `{{name}} init` rather than working around it.
 "#;
 
 const FORK_COMMAND: &str = r#"---
 description: Race N approaches to a task in isolated forks and land the winner, or run one risky step in a fork first
 ---
 
-Use the acyclic-fork-decompose skill for this request. Arguments: $ARGUMENTS
+Use the {{name}}-fork-decompose skill for this request. Arguments: $ARGUMENTS
 
 Parse the arguments for parameter overrides in the form `key=value`
 (fan_out, max_depth, max_forks, require_tests, test_command, tie_break);
-everything else is the task. Run `acyclic policy` for the defaults, apply
+everything else is the task. Run `{{name}} policy` for the defaults, apply
 the overrides, and state the effective parameters in one line before
 forking.
 "#;
 
 const FORK_DECOMPOSE_SKILL: &str = r#"---
-name: acyclic-fork-decompose
-description: Solve a large or uncertain task with isolated acyclic forks - race alternative approaches and land one winner, partition independent parts across forks and land them all, or prove a risky step in a fork before it touches the real tree. Use when two or more designs are plausible, when a task splits into parts that touch different files, or when the user runs /fork. Not for small edits: checkpoint and do those in place.
+name: {{name}}-fork-decompose
+description: Solve a large or uncertain task with isolated {{name}} forks - race alternative approaches and land one winner, partition independent parts across forks and land them all, or prove a risky step in a fork before it touches the real tree. Use when two or more designs are plausible, when a task splits into parts that touch different files, or when the user runs /fork. Not for small edits: checkpoint and do those in place.
 ---
 
-# Fork decomposition with acyclic
+# Fork decomposition with {{name}}
 
 You are the ROOT agent in the real repository. Only the root can fork.
-Subagents work inside fork directories and NEVER run `acyclic`. Recursion
+Subagents work inside fork directories and NEVER run `{{name}}`. Recursion
 is you repeating ROUND: fork, race, promote one, re-fork from the new tree.
 
 ## 0. Parameters (read first, every time)
 
-Run `acyclic policy`. It prints:
+Run `{{name}} policy`. It prints:
 
 ```
 fan_out = N          forks per race
@@ -281,7 +284,7 @@ effective values in ONE line before the first fork, e.g.
 ## 1. Decide ONCE, locally: DO, RACE, PARTITION, or SEQUENCE
 
 - **DO** — one obvious approach, or a handful of edits. Run
-  `acyclic checkpoint -m "before <task>"` and work in the real tree.
+  `{{name}} checkpoint -m "before <task>"` and work in the real tree.
   If unsure, prefer DO. Rewind already makes a wrong turn cheap; a fork
   must beat rewind, not beat nothing.
 - **RACE** — one goal, 2 or more genuinely different approaches, and a
@@ -308,8 +311,8 @@ effective values in ONE line before the first fork, e.g.
 
 Depth starts at 1 and increases by one per round.
 
-1. `acyclic checkpoint -m "round <depth>: before <goal>"`.
-2. `acyclic fork -n <fan_out>`. Note each id and path and whether it says
+1. `{{name}} checkpoint -m "round <depth>: before <goal>"`.
+2. `{{name}} fork -n <fan_out>`. Note each id and path and whether it says
    `(mount)` or `(copy)`. Copy forks cost time proportional to the tree:
    keep them few and short-lived.
 3. Dispatch ALL subagents in one turn, one per fork, using the CHILD
@@ -317,14 +320,14 @@ Depth starts at 1 and increases by one per round.
 4. **Freeze.** Make NO edits to the real tree while forks are live. A
    real-tree edit merges like another fork would: fine when disjoint,
    a conflict to resolve when it touches the same lines.
-5. When all reports are in, `acyclic fork-diff <id>` for each fork.
-6. RACE: pick the winner by the SELECTION RULE and `acyclic promote <winner>`.
-   PARTITION: `acyclic promote <id>` for every fork that passed, in
+5. When all reports are in, `{{name}} fork-diff <id>` for each fork.
+6. RACE: pick the winner by the SELECTION RULE and `{{name}} promote <winner>`.
+   PARTITION: `{{name}} promote <id>` for every fork that passed, in
    dispatch order. Every promote writes the fork's paths into the real
    tree in place; the repo directory is never replaced.
 7. Read each promote's output: `promoted` / `promoted by merge` landed;
    `N file(s) conflict` wrote markers into that fork (see section 6).
-8. `acyclic fork-drop <id>` for every fork you will not land, immediately.
+8. `{{name}} fork-drop <id>` for every fork you will not land, immediately.
 9. Report the round in the ROUND REPORT shape.
 10. If work remains and depth < max_depth and forks used < max_forks,
     start the next round from the promoted tree. Otherwise stop and
@@ -336,7 +339,7 @@ Depth starts at 1 and increases by one per round.
 You are working in an isolated fork of the repository at:
   <absolute fork path>
 Use ONLY absolute paths under that directory. Do not cd elsewhere. Do not
-run any `acyclic` command: this directory is a fork, not the repository.
+run any `{{name}}` command: this directory is a fork, not the repository.
 Do not read or write the real repository at <absolute repo root>.
 
 GOAL: <one sentence, verbatim from the task>
@@ -371,7 +374,7 @@ Reply with exactly this shape and nothing else:
    named in each child's approach text, then stop and report. Never
    promote a partial without saying so in the report.
 4. If several remain, apply `tie_break`:
-   - `smallest-diff`: fewest paths in `acyclic fork-diff`, not counting
+   - `smallest-diff`: fewest paths in `{{name}} fork-diff`, not counting
      `m` (metadata) lines or `(gitignored)` lines, then fewest RISKS.
    - `first-passing`: the first fork id in dispatch order that passed.
    - `ask-user`: show each candidate's fork-diff and RISKS, ask, wait.
@@ -388,7 +391,7 @@ round <depth>/<max_depth> · <goal>
   forks used <n>/<max_forks>
 ```
 
-After the final round: `acyclic diff <first checkpoint> <latest>` and
+After the final round: `{{name}} diff <first checkpoint> <latest>` and
 summarise the blast radius, ignoring `m` (metadata-only) lines. Mention
 anything a script or generator wrote.
 
@@ -398,7 +401,7 @@ anything a script or generator wrote.
   markers into THAT FORK (the mainline is untouched) and moved the fork
   onto the current tree. Open each named file in the fork, resolve every
   `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` block (the middle block is
-  the original), leave no markers, then `acyclic promote <id>` again. A
+  the original), leave no markers, then `{{name}} promote <id>` again. A
   `(deleted)` label means one side deleted the file: keep it without
   markers or delete it. `unresolved conflict markers` means a block is
   still there.
@@ -407,9 +410,9 @@ anything a script or generator wrote.
   other) cannot be resolved in place: one fork must own that path. The
   fork is untouched; re-fork from the current tree and redo that part
   with tighter ownership.
-- `acyclic forks` says none are live after a daemon restart: every fork is
+- `{{name}} forks` says none are live after a daemon restart: every fork is
   lost. Re-run the round; nothing was landed.
-- `acyclic fork` fails with a mounts error: read `acyclic status`, tell the
+- `{{name}} fork` fails with a mounts error: read `{{name}} status`, tell the
   user what it says, and fall back to DO.
 - Two rounds in a row with no winner: stop and ask the user.
 
@@ -429,23 +432,23 @@ anything a script or generator wrote.
 "#;
 
 const AGENTS_MD_BLOCK: &str = r#"
-## Acyclic checkpoints
+## {{name}} checkpoints
 
-This repo uses acyclic: the working tree (untracked + gitignored files
+This repo uses {{name}}: the working tree (untracked + gitignored files
 included) is snapshotted by a local daemon. Useful commands:
 
-    acyclic checkpoint --wait -m "msg"   snapshot now, note the id
-    acyclic timeline                     recent checkpoints
-    acyclic rewind <id> --yes            restore the tree exactly
-    acyclic diff --stat                  everything changed this session
-    acyclic turns                        which prompt caused which checkpoints
-    acyclic diff --turn N                what one conversation turn changed
-    acyclic restore <id> <path>          bring back one file, leave the rest
-    acyclic brief                        where the previous session ended
+    {{name}} checkpoint --wait -m "msg"   snapshot now, note the id
+    {{name}} timeline                     recent checkpoints
+    {{name}} rewind <id> --yes            restore the tree exactly
+    {{name}} diff --stat                  everything changed this session
+    {{name}} turns                        which prompt caused which checkpoints
+    {{name}} diff --turn N                what one conversation turn changed
+    {{name}} restore <id> <path>          bring back one file, leave the rest
+    {{name}} brief                        where the previous session ended
 
 Before a risky change, checkpoint. After a failed attempt, rewind instead
-of hand-reverting. Before finishing, review `acyclic diff`. Paths under
-`exclude` in .acyclic/config.toml are never checkpointed; a rewind leaves
+of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
+`exclude` in .{{name}}/config.toml are never checkpointed; a rewind leaves
 them untouched.
 "#;
 #[cfg(test)]
@@ -463,10 +466,11 @@ mod tests {
               "hooks": {
                 "PreToolUse": [
                   {"matcher": "Bash",
-                   "hooks": [{"type": "command", "command": "echo acyclic hook mention"}]}
+                   "hooks": [{"type": "command", "command": "echo NAME_HERE hook mention"}]}
                 ]
               }
-            }"#,
+            }"#
+            .replace("NAME_HERE", NAME),
         )
         .expect("seed");
 
@@ -481,7 +485,7 @@ mod tests {
         let pre = value["hooks"]["PreToolUse"].as_array().expect("array");
         assert!(pre
             .iter()
-            .any(|entry| { entry["hooks"][0]["command"] == "echo acyclic hook mention" }));
+            .any(|entry| { entry["hooks"][0]["command"] == format!("echo {NAME} hook mention") }));
         // Exactly one of ours per event, no duplicates after re-install.
         let ours = |event: &str| {
             value["hooks"][event]
@@ -511,7 +515,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
         assert_eq!(
             value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            "acyclic hook post-tool"
+            format!("{NAME} hook post-tool")
         );
         assert_eq!(
             value["hooks"]["PreToolUse"][0]["matcher"],
@@ -527,6 +531,6 @@ mod tests {
         agents_md(dir.path()).expect("second");
         let text = std::fs::read_to_string(dir.path().join("AGENTS.md")).expect("read");
         assert!(text.starts_with("# Existing\n"));
-        assert_eq!(text.matches("## Acyclic checkpoints").count(), 1);
+        assert_eq!(text.matches(&format!("## {NAME} checkpoints")).count(), 1);
     }
 }

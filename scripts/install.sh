@@ -1,5 +1,5 @@
 #!/bin/sh
-# acyclic installer: downloads the prebuilt binary for this machine from a
+# Installer: downloads the prebuilt binary for this machine from a
 # GitHub release, verifies it against the release's SHA256SUMS, and installs
 # it into a user-writable bin directory. No sudo, no package manager.
 #
@@ -13,6 +13,9 @@
 #                        how scripts/install-smoke.sh tests this script offline
 set -eu
 
+# This script is fetched on its own, so it cannot read product.toml. These
+# two lines mirror it; scripts/check-product-name.sh fails CI if they drift.
+NAME="acyclic"
 REPO="acyclic-labs/graphcoder-plugin"
 INSTALL_DIR="${ACYCLIC_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -29,7 +32,7 @@ case "$(uname -m)" in
   x86_64|amd64) cpu=x64 ;;
   *) die "unsupported CPU $(uname -m); see https://github.com/$REPO/releases" ;;
 esac
-asset="acyclic-$os-$cpu"
+asset="$NAME-$os-$cpu"
 
 if [ -n "${ACYCLIC_RELEASE_URL:-}" ]; then
   base="${ACYCLIC_RELEASE_URL%/}"
@@ -60,7 +63,7 @@ sha256_of() {
   fi
 }
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/acyclic-install.XXXXXX")"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/$NAME-install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 say "downloading $asset from $base"
@@ -75,15 +78,15 @@ got="$(sha256_of "$tmp/$asset")"
 mkdir -p "$INSTALL_DIR"
 chmod 0755 "$tmp/$asset"
 # Atomic replace so a running daemon keeps its old inode until restart.
-mv -f "$tmp/$asset" "$INSTALL_DIR/acyclic"
+mv -f "$tmp/$asset" "$INSTALL_DIR/$NAME"
 
-version="$("$INSTALL_DIR/acyclic" --version 2>/dev/null || true)"
+version="$("$INSTALL_DIR/$NAME" --version 2>/dev/null || true)"
 [ -n "$version" ] || die "installed binary does not run on this machine"
-say "installed $version to $INSTALL_DIR/acyclic"
+say "installed $version to $INSTALL_DIR/$NAME"
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) say "note: $INSTALL_DIR is not on your PATH; add it, e.g."
      say "  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
-say "next: cd your-repo && acyclic init && acyclic install claude-code"
+say "next: cd your-repo && $NAME init && $NAME install claude-code"

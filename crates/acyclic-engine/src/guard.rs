@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 fn guarded_error() -> MountSourceError {
-    MountSourceError::Unsupported("path is guarded by .acyclic/config.toml".to_owned())
+    MountSourceError::Unsupported(format!("path is guarded by {}", crate::product::repo_config_file()))
 }
 
 /// One guarded path prefix, pre-split into components for comparison

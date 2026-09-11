@@ -118,7 +118,7 @@ pub async fn restore_path_into(
     // filesystem; the parent must exist (it did at the checkpoint, but the
     // tree may have lost it since).
     std::fs::create_dir_all(parent)?;
-    let staged = parent.join(format!(".{name}.acyclic-restore-{}", std::process::id()));
+    let staged = parent.join(format!(".{name}.{}-restore-{}", crate::product::NAME, std::process::id()));
     let _ = remove_any(&staged);
     let written = write_node(
         &mut checkout,
@@ -306,7 +306,7 @@ pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
     }
     if components.is_empty() {
         return Err(EngineError::Restore(
-            "restoring the whole tree is `acyclic rewind`, not a path restore".into(),
+            format!("restoring the whole tree is `{} rewind`, not a path restore", crate::product::NAME),
         ));
     }
     Ok(components)
@@ -488,7 +488,7 @@ pub async fn execute(
         .to_string_lossy()
         .into_owned();
     let nonce = std::process::id();
-    let tmp = parent.join(format!(".{name}.acyclic-tmp-{nonce}"));
+    let tmp = parent.join(format!(".{name}.{}-tmp-{nonce}", crate::product::NAME));
     let journal_path = store.paths.rewind_journal();
 
     // 1. Materialize the target into an empty sibling directory.
@@ -573,7 +573,7 @@ pub async fn execute(
     let old_tree = match std::fs::rename(&tmp, &trashed) {
         Ok(()) => trashed,
         Err(_) => {
-            let sibling = parent.join(format!(".{name}.acyclic-trash-{stamp}"));
+            let sibling = parent.join(format!(".{name}.{}-trash-{stamp}", crate::product::NAME));
             std::fs::rename(&tmp, &sibling)?;
             sibling
         }

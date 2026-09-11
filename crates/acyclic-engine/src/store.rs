@@ -42,7 +42,7 @@ impl StorePaths {
             None => {
                 let home = std::env::var_os("HOME")
                     .ok_or_else(|| EngineError::Store("HOME is not set".into()))?;
-                Path::new(&home).join(".local/share/acyclic/stores")
+                Path::new(&home).join(format!(".local/share/{}/stores", crate::product::NAME))
             }
         };
         let canonical = repo_root
@@ -270,10 +270,10 @@ pub fn runtime_dir() -> PathBuf {
     let dir = {
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/acyclic-{uid}"))
+        PathBuf::from(format!("/tmp/{}-{uid}", crate::product::NAME))
     };
     #[cfg(not(unix))]
-    let dir = std::env::temp_dir().join("acyclic");
+    let dir = std::env::temp_dir().join(crate::product::NAME);
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(unix)]
     {

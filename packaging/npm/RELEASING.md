@@ -75,11 +75,11 @@ expected. Retry before assuming the publish failed.
 
 ## Cutting a release (GitHub workflow)
 
-1. Bump the version in exactly three places and keep them identical:
-   - `Cargo.toml` under `[workspace.package]`
-   - `packaging/npm/acyclic/package.json` `version`
-   - the four `optionalDependencies` in that same file
-   The `verify` job fails the release if any of them disagree.
+1. Bump the version in `Cargo.toml` under `[workspace.package]`. That is the
+   only version source: the npm launcher and platform packages are generated
+   from it at publish time (`packaging/npm/launcher-package.sh`,
+   `platform-package.sh`). The public name and npm package name come from
+   `product.toml`; the `verify` job runs `scripts/check-product-name.sh`.
 2. Merge that change to `main` and wait for `ci` to pass.
 3. Dry run first. Actions, release, Run workflow, leave `dry_run` checked.
    This builds all four binaries, attests them, verifies the attestations,

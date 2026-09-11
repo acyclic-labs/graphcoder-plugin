@@ -8,6 +8,7 @@ mod server;
 
 use std::path::{Path, PathBuf};
 
+use acyclic_engine::product::{self, NAME};
 use acyclic_proto as proto;
 use clap::{Parser, Subcommand};
 
@@ -17,13 +18,13 @@ use client::{Client, ConnectError, Spawn};
 const EXIT_NO_DAEMON: i32 = 2;
 
 #[derive(Parser)]
-#[command(name = "acyclic", version, about)]
+#[command(name = product::NAME, bin_name = product::NAME, version, about)]
 struct Cli {
     /// Repo root (defaults to the current directory).
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
     /// Hook mode: never spawn a daemon; exit 2 quietly if one isn't running.
-    #[arg(long, global = true, env = "ACYCLIC_HOOK")]
+    #[arg(long, global = true, env = product::HOOK_ENV)]
     hook: bool,
     #[command(subcommand)]
     command: Command,
@@ -92,7 +93,7 @@ enum Command {
     /// Restore one or more paths from a checkpoint, leaving the rest of the
     /// tree untouched.
     Restore {
-        /// Checkpoint id from `acyclic timeline`.
+        /// Checkpoint id from `{NAME} timeline`.
         checkpoint: i64,
         /// Paths relative to the repo root.
         #[arg(required = true)]
@@ -100,7 +101,7 @@ enum Command {
     },
     /// Restore the tree to a checkpoint (untracked files included).
     Rewind {
-        /// Checkpoint id from `acyclic timeline`.
+        /// Checkpoint id from `{NAME} timeline`.
         target: Option<i64>,
         /// Rewind to the most recent checkpoint.
         #[arg(long)]
@@ -114,7 +115,7 @@ enum Command {
     },
     /// Blast radius: what changed between two checkpoints, or in one turn.
     Diff {
-        /// A checkpoint row id from `acyclic timeline`, or a generation hex
+        /// A checkpoint row id from `{NAME} timeline`, or a generation hex
         /// prefix as printed by `promote`/`status`.
         before: Option<String>,
         after: Option<String>,
@@ -209,7 +210,7 @@ fn main() {
     // real tree is back before we read anything.
     acyclic_engine::fork::reap_dead_shadow(&repo_arg);
     let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
-        eprintln!("acyclic: bad repo path: {error}");
+        eprintln!("{}: bad repo path: {error}", product::NAME);
         std::process::exit(1);
     });
     if cli.repo.is_none() && stranded_in_trash(&repo) {
@@ -217,7 +218,8 @@ fn main() {
         // was inside it now resolves its cwd to the replaced tree in trash.
         // Every verb would otherwise target a store that does not exist.
         eprintln!(
-            "acyclic: your shell is inside a tree that a rewind replaced ({});\n  re-enter the repo first:  cd \"$PWD\"",
+            "{}: your shell is inside a tree that a rewind replaced ({});\n  re-enter the repo first:  cd \"$PWD\"",
+            product::NAME,
             repo.display()
         );
         std::process::exit(1);
@@ -240,7 +242,7 @@ fn stranded_in_trash(repo: &Path) -> bool {
                 .map(|store| store.join("meta.json").is_file())
                 .unwrap_or(false);
         }
-        name.starts_with('.') && name.contains(".acyclic-trash-")
+        name.starts_with('.') && name.contains(&format!(".{}-trash-", product::NAME))
     })
 }
 
@@ -258,7 +260,7 @@ mod stranded_tests {
         assert!(stranded_in_trash(&trashed));
         assert!(stranded_in_trash(trashed.parent().unwrap()));
 
-        let sibling = work.path().join(".demo.acyclic-trash-1789144724/src");
+        let sibling = work.path().join(format!(".demo.{}-trash-1789144724/src", super::product::NAME));
         std::fs::create_dir_all(&sibling).expect("sibling");
         assert!(stranded_in_trash(&sibling));
 
@@ -275,7 +277,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         Command::Daemon { repo_root } => match server::run(&repo_root) {
             Ok(()) => 0,
             Err(message) => {
-                eprintln!("acyclic daemon: {message}");
+                eprintln!("{} daemon: {message}", product::NAME);
                 1
             }
         },
@@ -288,7 +290,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                 0
             }
             Err(message) => {
-                eprintln!("acyclic install: {message}");
+                eprintln!("{} install: {message}", product::NAME);
                 1
             }
         },
@@ -301,18 +303,18 @@ fn run(cli: Cli, repo: &Path) -> i32 {
             let mut client = match connect(repo, spawn) {
                 Ok(client) => client,
                 Err(ConnectError::NoDaemon) => {
-                    eprintln!("acyclic: daemon not running; checkpoint skipped");
+                    eprintln!("{}: daemon not running; checkpoint skipped", product::NAME);
                     return EXIT_NO_DAEMON;
                 }
                 Err(ConnectError::Other(message)) => {
-                    eprintln!("acyclic: {message}");
+                    eprintln!("{}: {message}", product::NAME);
                     return 1;
                 }
             };
             match execute(&mut client, command) {
                 Ok(()) => 0,
                 Err(message) => {
-                    eprintln!("acyclic: {message}");
+                    eprintln!("{}: {message}", product::NAME);
                     1
                 }
             }
@@ -351,7 +353,7 @@ fn print_mount_capability() {
     }
 }
 
-/// `acyclic policy`: the effective `[decompose]` parameters as `key = value`
+/// `{NAME} policy`: the effective `[decompose]` parameters as `key = value`
 /// lines, so the skill reads one command instead of parsing TOML.
 fn policy(repo: &Path) -> i32 {
     match acyclic_engine::config::Config::load(repo) {
@@ -366,11 +368,11 @@ fn policy(repo: &Path) -> i32 {
                 None => println!("test_command = (infer from the repo)"),
             }
             println!("tie_break = {:?}", d.tie_break);
-            println!("# set these under [decompose] in .acyclic/config.toml");
+            println!("# set these under [decompose] in {}", product::repo_config_file());
             0
         }
         Err(error) => {
-            eprintln!("acyclic policy: {error}");
+            eprintln!("{} policy: {error}", product::NAME);
             1
         }
     }
@@ -405,7 +407,7 @@ fn init(repo: &Path) -> i32 {
     match result {
         Ok(()) => 0,
         Err(message) => {
-            eprintln!("acyclic init: {message}");
+            eprintln!("{} init: {message}", product::NAME);
             1
         }
     }
@@ -707,13 +709,13 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 println!("fork {}  ({})  {}", entry.id, entry.mode, entry.path);
             }
             println!(
-                "{} fork(s) ready — work in them freely; `acyclic promote <id>` keeps a winner",
+                "{} fork(s) ready — work in them freely; `{NAME} promote <id>` keeps a winner",
                 entries.len()
             );
             if entries.iter().any(|entry| entry.mode == "copy") {
                 println!(
                     "note: no mount provider on this host, so these are full copies \
-                     (`acyclic status` explains; promote works the same)"
+                     (`{NAME} status` explains; promote works the same)"
                 );
             }
             Ok(())
@@ -775,7 +777,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     report.push_str(&format!("  {}: {}\n", conflict.path, conflict.detail));
                 }
                 report.push_str(&format!(
-                    "Resolve the markers in {} and run `acyclic promote {id}` again (the fork now sits on {})",
+                    "Resolve the markers in {} and run `{NAME} promote {id}` again (the fork now sits on {})",
                     info.fork_path.as_deref().unwrap_or("the fork"),
                     &info.generation[..12]
                 ));
@@ -889,8 +891,8 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 println!("{tag} {}", entry.path);
             }
             println!(
-                "{} paths changed; run `acyclic session-apply {}` to land them or \
-                 `acyclic session-discard {}` to throw them away",
+                "{} paths changed; run `{NAME} session-apply {}` to land them or \
+                 `{NAME} session-discard {}` to throw them away",
                 info.diff.len(),
                 info.session_id,
                 info.session_id
@@ -971,7 +973,7 @@ fn checkpoint_ref(arg: Option<&str>) -> Result<(Option<i64>, Option<String>), St
         return Ok((None, Some(arg.to_string())));
     }
     Err(format!(
-        "{arg:?} is neither a checkpoint row id (see `acyclic timeline`) nor a generation hex prefix of at least 6 digits"
+        "{arg:?} is neither a checkpoint row id (see `{NAME} timeline`) nor a generation hex prefix of at least 6 digits"
     ))
 }
 

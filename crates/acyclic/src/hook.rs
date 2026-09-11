@@ -1,5 +1,5 @@
 //! Host-hook entrypoint. Claude Code (and compatible hosts) invoke
-//! `acyclic hook <event>` with a JSON payload on stdin. The contract:
+//! `{NAME} hook <event>` with a JSON payload on stdin. The contract:
 //! NEVER block or fail the agent — every path exits 0, a missing daemon is
 //! a silent no-op, and pre-tool waits are bounded. The one exception is
 //! `session-start`: it runs once per session, before any edit, and the host
@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
+use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
 use crate::client::{Client, ConnectError, Spawn};
@@ -88,7 +89,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
                 host: "claude-code".into(),
             });
             if let Err(message) = registered {
-                eprintln!("acyclic hook (session-start): {message}");
+                eprintln!("{NAME} hook (session-start): {message}");
                 return 0;
             }
             // Stdout of a SessionStart hook lands in the agent's context:
@@ -100,7 +101,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
                 }) {
                     Ok(proto::Reply::Brief(info)) => print!("{}", crate::brief::render(&info)),
                     Ok(_) => {}
-                    Err(message) => eprintln!("acyclic hook (session-start brief): {message}"),
+                    Err(message) => eprintln!("{NAME} hook (session-start brief): {message}"),
                 }
             }
             return 0;
@@ -109,7 +110,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             session_id: payload.session_id.unwrap_or_default(),
         },
         other => {
-            eprintln!("acyclic hook: unknown event {other:?}");
+            eprintln!("{NAME} hook: unknown event {other:?}");
             return 0;
         }
     };
@@ -120,7 +121,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     }
     if let Err(message) = client.call(op) {
         // Deadline overruns and daemon hiccups are advisory only.
-        eprintln!("acyclic hook ({event}): {message}");
+        eprintln!("{NAME} hook ({event}): {message}");
     }
     0
 }

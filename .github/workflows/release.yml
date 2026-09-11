@@ -54,6 +54,8 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       dry_run: ${{ steps.v.outputs.dry_run }}
+      name: ${{ steps.v.outputs.name }}
+      npm_package: ${{ steps.v.outputs.npm_package }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -68,15 +70,16 @@ jobs:
         run: |
           set -euo pipefail
           cargo_version="$(awk '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f && /^version/ {gsub(/[" ]/,"",$3); print $3}' Cargo.toml)"
-          npm_version="$(node -p "require('./packaging/npm/acyclic/package.json').version")"
+          # The public name and npm package come from product.toml; the npm
+          # launcher is generated from it at publish time, so the version has
+          # exactly one source: Cargo.toml.
+          source scripts/product.sh
+          bash scripts/check-product-name.sh
           echo "Cargo.toml   : ${cargo_version}"
-          echo "npm launcher : ${npm_version}"
-          [ "$cargo_version" = "$npm_version" ] || { echo "::error::Cargo.toml and packaging/npm/acyclic/package.json versions differ"; exit 1; }
-
-          for p in $(node -p "Object.keys(require('./packaging/npm/acyclic/package.json').optionalDependencies).join(' ')"); do
-            dep="$(node -p "require('./packaging/npm/acyclic/package.json').optionalDependencies['$p']")"
-            [ "$dep" = "$npm_version" ] || { echo "::error::optionalDependency $p is pinned to $dep, expected $npm_version"; exit 1; }
-          done
+          echo "product name : ${PRODUCT_NAME}"
+          echo "npm package  : ${PRODUCT_NPM_PACKAGE}"
+          echo "name=${PRODUCT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "npm_package=${PRODUCT_NPM_PACKAGE}" >> "$GITHUB_OUTPUT"
 
           if [ "$REF_TYPE" = "tag" ]; then
             tag_version="${REF_NAME#v}"
@@ -125,21 +128,24 @@ jobs:
       - name: Smoke test and checksum
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          NAME: ${{ needs.verify.outputs.name }}
         run: |
           set -euo pipefail
+          # The cargo target is named acyclic internally; the artifact takes the public name.
           bin="target/${{ matrix.target }}/release/acyclic"
           out="$("$bin" --version)"
           echo "$out"
           [[ "$out" == *"$VERSION"* ]] || { echo "::error::binary reports '$out', expected version $VERSION"; exit 1; }
+          [[ "$out" == "$NAME "* ]] || { echo "::error::binary reports '$out', expected it to be named $NAME"; exit 1; }
           mkdir -p dist
-          cp "$bin" "dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}"
-          (cd dist && shasum -a 256 "acyclic-${{ matrix.os }}-${{ matrix.cpu }}" > "acyclic-${{ matrix.os }}-${{ matrix.cpu }}.sha256")
+          cp "$bin" "dist/${NAME}-${{ matrix.os }}-${{ matrix.cpu }}"
+          (cd dist && shasum -a 256 "${NAME}-${{ matrix.os }}-${{ matrix.cpu }}" > "${NAME}-${{ matrix.os }}-${{ matrix.cpu }}.sha256")
           cat dist/*.sha256
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}
+          subject-path: dist/${{ needs.verify.outputs.name }}-${{ matrix.os }}-${{ matrix.cpu }}
 
       # SPDX SBOM from the locked dependency graph the binary was built from.
       # Generated per target so each binary's SBOM attestation names exactly
@@ -149,19 +155,19 @@ jobs:
         with:
           file: Cargo.lock
           format: spdx-json
-          output-file: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}.spdx.json
+          output-file: dist/${{ needs.verify.outputs.name }}-${{ matrix.os }}-${{ matrix.cpu }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
 
       - name: Attest SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}
-          sbom-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}.spdx.json
+          subject-path: dist/${{ needs.verify.outputs.name }}-${{ matrix.os }}-${{ matrix.cpu }}
+          sbom-path: dist/${{ needs.verify.outputs.name }}-${{ matrix.os }}-${{ matrix.cpu }}.spdx.json
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: acyclic-${{ matrix.os }}-${{ matrix.cpu }}
+          name: ${{ needs.verify.outputs.name }}-${{ matrix.os }}-${{ matrix.cpu }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
@@ -185,16 +191,17 @@ jobs:
       - name: Assemble SHA256SUMS and the release SBOM
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          NAME: ${{ needs.verify.outputs.name }}
         run: |
           set -euo pipefail
           cd dist
           # One SBOM ships with the release (the per-target ones are identical
           # and each stays attested against its own binary).
-          mv acyclic-linux-x64.spdx.json "acyclic-${VERSION}.spdx.json"
-          rm -f ./*-*.spdx.json
+          mv "${NAME}-linux-x64.spdx.json" "${NAME}-${VERSION}.spdx.json"
+          rm -f ./*-*-*.spdx.json
           cat ./*.sha256 > SHA256SUMS
           rm ./*.sha256
-          shasum -a 256 "acyclic-${VERSION}.spdx.json" >> SHA256SUMS
+          shasum -a 256 "${NAME}-${VERSION}.spdx.json" >> SHA256SUMS
           shasum -a 256 -c SHA256SUMS
           ls -l
 
@@ -220,6 +227,8 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       DRY_RUN: ${{ needs.verify.outputs.dry_run }}
+      NAME: ${{ needs.verify.outputs.name }}
+      PKG: ${{ needs.verify.outputs.npm_package }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -249,22 +258,23 @@ jobs:
           set -euo pipefail
           cd dist
           shasum -a 256 -c ./*.sha256
-          for bin in acyclic-darwin-arm64 acyclic-darwin-x64 acyclic-linux-x64 acyclic-linux-arm64; do
-            gh attestation verify "./$bin" \
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            gh attestation verify "./${NAME}-$t" \
               --repo "${GITHUB_REPOSITORY}" \
               --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
           done
           # The linux-x64 binary runs on this runner: prove it before publishing.
-          chmod +x acyclic-linux-x64
-          ./acyclic-linux-x64 --version | grep -F "$VERSION"
+          chmod +x "${NAME}-linux-x64"
+          "./${NAME}-linux-x64" --version | grep -F "$VERSION"
 
       - name: Assemble platform packages
         run: |
           set -euo pipefail
           for t in darwin:arm64 darwin:x64 linux:x64 linux:arm64; do
             os="${t%%:*}"; cpu="${t##*:}"
-            packaging/npm/platform-package.sh "$os" "$cpu" "$VERSION" "dist/acyclic-${os}-${cpu}" build
+            packaging/npm/platform-package.sh "$os" "$cpu" "$VERSION" "dist/${NAME}-${os}-${cpu}" build
           done
+          packaging/npm/launcher-package.sh "$VERSION" build
           find build -type f | sort
 
       - name: Publish platform packages
@@ -274,7 +284,7 @@ jobs:
           set -euo pipefail
           flags=(--access public --provenance --ignore-scripts)
           [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
-          for pkg in build/@acyclic-labs/plugin-*; do
+          for pkg in build/"${PKG}"-*; do
             name="$(node -p "require('./$pkg/package.json').name")"
             if [ "$DRY_RUN" != "true" ] && npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
               echo "${name}@${VERSION} already on the registry, skipping"
@@ -292,11 +302,11 @@ jobs:
           set -euo pipefail
           flags=(--access public --provenance --ignore-scripts)
           [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
-          if [ "$DRY_RUN" != "true" ] && npm view "@acyclic-labs/plugin@${VERSION}" version >/dev/null 2>&1; then
+          if [ "$DRY_RUN" != "true" ] && npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
             echo "launcher ${VERSION} already on the registry, skipping"
             exit 0
           fi
-          (cd packaging/npm/acyclic && npm publish "${flags[@]}")
+          (cd "build/${PKG}" && npm publish "${flags[@]}")
 
       - name: Post-publish install check
         if: needs.verify.outputs.dry_run == 'false'
@@ -306,5 +316,5 @@ jobs:
           cd "$tmp"
           npm init -y >/dev/null
           # Fresh install from the public registry, no auth, scripts disabled.
-          NODE_AUTH_TOKEN= npm install --ignore-scripts "@acyclic-labs/plugin@${VERSION}"
-          ./node_modules/.bin/acyclic --version | grep -F "$VERSION"
+          NODE_AUTH_TOKEN= npm install --ignore-scripts "${PKG}@${VERSION}"
+          "./node_modules/.bin/${NAME}" --version | grep -F "$VERSION"

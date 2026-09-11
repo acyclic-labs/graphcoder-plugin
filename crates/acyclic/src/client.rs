@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
 pub enum Spawn {
@@ -161,7 +162,7 @@ fn wait_for_socket(
             )));
         }
         if started.elapsed() > Duration::from_secs(2) && !reported {
-            eprintln!("acyclic: daemon starting (building the first snapshot of the tree)...");
+            eprintln!("{NAME}: daemon starting (building the first snapshot of the tree)...");
             reported = true;
         }
         std::thread::sleep(Duration::from_millis(200));

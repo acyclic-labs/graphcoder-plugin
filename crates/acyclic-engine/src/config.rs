@@ -122,7 +122,7 @@ impl Config {
     /// defaults from `~/.config/acyclic/config.toml`. Missing files are fine.
     pub fn load(repo_root: &Path) -> Result<Self> {
         let machine = std::env::var_os("HOME")
-            .map(|home| Path::new(&home).join(".config/acyclic/config.toml"));
+            .map(|home| Path::new(&home).join(format!(".config/{}/config.toml", crate::product::NAME)));
         Self::load_layered(machine.as_deref(), repo_root)
     }
 
@@ -133,7 +133,7 @@ impl Config {
         if let Some(machine) = machine {
             config = Self::merge_file(config, machine)?;
         }
-        Self::merge_file(config, &repo_root.join(".acyclic/config.toml"))
+        Self::merge_file(config, &repo_root.join(crate::product::repo_config_file()))
     }
 
     fn merge_file(base: Config, path: &Path) -> Result<Self> {
@@ -160,9 +160,9 @@ mod tests {
     #[test]
     fn repo_config_overrides_defaults() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "quiesce_ms = 10\ncommit_every = 5\n",
         )
         .expect("write");
@@ -176,9 +176,9 @@ mod tests {
     #[test]
     fn safe_mode_fields_parse_from_repo_config() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "dry_run = true\nguarded_paths = [\".env\", \"migrations/\"]\n",
         )
         .expect("write");
@@ -190,9 +190,9 @@ mod tests {
     #[test]
     fn exclude_list_parses_from_repo_config() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "exclude = [\".env\", \"secrets/\"]\n",
         )
         .expect("write");
@@ -204,9 +204,9 @@ mod tests {
     #[test]
     fn decompose_table_overrides_defaults_and_keeps_the_rest() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "[decompose]\nfan_out = 2\ntest_command = \"cargo test\"\n",
         )
         .expect("write");
@@ -220,9 +220,9 @@ mod tests {
     #[test]
     fn merge_table_overrides_the_size_cap() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "[merge]\nmax_file_bytes = 1024\n",
         )
         .expect("write");
@@ -235,9 +235,9 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected_loudly() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "quiesce_millis = 10\n",
         )
         .expect("write");

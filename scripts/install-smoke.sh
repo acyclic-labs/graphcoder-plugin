@@ -10,6 +10,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/product.sh"
+NAME="$PRODUCT_NAME"
 SRC="${1:-$ROOT/dist/bin}"
 command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
 
@@ -19,19 +21,20 @@ case "$(uname -m)" in
   arm64|aarch64) PREFER=arm64; OTHER=x64 ;;
   *) PREFER=x64; OTHER=arm64 ;;
 esac
-if [ -f "$SRC/acyclic-linux-$PREFER" ]; then CPU=$PREFER
-elif [ -f "$SRC/acyclic-linux-$OTHER" ]; then CPU=$OTHER
+if [ -f "$SRC/$NAME-linux-$PREFER" ]; then CPU=$PREFER
+elif [ -f "$SRC/$NAME-linux-$OTHER" ]; then CPU=$OTHER
 else echo "no linux binary in $SRC (run packaging/npm/release-local.sh build --all)" >&2; exit 1; fi
 case "$CPU" in arm64) PLATFORM=linux/arm64 ;; *) PLATFORM=linux/amd64 ;; esac
 
 # Assemble a release directory exactly as .github/workflows/release.yml does.
-REL="$(mktemp -d "${TMPDIR:-/tmp}/acyclic-release.XXXXXX")"
+REL="$(mktemp -d "${TMPDIR:-/tmp}/$NAME-release.XXXXXX")"
 trap 'rm -rf "$REL"' EXIT
-cp "$SRC/acyclic-linux-$CPU" "$REL/"
-(cd "$REL" && shasum -a 256 "acyclic-linux-$CPU" > SHA256SUMS)
+cp "$SRC/$NAME-linux-$CPU" "$REL/"
+(cd "$REL" && shasum -a 256 "$NAME-linux-$CPU" > SHA256SUMS)
 echo "release dir: $REL ($CPU, $PLATFORM)"
 
 docker run --rm --platform "$PLATFORM" \
+  -e "NAME=$NAME" \
   -v "$ROOT/scripts/install.sh:/install.sh:ro" \
   -v "$REL:/release:ro" \
   debian:bookworm-slim bash -eu -o pipefail -c '
@@ -40,31 +43,32 @@ docker run --rm --platform "$PLATFORM" \
     useradd -m dev
     su dev -c "
       set -eu
+      NAME=$NAME
       export HOME=/home/dev
       cd \$HOME
       ACYCLIC_RELEASE_URL=file:///release sh /install.sh
       export PATH=\$HOME/.local/bin:\$PATH
-      acyclic --version
+      \$NAME --version
       mkdir demo && cd demo
       printf ORIGINAL > app.txt
       printf SECRET > .env
-      mkdir .acyclic && printf \"exclude = [\\\".env\\\"]\\n\" > .acyclic/config.toml
-      acyclic init
-      acyclic install agents-md >/dev/null
-      acyclic checkpoint --wait -m start
+      mkdir .\$NAME && printf \"exclude = [\\\".env\\\"]\\n\" > .\$NAME/config.toml
+      \$NAME init
+      \$NAME install agents-md >/dev/null
+      \$NAME checkpoint --wait -m start
       printf CHANGED > app.txt
       printf LEAKED > .env
       sleep 0.5
-      acyclic checkpoint --wait -m edit
-      acyclic rewind --last --yes >/dev/null
+      \$NAME checkpoint --wait -m edit
+      \$NAME rewind --last --yes >/dev/null
       cd \"\$PWD\"   # a rewind swaps the directory inode; re-enter it
-      acyclic timeline | head -5
-      acyclic rewind 1 --yes
+      \$NAME timeline | head -5
+      \$NAME rewind 1 --yes
       cd \"\$PWD\"
       [ \"\$(cat app.txt)\" = ORIGINAL ] || { echo rewind failed; exit 1; }
       [ \"\$(cat .env)\" = LEAKED ] || { echo excluded file was not carried; exit 1; }
-      acyclic status
-      acyclic stop
+      \$NAME status
+      \$NAME stop
       echo CLEAN-MACHINE-OK
     "
   '

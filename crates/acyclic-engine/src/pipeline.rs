@@ -613,7 +613,7 @@ pub fn spawn(
 ) -> (PipelineHandle, std::thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(1024);
     let thread = std::thread::Builder::new()
-        .name("acyclic-pipeline".into())
+        .name(format!("{}-pipeline", crate::product::NAME))
         // The fs facade's futures are large and a few of them nest per
         // request (a subtree copy, a restore); the 2 MiB default is tight
         // in debug builds. Virtual reservation only: untouched pages cost
@@ -1386,8 +1386,9 @@ impl Pipeline {
         }
         if self.exclusions.covers_host(path) {
             return Err(EngineError::Restore(format!(
-                "{} is excluded from snapshots (`exclude` in .acyclic/config.toml); no checkpoint holds it",
-                path.display()
+                "{} is excluded from snapshots (`exclude` in {}); no checkpoint holds it",
+                path.display(),
+                crate::product::repo_config_file()
             )));
         }
         if self.state != State::Ready {

@@ -18,6 +18,10 @@ acyclic install claude-code        # hooks, /rewind /timeline /fork, two skills;
 
 Any shell-capable agent can use the CLI directly; `acyclic install agents-md` teaches it the verbs. Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
 
+## The public name
+
+`product.toml` at the repo root holds the public name once. The CLI command, `.<name>/config.toml`, the state and config directories, hook commands, skill names, message prefixes, the `<NAME>_TRACE` and `<NAME>_HOOK` variables, release asset names, and the npm bin all derive from it at build or packaging time (`crates/acyclic-engine/build.rs`, `scripts/product.sh`, the workflows). Crate names stay `acyclic*` because they are internal. `scripts/install.sh` is fetched standalone and mirrors the name; `scripts/check-product-name.sh` fails CI if it drifts or if any user-facing Rust string spells the name out. Renaming is: change `product.toml`, update the two mirror lines in `install.sh`, rebuild.
+
 ## Configuration
 
 `.acyclic/config.toml` is checked in, so the policy ships with the repo. Every key has a safe default; zero config is supported. Machine-level defaults live in `~/.config/acyclic/config.toml`.
