@@ -13,6 +13,7 @@
 pub mod config;
 pub mod diff;
 pub mod fork;
+pub mod guard;
 pub mod index;
 pub mod pipeline;
 pub mod rewind;

@@ -1,0 +1,285 @@
+name: release
+
+# Builds the `acyclic` binary for four targets, attaches them to a GitHub
+# release, and publishes the npm launcher plus its four platform packages.
+#
+# Security posture (see packaging/npm/RELEASING.md):
+#   - Runs only on an annotated version tag or a manual dispatch (dry run
+#     by default). No PR or branch event can reach the publish job.
+#   - Every action is pinned to a commit SHA, not a mutable tag.
+#   - Default token permissions are read-only; each job asks for exactly
+#     what it needs. Build jobs never see the npm token.
+#   - Publishing is gated behind the `npm` GitHub environment, so a
+#     required reviewer must approve before the token is exposed.
+#   - Binaries carry SLSA build-provenance attestations, and the publish
+#     job verifies those attestations before wrapping anything in a
+#     package. npm packages are published with provenance too.
+#   - Lifecycle scripts are disabled for every npm command.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and attest, but run npm publish with --dry-run and skip the GitHub release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # acyclic-fs is a git dependency pinned to a commit SHA; cargo's libgit2
+  # fetcher can't resolve non-tip SHAs on GitHub, so use the git CLI.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Strip symbols so the npm platform packages stay small. Set here rather
+  # than in Cargo.toml so local debug-friendly release builds are unchanged.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Confirm the tag, Cargo.toml, and the npm launcher all agree on one
+  # version before spending any build minutes.
+  # ---------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      dry_run: ${{ steps.v.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve and cross-check version
+        id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f && /^version/ {gsub(/[" ]/,"",$3); print $3}' Cargo.toml)"
+          npm_version="$(node -p "require('./packaging/npm/acyclic/package.json').version")"
+          echo "Cargo.toml   : ${cargo_version}"
+          echo "npm launcher : ${npm_version}"
+          [ "$cargo_version" = "$npm_version" ] || { echo "::error::Cargo.toml and packaging/npm/acyclic/package.json versions differ"; exit 1; }
+
+          for p in $(node -p "Object.keys(require('./packaging/npm/acyclic/package.json').optionalDependencies).join(' ')"); do
+            dep="$(node -p "require('./packaging/npm/acyclic/package.json').optionalDependencies['$p']")"
+            [ "$dep" = "$npm_version" ] || { echo "::error::optionalDependency $p is pinned to $dep, expected $npm_version"; exit 1; }
+          done
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag_version="${REF_NAME#v}"
+            echo "git tag      : ${tag_version}"
+            [ "$tag_version" = "$cargo_version" ] || { echo "::error::tag $REF_NAME does not match Cargo.toml version $cargo_version"; exit 1; }
+            dry_run=false
+          else
+            dry_run="${DRY_RUN_INPUT:-true}"
+          fi
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Native builds on each target's own runner. No cross toolchains, so the
+  # binary is exactly what `cargo build --release` produces there.
+  # ---------------------------------------------------------------------
+  build:
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write      # sign the provenance attestation
+      attestations: write  # store it
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: darwin, cpu: arm64, runner: macos-14,         target: aarch64-apple-darwin }
+          - { os: darwin, cpu: x64,   runner: macos-13,         target: x86_64-apple-darwin }
+          - { os: linux,  cpu: x64,   runner: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+          - { os: linux,  cpu: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p acyclic --target ${{ matrix.target }}
+
+      - name: Smoke test and checksum
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/acyclic"
+          out="$("$bin" --version)"
+          echo "$out"
+          [[ "$out" == *"$VERSION"* ]] || { echo "::error::binary reports '$out', expected version $VERSION"; exit 1; }
+          mkdir -p dist
+          cp "$bin" "dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}"
+          (cd dist && shasum -a 256 "acyclic-${{ matrix.os }}-${{ matrix.cpu }}" > "acyclic-${{ matrix.os }}-${{ matrix.cpu }}.sha256")
+          cat dist/*.sha256
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/acyclic-${{ matrix.os }}-${{ matrix.cpu }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: acyclic-${{ matrix.os }}-${{ matrix.cpu }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # GitHub release with the raw binaries and a SHA256SUMS file. The future
+  # curl installer and Homebrew formula consume these.
+  # ---------------------------------------------------------------------
+  github-release:
+    needs: [verify, build]
+    if: needs.verify.outputs.dry_run == 'false'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm ./*.sha256
+          shasum -a 256 -c SHA256SUMS
+          ls -l
+
+      - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------
+  # npm publish. Gated by the `npm` environment; this is the only job that
+  # can read NPM_TOKEN. Platform packages go first, the launcher last, so a
+  # half-finished publish never leaves a launcher pointing at missing deps.
+  # ---------------------------------------------------------------------
+  npm-publish:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write  # npm provenance + verifying the binary attestations
+      attestations: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      DRY_RUN: ${{ needs.verify.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Lock down npm
+        run: |
+          npm config set ignore-scripts true
+          npm config set fund false
+          npm config set audit false
+          npm --version
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums and build attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 -c ./*.sha256
+          for bin in acyclic-darwin-arm64 acyclic-darwin-x64 acyclic-linux-x64 acyclic-linux-arm64; do
+            gh attestation verify "./$bin" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          done
+          # The linux-x64 binary runs on this runner: prove it before publishing.
+          chmod +x acyclic-linux-x64
+          ./acyclic-linux-x64 --version | grep -F "$VERSION"
+
+      - name: Assemble platform packages
+        run: |
+          set -euo pipefail
+          for t in darwin:arm64 darwin:x64 linux:x64 linux:arm64; do
+            os="${t%%:*}"; cpu="${t##*:}"
+            packaging/npm/platform-package.sh "$os" "$cpu" "$VERSION" "dist/acyclic-${os}-${cpu}" build
+          done
+          find build -type f | sort
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          flags=(--access public --provenance --ignore-scripts)
+          [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
+          for pkg in build/@acyclic-labs/plugin-*; do
+            name="$(node -p "require('./$pkg/package.json').name")"
+            if [ "$DRY_RUN" != "true" ] && npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${name}@${VERSION} already on the registry, skipping"
+              continue
+            fi
+            echo "::group::publish ${name}@${VERSION}"
+            (cd "$pkg" && npm publish "${flags[@]}")
+            echo "::endgroup::"
+          done
+
+      - name: Publish launcher
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          flags=(--access public --provenance --ignore-scripts)
+          [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
+          if [ "$DRY_RUN" != "true" ] && npm view "@acyclic-labs/plugin@${VERSION}" version >/dev/null 2>&1; then
+            echo "launcher ${VERSION} already on the registry, skipping"
+            exit 0
+          fi
+          (cd packaging/npm/acyclic && npm publish "${flags[@]}")
+
+      - name: Post-publish install check
+        if: needs.verify.outputs.dry_run == 'false'
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          npm init -y >/dev/null
+          # Fresh install from the public registry, no auth, scripts disabled.
+          NODE_AUTH_TOKEN= npm install --ignore-scripts "@acyclic-labs/plugin@${VERSION}"
+          ./node_modules/.bin/acyclic --version | grep -F "$VERSION"

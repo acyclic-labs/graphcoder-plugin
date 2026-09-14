@@ -80,14 +80,32 @@ printf 'MAINLINE-NOTE-2\n' > "$R/note.txt"
 sleep 0.4
 acy checkpoint --wait --durable >/dev/null || fail "I3: durable checkpoint"
 
-# --- M5 first (so M4's promote still applies cleanly): conflict path ------
-# The published movement above means promoting C must conflict legibly and
-# touch nothing.
-if OUT="$(acy promote "${IDS[2]}" 2>&1)"; then
-  fail "M5: promote after mainline moved should conflict: $OUT"
+# --- M5 first (so M4's promote still applies cleanly): merge semantics ----
+# The published movement above (note.txt) means the mainline moved past
+# every fork's base. Fork C only added only-in-c.txt: disjoint from the
+# mainline's change, so promote must REPLAY it in place, no swap, and touch
+# nothing else.
+OUT="$(acy promote "${IDS[2]}" 2>&1)" || fail "M5: disjoint promote should replay: $OUT"
+echo "$OUT" | grep -q "promoted by replay: 1 path" || fail "M5: expected a 1-path replay: $OUT"
+[ "$(cat "$R/only-in-c.txt")" = "extra" ] || fail "M5: replayed file missing"
+[ "$(cat "$R/note.txt")" = "MAINLINE-NOTE-2" ] || fail "M5: replay clobbered the mainline's own change"
+[ "$(cat "$R/src/app.txt")" = "MAINLINE" ] || fail "M5: replay touched an unrelated path"
+route_dead "$C" "${IDS[2]}" || fail "M5: replayed fork still serves"
+
+# --- M5b: overlap conflicts legibly and touches nothing ---------------------
+# Fork D edits note.txt; the mainline edits note.txt again and publishes.
+# Both sides changed the same path: promote must refuse and name it.
+D_OUT="$(acy fork -n 1)" || fail "M5b: fork D"
+D_ID="$(echo "$D_OUT" | awk '/^fork /{print $2; exit}')"; D="$MNT/$D_ID"
+printf 'FORK-D-NOTE\n' > "$D/note.txt" || fail "M5b: write into fork D"
+printf 'MAINLINE-NOTE-3\n' > "$R/note.txt"
+sleep 0.4
+acy checkpoint --wait --durable >/dev/null || fail "M5b: durable checkpoint"
+if OUT="$(acy promote "$D_ID" 2>&1)"; then
+  fail "M5b: overlapping promote should conflict: $OUT"
 fi
-echo "$OUT" | grep -q "moved past the fork's base" || fail "M5: conflict not legible: $OUT"
-[ "$(cat "$R/src/app.txt")" = "MAINLINE" ] || fail "M5: conflict touched the tree"
+echo "$OUT" | grep -q "both sides changed 1 path(s): note.txt" || fail "M5b: conflict not legible: $OUT"
+[ "$(cat "$R/note.txt")" = "MAINLINE-NOTE-3" ] || fail "M5b: conflict touched the tree"
 
 # Restore an unmoved mainline for A and B by re-forking from current state.
 acy fork-drop "${IDS[0]}" >/dev/null || fail "drop stale A"

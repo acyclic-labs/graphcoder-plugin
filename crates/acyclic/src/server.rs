@@ -5,14 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acyclic_engine::config::Config;
-use acyclic_engine::fork::{self, PromoteOutcome, SharedLocalCheckout};
+use acyclic_engine::fork::{
+    self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
+};
+use acyclic_engine::guard::GuardedMountFilesystem;
 use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
 use acyclic_fs::{
-    mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
-    RoutedMountSource,
+    mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
+    NativeMountRequest, NativeMountSession, RoutedMountSource,
 };
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,6 +30,30 @@ struct ForkState {
     shared: Arc<SharedLocalCheckout>,
     base: acyclic_engine::GenerationId,
     entry: proto::ForkEntry,
+    /// Copy-mode forks only: the materialized directory the user works in.
+    /// Captured back into `shared` at promote, removed at drop/promote.
+    copy_dir: Option<PathBuf>,
+}
+
+/// One Safe Mode session: its fork and the shadow mount that projects it
+/// directly at the real repo root for the session's duration. Only one can
+/// be active at a time -- shadowing is a whole-path substitution, so two
+/// sessions can't both shadow the same repo root concurrently.
+struct DrySession {
+    fork_id: String,
+    session_id: String,
+    shared: Arc<SharedLocalCheckout>,
+    base: acyclic_engine::GenerationId,
+    mount: NativeMountSession,
+}
+
+/// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`. Its
+/// overlay is already committed to the store under `generation`; nothing
+/// has touched the real tree yet.
+struct PendingSession {
+    generation: acyclic_engine::GenerationId,
+    base: acyclic_engine::GenerationId,
+    label: String,
 }
 
 /// The one native session projecting every fork through the router.
@@ -37,6 +64,13 @@ struct ForkMount {
 }
 
 pub fn run(repo_root: &Path) -> Result<(), String> {
+    // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
+    // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
+    // that wedges every stat/open under it (Config::load, canonicalize, ...).
+    // The force-unmount acts on the mountpoint path itself without touching
+    // the dead server, so the real tree reappears before we read the config.
+    fork::sweep_stale_dry_session(repo_root);
+
     let config = Config::load(repo_root).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
     let paths = StorePaths::for_repo(repo_root, stores_root.as_deref())
@@ -54,7 +88,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let repo_root = store.repo_root.clone();
     let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;
-    let (handle, pipeline_thread) = pipeline::spawn(store, index, config);
+    let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
 
     // Socket + pidfile. A stale socket from a dead daemon is removed; a live
     // one refuses the second daemon via bind failure after removal race.
@@ -66,17 +100,28 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     let shutdown = Arc::new(Notify::new());
+    let mounts = fork::mount_capability();
+    if !mounts.available {
+        eprintln!(
+            "acyclic daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
+            mounts.reason.as_deref().unwrap_or("unknown reason")
+        );
+    }
     let server = Server {
+        mounts,
         handle: handle.clone(),
         index_db: paths.index_db(),
         store_root: paths.root.clone(),
         repo_root,
+        config,
         shutdown: shutdown.clone(),
         forks: Arc::new(Mutex::new(HashMap::new())),
         fork_mount: Arc::new(Mutex::new(ForkMount {
             router: Arc::new(RoutedMountSource::new()),
             session: None,
         })),
+        dry_session: Arc::new(Mutex::new(None)),
+        pending: Arc::new(Mutex::new(HashMap::new())),
     };
 
     runtime.block_on(async move {
@@ -102,13 +147,20 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
 #[derive(Clone)]
 struct Server {
+    /// Probed once at start: decides fork mode and gates Safe Mode.
+    mounts: MountCapability,
     handle: PipelineHandle,
     index_db: PathBuf,
     store_root: PathBuf,
     repo_root: PathBuf,
+    config: Config,
     shutdown: Arc<Notify>,
     forks: Arc<Mutex<HashMap<String, ForkState>>>,
     fork_mount: Arc<Mutex<ForkMount>>,
+    /// The one active Safe Mode session shadow-mounted at `repo_root`, if any.
+    dry_session: Arc<Mutex<Option<DrySession>>>,
+    /// Sessions that resolved (committed) but haven't been applied/discarded.
+    pending: Arc<Mutex<HashMap<String, PendingSession>>>,
 }
 
 impl Server {
@@ -158,6 +210,9 @@ impl Server {
                     unpublished: status.unpublished,
                     store_bytes: directory_bytes(&self.store_root.join("store")),
                     repo_root: self.repo_root.display().to_string(),
+                    mount_provider: self.mounts.provider.to_string(),
+                    mount_available: self.mounts.available,
+                    mount_reason: self.mounts.reason.clone(),
                 }))
             }
             proto::Op::Checkpoint {
@@ -175,6 +230,8 @@ impl Server {
                     tool_call_id,
                     tool_name,
                     label,
+                    turn: None,
+                    rewind_target: None,
                 };
                 if wait {
                     let outcome = self
@@ -208,19 +265,144 @@ impl Server {
                     Ok(proto::Reply::Enqueued)
                 }
             }
-            proto::Op::Timeline { session_id, limit } => {
+            proto::Op::Timeline {
+                session_id,
+                turn,
+                limit,
+            } => {
+                if turn.is_some() && session_id.is_none() {
+                    return Err("--turn needs --session (turn numbers are per session)".into());
+                }
                 let index = self.open_index()?;
                 let rows = index
-                    .list(session_id.as_deref(), limit)
+                    .list(session_id.as_deref(), turn, limit)
                     .map_err(stringify)?;
                 Ok(proto::Reply::Timeline(
                     rows.into_iter().map(timeline_entry).collect(),
                 ))
             }
-            proto::Op::Rewind { target, path } => {
-                if path.is_some() {
-                    return Err("single-path restore is not implemented yet".into());
+            proto::Op::Turns { session_id } => {
+                let index = self.open_index()?;
+                let turns = index.turns(session_id.as_deref()).map_err(stringify)?;
+                let mut entries = Vec::with_capacity(turns.len());
+                for turn in turns {
+                    let base_checkpoint = match turn.first_checkpoint {
+                        Some(first) => index
+                            .latest_target_before(first)
+                            .map_err(stringify)?
+                            .map(|row| row.id),
+                        None => None,
+                    };
+                    entries.push(proto::TurnEntry {
+                        session_id: turn.session_id,
+                        turn: turn.turn,
+                        started_at: turn.started_at,
+                        prompt: turn.prompt,
+                        first_checkpoint: turn.first_checkpoint,
+                        last_checkpoint: turn.last_checkpoint,
+                        checkpoints: turn.checkpoints,
+                        base_checkpoint,
+                    });
                 }
+                Ok(proto::Reply::Turns(entries))
+            }
+            proto::Op::TurnStart { session_id, prompt } => {
+                let turn = self
+                    .handle
+                    .turn_started(session_id.clone(), prompt)
+                    .await
+                    .map_err(stringify)?;
+                Ok(proto::Reply::Turn(proto::TurnInfo { session_id, turn }))
+            }
+            proto::Op::Inspect { checkpoint } => {
+                let index = self.open_index()?;
+                let row = index
+                    .by_id(checkpoint)
+                    .map_err(stringify)?
+                    .ok_or(format!("no checkpoint #{checkpoint}"))?;
+                let (host, prompt) = match (&row.session_id, row.turn) {
+                    (Some(session), turn) => {
+                        let host = index
+                            .session(session)
+                            .map_err(stringify)?
+                            .and_then(|session| session.host);
+                        let prompt = match turn {
+                            Some(turn) => index
+                                .turn(session, turn)
+                                .map_err(stringify)?
+                                .map(|turn| turn.prompt),
+                            None => None,
+                        };
+                        (host, prompt)
+                    }
+                    (None, _) => (None, None),
+                };
+                Ok(proto::Reply::Inspect(proto::InspectInfo {
+                    id: row.id,
+                    generation: hex_generation(row.generation),
+                    created_at: row.created_at,
+                    kind: row.kind.as_str().to_string(),
+                    published: row.published,
+                    session_id: row.session_id,
+                    host,
+                    turn: row.turn,
+                    prompt,
+                    tool_name: row.tool_name,
+                    tool_call_id: row.tool_call_id,
+                    label: row.label,
+                    error: row.error,
+                    rewind_target: row.rewind_target,
+                }))
+            }
+            proto::Op::Sessions { limit } => {
+                let index = self.open_index()?;
+                let sessions = index.sessions(limit).map_err(stringify)?;
+                let mut entries = Vec::with_capacity(sessions.len());
+                for session in sessions {
+                    let end_checkpoint = index
+                        .session_end(&session.session_id)
+                        .map_err(stringify)?
+                        .map(|row| row.id);
+                    entries.push(proto::SessionEntry {
+                        session_id: session.session_id,
+                        host: session.host,
+                        started_at: session.started_at,
+                        ended_at: session.ended_at,
+                        checkpoints: session.checkpoints,
+                        turns: session.turns,
+                        end_checkpoint,
+                    });
+                }
+                Ok(proto::Reply::Sessions(entries))
+            }
+            proto::Op::Brief { current } => {
+                let brief = self.brief(current.as_deref()).await?;
+                Ok(proto::Reply::Brief(brief))
+            }
+            proto::Op::Rewind {
+                target,
+                path: Some(path),
+            } => {
+                let row = self.resolve_target(target)?;
+                let row_id = row.id;
+                let outcome = self
+                    .handle
+                    .restore_path(row, PathBuf::from(&path))
+                    .await
+                    .map_err(stringify)?;
+                let recorded_checkpoint = self.handle.status().await.map_err(stringify)?.last_checkpoint;
+                Ok(proto::Reply::Restore(proto::RestoreInfo {
+                    checkpoint: row_id,
+                    path: outcome.path.display().to_string(),
+                    action: match outcome.action {
+                        rewind::RestoreAction::Restored => "restored",
+                        rewind::RestoreAction::Removed => "removed",
+                    }
+                    .to_string(),
+                    recorded_checkpoint,
+                }))
+            }
+            proto::Op::Rewind { target, path: None } => {
                 let row = self.resolve_target(target)?;
                 let row_id = row.id;
                 let outcome = self.handle.rewind(row).await.map_err(stringify)?;
@@ -255,34 +437,44 @@ impl Server {
                     .await
                     .map_err(stringify)?;
                 Ok(proto::Reply::Diff(
-                    changes
-                        .into_iter()
-                        .map(|change| proto::DiffEntry {
-                            path: change.path.display().to_string(),
-                            change: match change.change {
-                                acyclic_engine::diff::ChangeKind::Added => "added",
-                                acyclic_engine::diff::ChangeKind::Removed => "removed",
-                                acyclic_engine::diff::ChangeKind::Modified => "modified",
-                                acyclic_engine::diff::ChangeKind::MetadataOnly => "metadata",
-                            }
-                            .to_string(),
-                            file_kind: format!("{:?}", change.file_kind).to_lowercase(),
-                        })
-                        .collect(),
+                    changes.into_iter().map(diff_entry).collect(),
                 ))
             }
             proto::Op::SessionStart { session_id, host } => {
                 self.handle
-                    .session_started(session_id, host)
+                    .session_started(session_id.clone(), host)
                     .await
                     .map_err(stringify)?;
+                if self.config.dry_run {
+                    self.session_fork(session_id).await?;
+                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionEnd { session_id } => {
                 self.handle
-                    .session_ended(session_id)
+                    .session_ended(session_id.clone())
                     .await
                     .map_err(stringify)?;
+                // Scratch trees are tagged with their owning session and
+                // never meant to be promoted: best-effort drop, log rather
+                // than fail session-end over a leaked mount.
+                let scratch_ids: Vec<String> = self
+                    .forks
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(_, fork)| {
+                        fork.entry.session_id.as_deref() == Some(session_id.as_str())
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in scratch_ids {
+                    let fork = self.forks.lock().await.remove(&id);
+                    let copy_dir = fork.and_then(|fork| fork.copy_dir);
+                    if let Err(error) = self.discard_fork_workspace(&id, copy_dir.as_deref()).await {
+                        eprintln!("acyclic daemon: drop scratch fork {id}: {error}");
+                    }
+                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Commit => {
@@ -290,6 +482,13 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Stop => {
+                // Unmount an active Safe Mode shadow first: it sits directly
+                // on the real repo root, so this must never be left mounted
+                // once the daemon that owns it is gone.
+                if let Some(mut session) = self.dry_session.lock().await.take() {
+                    let _ = tokio::task::block_in_place(|| session.mount.stop());
+                }
+                self.pending.lock().await.clear();
                 // Detach the fork session before the pipeline goes away: its
                 // callback runtimes reach into the shared checkouts.
                 self.forks.lock().await.clear();
@@ -304,9 +503,12 @@ impl Server {
                 self.shutdown.notify_one();
                 Ok(proto::Reply::Unit)
             }
-            proto::Op::Fork { count } => {
+            proto::Op::Fork { count, session_id } => {
                 if count == 0 || count > 16 {
                     return Err("fork count must be 1..=16".into());
+                }
+                if self.mounts.fork_mode() == ForkMode::Copy {
+                    return self.fork_copies(count, session_id).await;
                 }
                 let root = fork::forks_mount_root(&self.repo_root)
                     .ok_or("repo root has no parent for fork workspaces")?;
@@ -318,25 +520,32 @@ impl Server {
                     // keep it (and any mount syscall) off async workers.
                     let shared = Arc::clone(&seed.shared);
                     let config = seed.config;
+                    let guarded_paths = self.config.guarded_paths.clone();
                     let source = tokio::task::block_in_place(move || {
-                        CheckoutMountSource::new(shared, config)
-                            .map_err(|error| format!("mount source: {error:?}"))
+                        let source = CheckoutMountSource::new(shared, config)
+                            .map_err(|error| format!("mount source: {error:?}"))?;
+                        Ok::<Arc<dyn MountFilesystem>, String>(
+                            if GuardedMountFilesystem::is_active(&guarded_paths) {
+                                Arc::new(GuardedMountFilesystem::new(
+                                    Arc::new(source),
+                                    &guarded_paths,
+                                ))
+                            } else {
+                                Arc::new(source)
+                            },
+                        )
                     })?;
                     let mut mount = self.fork_mount.lock().await;
                     mount
                         .router
-                        .add_route(
-                            id.clone().into_bytes(),
-                            Arc::new(source) as Arc<dyn MountFilesystem>,
-                        )
+                        .add_route(id.clone().into_bytes(), source)
                         .map_err(|error| format!("route: {error:?}"))?;
                     // The ONE session, mounted lazily on the first fork. A
                     // route insert is all later forks pay.
                     if mount.session.is_none() {
                         let _ = std::fs::remove_dir_all(&root);
                         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-                        let router =
-                            Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
+                        let router = Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
                         let volume_id = seed.volume_id;
                         let dest = root.clone();
                         let session = tokio::task::block_in_place(move || {
@@ -365,8 +574,10 @@ impl Server {
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
+                        mode: ForkMode::Mount.as_str().to_string(),
                         base: acyclic_engine::generation_hex(seed.base),
                         created_at: unix_now(),
+                        session_id: session_id.clone(),
                     };
                     self.forks.lock().await.insert(
                         id,
@@ -374,6 +585,7 @@ impl Server {
                             shared: seed.shared,
                             base: seed.base,
                             entry: clone_entry(&entry),
+                            copy_dir: None,
                         },
                     );
                     created.push(entry);
@@ -382,48 +594,518 @@ impl Server {
             }
             proto::Op::ForkList => {
                 let forks = self.forks.lock().await;
-                let mut entries: Vec<proto::ForkEntry> =
-                    forks.values().map(|fork| clone_entry(&fork.entry)).collect();
-                entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                let mut entries: Vec<proto::ForkEntry> = forks
+                    .values()
+                    .map(|fork| clone_entry(&fork.entry))
+                    .collect();
+                entries.sort_by_key(|entry| entry.created_at);
                 Ok(proto::Reply::Forks(entries))
             }
             proto::Op::ForkDrop { id } => {
                 let mut forks = self.forks.lock().await;
-                forks.remove(&id).ok_or(format!("no fork {id}"))?;
+                let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
-                self.detach_route(&id).await?;
+                self.discard_fork_workspace(&id, fork.copy_dir.as_deref()).await?;
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Promote { id } => {
                 let mut forks = self.forks.lock().await;
                 let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
-                // Detach the route first: new writes stop reaching the
-                // overlay before its commit (in-flight handles detach).
-                self.detach_route(&id).await?;
-
+                let label = format!("promote fork {id}");
+                let result = self.promote_fork(&id, &fork, &label).await;
+                if let Some(dir) = fork.copy_dir.as_deref() {
+                    let _ = std::fs::remove_dir_all(dir);
+                    Self::remove_if_empty(dir.parent());
+                }
+                match result? {
+                    Landed::Swapped {
+                        generation,
+                        old_tree,
+                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
+                        generation: acyclic_engine::generation_hex(generation),
+                        old_tree: Some(old_tree.display().to_string()),
+                        warning: "reload your editor: open files still point at the replaced tree"
+                            .into(),
+                        replayed_paths: 0,
+                    })),
+                    Landed::Replayed { generation, paths } => {
+                        Ok(proto::Reply::Promote(proto::PromoteInfo {
+                            generation: acyclic_engine::generation_hex(generation),
+                            old_tree: None,
+                            warning: "the mainline had moved; the fork's paths were written \
+                                      in place, no directory swap"
+                                .into(),
+                            replayed_paths: paths,
+                        }))
+                    }
+                    Landed::Nothing { generation } => {
+                        Ok(proto::Reply::Promote(proto::PromoteInfo {
+                            generation: acyclic_engine::generation_hex(generation),
+                            old_tree: None,
+                            warning: String::new(),
+                            replayed_paths: 0,
+                        }))
+                    }
+                }
+            }
+            proto::Op::ForkDiff { id } => {
+                let (base, shared, copy_dir) = {
+                    let forks = self.forks.lock().await;
+                    let fork = forks.get(&id).ok_or(format!("no fork {id}"))?;
+                    (fork.base, Arc::clone(&fork.shared), fork.copy_dir.clone())
+                };
+                // Mounted fork: its writes already sit in its own overlay, so
+                // snapshot that. Copy fork: read the directory into a
+                // scratch overlay pinned at the base (native capture cannot
+                // read through the mount itself: NFS lacks the extent ioctl).
+                // Either way the fork stays promotable afterwards.
+                let overlay = match copy_dir {
+                    None => shared,
+                    Some(dir) => {
+                        let scratch =
+                            self.handle.scratch_checkout(base).await.map_err(stringify)?;
+                        fork::capture_copy(&scratch, &dir)
+                            .await
+                            .map_err(stringify)?;
+                        scratch
+                    }
+                };
+                let changes = if overlay.lock().await.has_pending_mutations() {
+                    let generation = self
+                        .handle
+                        .snapshot_overlay(overlay)
+                        .await
+                        .map_err(stringify)?;
+                    self.handle.diff(base, generation).await.map_err(stringify)?
+                } else {
+                    Vec::new()
+                };
+                // Timestamps differ on a copy fork by construction; only
+                // content is a blast radius.
+                Ok(proto::Reply::Diff(
+                    changes
+                        .into_iter()
+                        .filter(|change| {
+                            change.change != acyclic_engine::diff::ChangeKind::MetadataOnly
+                        })
+                        .map(diff_entry)
+                        .collect(),
+                ))
+            }
+            proto::Op::SessionFork { session_id } => {
+                self.session_fork(session_id).await?;
+                Ok(proto::Reply::Unit)
+            }
+            proto::Op::SessionResolve { session_id } => {
+                let mut slot = self.dry_session.lock().await;
+                let session = slot
+                    .take()
+                    .filter(|session| session.session_id == session_id)
+                    .ok_or_else(|| format!("no active Safe Mode session {session_id}"))?;
+                drop(slot);
+                // Unmount first: the real tree must reappear before we ask
+                // the engine to touch it, and no new writes can race the
+                // commit below.
+                let DrySession {
+                    fork_id,
+                    session_id,
+                    shared,
+                    base,
+                    mut mount,
+                } = session;
+                tokio::task::block_in_place(|| mount.stop())
+                    .map_err(|error| format!("unmount: {error:?}"))?;
+                let label = format!("safe mode session {fork_id}");
                 let outcome = self
                     .handle
-                    .promote(
-                        Arc::clone(&fork.shared),
-                        fork.base,
-                        format!("promote fork {id}"),
-                    )
+                    .resolve_session(Arc::clone(&shared), base, label.clone())
                     .await
                     .map_err(stringify)?;
                 match outcome {
-                    PromoteOutcome::Promoted { generation, old_tree } => {
-                        Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(generation),
-                            old_tree: old_tree.map(|path| path.display().to_string()),
-                            warning:
-                                "reload your editor: open files still point at the replaced tree"
-                                    .into(),
+                    SessionResolveOutcome::NoChanges => {
+                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
+                            session_id,
+                            diff: Vec::new(),
                         }))
                     }
+                    SessionResolveOutcome::Resolved { generation } => {
+                        let changes = self
+                            .handle
+                            .diff(base, generation)
+                            .await
+                            .map_err(stringify)?;
+                        self.pending
+                            .lock()
+                            .await
+                            .insert(
+                                session_id.clone(),
+                                PendingSession {
+                                    generation,
+                                    base,
+                                    label,
+                                },
+                            );
+                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
+                            session_id,
+                            diff: changes.into_iter().map(diff_entry).collect(),
+                        }))
+                    }
+                    SessionResolveOutcome::Conflict { message } => Err(message),
+                }
+            }
+            proto::Op::SessionApply { session_id } => {
+                let mut pending = self.pending.lock().await;
+                let session = pending
+                    .remove(&session_id)
+                    .ok_or_else(|| format!("no resolved Safe Mode session {session_id}"))?;
+                drop(pending);
+                let outcome = self
+                    .handle
+                    .apply_session(session.generation, session.base, session.label)
+                    .await
+                    .map_err(stringify)?;
+                match outcome {
+                    PromoteOutcome::Promoted {
+                        generation,
+                        old_tree,
+                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
+                        generation: acyclic_engine::generation_hex(generation),
+                        old_tree: old_tree.map(|path| path.display().to_string()),
+                        warning: "reload your editor: open files still point at the replaced tree"
+                            .into(),
+                        replayed_paths: 0,
+                    })),
                     PromoteOutcome::Conflict { message } => Err(message),
                 }
             }
+            proto::Op::SessionDiscard { session_id } => {
+                self.pending.lock().await.remove(&session_id);
+                Ok(proto::Reply::Unit)
+            }
+        }
+    }
+
+    /// Forks one checkout and shadow-mounts it directly at `repo_root` for
+    /// `session_id`'s duration (Safe Mode's session redirection). Only one
+    /// Safe Mode session can be active per repo at a time.
+    async fn session_fork(&self, session_id: String) -> Result<(), String> {
+        if !self.mounts.available {
+            return Err(format!(
+                "Safe Mode needs a mount provider and this host has none ({}).\n{}",
+                self.mounts.reason.as_deref().unwrap_or("unknown reason"),
+                fork::mount_setup_hint()
+            ));
+        }
+        if self.dry_session.lock().await.is_some() {
+            return Err("a Safe Mode session is already active for this repo".to_string());
+        }
+        let seed = self.handle.fork().await.map_err(stringify)?;
+        let shared = Arc::clone(&seed.shared);
+        let config = seed.config;
+        let guarded_paths = self.config.guarded_paths.clone();
+        let volume_id = seed.volume_id;
+        let destination = self.repo_root.clone();
+        let mount = tokio::task::block_in_place(move || {
+            let source = CheckoutMountSource::new(shared, config)
+                .map_err(|error| format!("mount source: {error:?}"))?;
+            let source: Arc<dyn MountFilesystem> =
+                if GuardedMountFilesystem::is_active(&guarded_paths) {
+                    Arc::new(GuardedMountFilesystem::new(
+                        Arc::new(source),
+                        &guarded_paths,
+                    ))
+                } else {
+                    Arc::new(source)
+                };
+            mount_native_over_existing(
+                NativeMountRequest {
+                    mount_id: acyclic_engine::MountId::new(),
+                    volume_id,
+                    destination,
+                    writable: true,
+                },
+                source,
+            )
+            .map_err(|error| format!("shadow mount: {error:?}"))
+        })?;
+        *self.dry_session.lock().await = Some(DrySession {
+            fork_id: short_id(),
+            session_id,
+            shared: seed.shared,
+            base: seed.base,
+            mount,
+        });
+        // The fork now shadows the real repo root: suspend mainline capture
+        // until resolve/apply, or the pipeline watcher captures the shadow's
+        // content and the mount lifecycle instead of real-tree mutations.
+        self.handle.set_shadowed(true).await.map_err(stringify)?;
+        Ok(())
+    }
+
+    /// Copy-mode forks: materialize the base generation into a real
+    /// directory per fork. Same ids, lifecycle, and promote semantics as
+    /// mounted forks; creation is O(tree) instead of O(1).
+    async fn fork_copies(
+        &self,
+        count: u32,
+        session_id: Option<String>,
+    ) -> Result<proto::Reply, String> {
+        let root = fork::forks_copy_root(&self.repo_root)
+            .ok_or("repo root has no parent for fork workspaces")?;
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let mut created = Vec::new();
+        for _ in 0..count {
+            let seed = self.handle.fork().await.map_err(stringify)?;
+            let id = short_id();
+            let dir = root.join(&id);
+            self.handle
+                .materialize(seed.base, dir.clone())
+                .await
+                .map_err(stringify)?;
+            let entry = proto::ForkEntry {
+                id: id.clone(),
+                path: dir.display().to_string(),
+                mode: ForkMode::Copy.as_str().to_string(),
+                base: acyclic_engine::generation_hex(seed.base),
+                created_at: unix_now(),
+                session_id: session_id.clone(),
+            };
+            self.forks.lock().await.insert(
+                id,
+                ForkState {
+                    shared: seed.shared,
+                    base: seed.base,
+                    entry: clone_entry(&entry),
+                    copy_dir: Some(dir),
+                },
+            );
+            created.push(entry);
+        }
+        Ok(proto::Reply::Forks(created))
+    }
+
+    /// Lands a fork. Three outcomes: the mainline is still at the fork's
+    /// base and the whole tree is swapped (mounted forks use the engine's
+    /// promote, copy forks the resolve/apply pair); the mainline moved but
+    /// nothing overlaps and the fork's paths are replayed in place; or the
+    /// fork had no content changes. Overlap is an error naming the paths.
+    async fn promote_fork(
+        &self,
+        id: &str,
+        fork: &ForkState,
+        label: &str,
+    ) -> Result<Landed, String> {
+        // Freeze the fork's writes and get at its overlay.
+        let overlay = match fork.copy_dir.as_deref() {
+            Some(dir) => {
+                let scratch = self.handle.scratch_checkout(fork.base).await.map_err(stringify)?;
+                fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
+                scratch
+            }
+            None => {
+                self.detach_route(id).await?;
+                Arc::clone(&fork.shared)
+            }
+        };
+        let head = self.handle.publish_head().await.map_err(stringify)?;
+        if head != fork.base {
+            return self.replay_onto_head(id, overlay, fork.base, head, label).await;
+        }
+        let outcome = if fork.copy_dir.is_some() {
+            self.land_overlay(overlay, fork.base, label).await?
+        } else {
+            self.handle
+                .promote(overlay, fork.base, label.to_string())
+                .await
+                .map_err(stringify)?
+        };
+        match outcome {
+            PromoteOutcome::Promoted {
+                generation,
+                old_tree: Some(old_tree),
+            } => Ok(Landed::Swapped {
+                generation,
+                old_tree,
+            }),
+            PromoteOutcome::Promoted {
+                generation,
+                old_tree: None,
+            } => Ok(Landed::Nothing { generation }),
+            PromoteOutcome::Conflict { message } => Err(message),
+        }
+    }
+
+    /// Unmoved mainline, overlay-backed fork: commit the overlay as an
+    /// unpublished generation and land it with the Safe Mode swap. A
+    /// materialized copy carries fresh timestamps, so metadata-only
+    /// differences count as "no changes" rather than swapping for nothing.
+    async fn land_overlay(
+        &self,
+        overlay: Arc<SharedLocalCheckout>,
+        base: acyclic_engine::GenerationId,
+        label: &str,
+    ) -> Result<PromoteOutcome, String> {
+        let resolved = self
+            .handle
+            .resolve_session(overlay, base, label.to_string())
+            .await
+            .map_err(stringify)?;
+        let generation = match resolved {
+            SessionResolveOutcome::NoChanges => {
+                return Ok(PromoteOutcome::Promoted {
+                    generation: base,
+                    old_tree: None,
+                })
+            }
+            SessionResolveOutcome::Conflict { message } => {
+                return Ok(PromoteOutcome::Conflict { message })
+            }
+            SessionResolveOutcome::Resolved { generation } => generation,
+        };
+        if content_changes(self.handle.diff(base, generation).await.map_err(stringify)?)
+            .is_empty()
+        {
+            return Ok(PromoteOutcome::Promoted {
+                generation: base,
+                old_tree: None,
+            });
+        }
+        self.handle
+            .apply_session(generation, base, label.to_string())
+            .await
+            .map_err(stringify)
+    }
+
+    /// The merge primitive, v1: path-disjoint replay. The mainline moved
+    /// past the fork's base. Diff both sides against the base; if no path on
+    /// one side is the same as, or inside, a path on the other, write the
+    /// fork's changed paths onto the current tree one by one (each write is
+    /// the same atomic single-path restore a `restore` uses), then checkpoint
+    /// and publish. Any overlap is a conflict that names the paths: content
+    /// merging is a later launch.
+    async fn replay_onto_head(
+        &self,
+        id: &str,
+        overlay: Arc<SharedLocalCheckout>,
+        base: acyclic_engine::GenerationId,
+        head: acyclic_engine::GenerationId,
+        label: &str,
+    ) -> Result<Landed, String> {
+        if !overlay.lock().await.has_pending_mutations() {
+            return Ok(Landed::Nothing { generation: head });
+        }
+        let snapshot = self
+            .handle
+            .snapshot_overlay(overlay)
+            .await
+            .map_err(stringify)?;
+        let fork_changes: Vec<PathBuf> = content_changes(self.handle.diff(base, snapshot).await.map_err(stringify)?)
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        if fork_changes.is_empty() {
+            return Ok(Landed::Nothing { generation: head });
+        }
+        let head_changes: Vec<PathBuf> = content_changes(self.handle.diff(base, head).await.map_err(stringify)?)
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        let mut overlaps: Vec<String> = fork_changes
+            .iter()
+            .filter(|fork_path| {
+                head_changes
+                    .iter()
+                    .any(|head_path| fork_path.starts_with(head_path) || head_path.starts_with(fork_path))
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        if !overlaps.is_empty() {
+            overlaps.sort();
+            let shown: Vec<&str> = overlaps.iter().take(8).map(String::as_str).collect();
+            let more = overlaps.len().saturating_sub(shown.len());
+            return Err(format!(
+                "the working tree moved past the fork's base ({}) and both sides changed {} path(s): {}{}. \
+                 Merge is path-disjoint in v1: re-fork from the current tree and re-apply those paths, \
+                 or rewind to the base",
+                acyclic_engine::generation_hex(base),
+                overlaps.len(),
+                shown.join(", "),
+                if more > 0 { format!(" (+{more} more)") } else { String::new() }
+            ));
+        }
+        // A subtree restore covers its descendants: restore each changed
+        // path only if no ancestor of it is also being restored.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for path in &fork_changes {
+            if !roots.iter().any(|root| path.starts_with(root)) {
+                roots.push(path.clone());
+            }
+        }
+        let target = self
+            .handle
+            .record_generation(snapshot, format!("fork {id} snapshot"))
+            .await
+            .map_err(stringify)?;
+        self.handle
+            .checkpoint(
+                CheckpointKind::PreRewind,
+                Attribution {
+                    label: Some(format!("before {label} (replay)")),
+                    ..Attribution::default()
+                },
+            )
+            .await
+            .map_err(stringify)?;
+        let mut written = 0u32;
+        for root in &roots {
+            self.handle
+                .restore_path(target.clone(), root.clone())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "replay stopped at {} after {written} path(s): {error}. The tree is partially \
+                         merged; `acyclic rewind --last` returns to the pre-replay safety checkpoint",
+                        root.display()
+                    )
+                })?;
+            written += 1;
+        }
+        let landed = self
+            .handle
+            .checkpoint(
+                CheckpointKind::Manual,
+                Attribution {
+                    label: Some(format!("{label} (replayed {written} paths onto moved mainline)")),
+                    ..Attribution::default()
+                },
+            )
+            .await
+            .map_err(stringify)?;
+        self.handle.commit().await.map_err(stringify)?;
+        Ok(Landed::Replayed {
+            generation: landed.generation,
+            paths: written,
+        })
+    }
+
+    /// Drops whatever backs a fork: its route for mounted forks, its
+    /// directory for copy forks.
+    async fn discard_fork_workspace(&self, id: &str, copy_dir: Option<&Path>) -> Result<(), String> {
+        match copy_dir {
+            Some(dir) => {
+                std::fs::remove_dir_all(dir).map_err(|error| format!("remove fork copy: {error}"))?;
+                Self::remove_if_empty(dir.parent());
+                Ok(())
+            }
+            None => self.detach_route(id).await,
+        }
+    }
+
+    fn remove_if_empty(dir: Option<&Path>) {
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir(dir);
+            let _ = dir.parent().map(std::fs::remove_dir);
         }
     }
 
@@ -437,8 +1119,7 @@ impl Server {
         // The kernel may hold a positive entry cache for the removed name
         // (FSKit caches until told otherwise): invalidate it eagerly.
         if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes()))
-            {
+            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes())) {
                 eprintln!("acyclic daemon: invalidate {id}: {error:?}");
             }
         }
@@ -480,16 +1161,148 @@ impl Server {
     /// Default diff base: the most recent session's first checkpoint, falling
     /// back to the oldest checkpoint on record.
     fn default_diff_base(&self, index: &Index) -> Result<CheckpointRow, String> {
-        let rows = index.list(None, 10_000).map_err(stringify)?;
-        let base = rows
-            .iter()
-            .rev()
-            .find(|row| row.session_id.is_some())
-            .and_then(|row| row.session_id.clone())
-            .and_then(|session| index.session_start(&session).ok().flatten())
-            .or_else(|| rows.last().cloned());
+        let from_session = match index.latest_session().map_err(stringify)? {
+            Some(session) => index
+                .session_start(&session.session_id)
+                .map_err(stringify)?,
+            None => None,
+        };
+        let base = match from_session {
+            Some(row) => Some(row),
+            None => index.oldest().map_err(stringify)?,
+        };
         base.ok_or_else(|| "no checkpoints yet".to_string())
     }
+
+    /// Builds the previous-session brief: where the last session (other
+    /// than `current`) ended, what it changed, and every branch it abandoned
+    /// by rewinding. Diffs are computed against the store, so counts are
+    /// exact rather than remembered.
+    async fn brief(&self, current: Option<&str>) -> Result<proto::BriefInfo, String> {
+        let index = self.open_index()?;
+        let Some(session) = index
+            .last_session_with_checkpoints(current)
+            .map_err(stringify)?
+        else {
+            return Ok(proto::BriefInfo::default());
+        };
+        let id = session.session_id.clone();
+        let start = index.session_start(&id).map_err(stringify)?;
+        let end = index.session_end(&id).map_err(stringify)?;
+        let last_any = index.list(Some(&id), None, 1).map_err(stringify)?.into_iter().next();
+
+        let (files_changed, sample_paths) = match (&start, &end) {
+            (Some(start), Some(end)) if start.generation != end.generation => {
+                let changes = content_changes(
+                    self.handle
+                        .diff(start.generation, end.generation)
+                        .await
+                        .map_err(stringify)?,
+                );
+                let sample = changes
+                    .iter()
+                    .take(5)
+                    .map(|change| change.path.display().to_string())
+                    .collect();
+                (changes.len() as u64, sample)
+            }
+            _ => (0, Vec::new()),
+        };
+
+        let mut abandoned = Vec::new();
+        if let (Some(start), Some(last)) = (&start, &last_any) {
+            for rewind in index
+                .rewinds_between(start.id, last.id)
+                .map_err(stringify)?
+            {
+                let Some(target) = rewind.rewind_target else { continue };
+                let branch = index.between(target, rewind.id).map_err(stringify)?;
+                let (Some(first), Some(last)) = (branch.first(), branch.last()) else {
+                    continue;
+                };
+                let target_row = index.by_id(target).map_err(stringify)?;
+                let files = match target_row {
+                    Some(target_row) if target_row.generation != last.generation => {
+                        content_changes(
+                            self.handle
+                                .diff(target_row.generation, last.generation)
+                                .await
+                                .map_err(stringify)?,
+                        )
+                        .len() as u64
+                    }
+                    _ => 0,
+                };
+                let turn = last.turn.or(first.turn);
+                let prompt = match (last.session_id.as_deref(), turn) {
+                    (Some(session), Some(turn)) => index
+                        .turn(session, turn)
+                        .map_err(stringify)?
+                        .map(|turn| turn.prompt),
+                    _ => None,
+                };
+                abandoned.push(proto::BriefAbandoned {
+                    from_checkpoint: first.id,
+                    to_checkpoint: last.id,
+                    rewound_to: target,
+                    turn,
+                    prompt,
+                    checkpoints: branch.len() as i64,
+                    files_changed: files,
+                });
+            }
+        }
+
+        let (end_turn, end_prompt) = match end.as_ref().and_then(|row| row.turn) {
+            Some(turn) => (
+                Some(turn),
+                index.turn(&id, turn).map_err(stringify)?.map(|turn| turn.prompt),
+            ),
+            None => (None, None),
+        };
+
+        // Drift: the tree may have moved since the session ended (another
+        // session that never ended cleanly, or edits with no session).
+        let drift_files = match (&end, index.latest_target().map_err(stringify)?) {
+            (Some(end), Some(latest)) if latest.generation != end.generation => content_changes(
+                self.handle
+                    .diff(end.generation, latest.generation)
+                    .await
+                    .map_err(stringify)?,
+            )
+            .len() as u64,
+            _ => 0,
+        };
+
+        Ok(proto::BriefInfo {
+            session: Some(proto::BriefSession {
+                session_id: id,
+                host: session.host,
+                started_at: session.started_at,
+                ended_at: session.ended_at,
+                turns: session.turns,
+                checkpoints: session.checkpoints,
+                end_checkpoint: end.as_ref().map(|row| row.id),
+                end_turn,
+                end_prompt,
+                files_changed,
+                sample_paths,
+                abandoned,
+            }),
+            drift_files,
+        })
+    }
+}
+
+/// Content changes only. A rewind or restore rewrites mtimes on every path
+/// it materializes, so metadata-only rows are noise for "what changed".
+fn content_changes(
+    changes: Vec<acyclic_engine::diff::FileChange>,
+) -> Vec<acyclic_engine::diff::FileChange> {
+    changes
+        .into_iter()
+        .filter(|change| change.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+        .collect()
 }
 
 fn err(message: String) -> proto::Payload {
@@ -512,15 +1325,34 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// How a fork ended up in the real tree.
+enum Landed {
+    /// Whole-tree swap; the old tree is in trash.
+    Swapped {
+        generation: acyclic_engine::GenerationId,
+        old_tree: PathBuf,
+    },
+    /// Path-by-path replay onto a moved mainline; no swap.
+    Replayed {
+        generation: acyclic_engine::GenerationId,
+        paths: u32,
+    },
+    /// No content changes to land.
+    Nothing {
+        generation: acyclic_engine::GenerationId,
+    },
+}
+
 fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
     proto::ForkEntry {
         id: entry.id.clone(),
         path: entry.path.clone(),
+        mode: entry.mode.clone(),
         base: entry.base.clone(),
         created_at: entry.created_at,
+        session_id: entry.session_id.clone(),
     }
 }
-
 
 fn stringify(error: EngineError) -> String {
     error.to_string()
@@ -535,6 +1367,20 @@ fn parse_kind(kind: &str) -> Result<CheckpointKind, String> {
     })
 }
 
+fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
+    proto::DiffEntry {
+        path: change.path.display().to_string(),
+        change: match change.change {
+            acyclic_engine::diff::ChangeKind::Added => "added",
+            acyclic_engine::diff::ChangeKind::Removed => "removed",
+            acyclic_engine::diff::ChangeKind::Modified => "modified",
+            acyclic_engine::diff::ChangeKind::MetadataOnly => "metadata",
+        }
+        .to_string(),
+        file_kind: format!("{:?}", change.file_kind).to_lowercase(),
+    }
+}
+
 fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     proto::TimelineEntry {
         id: row.id,
@@ -545,6 +1391,7 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
         tool_name: row.tool_name,
         label: row.label,
         error: row.error,
+        turn: row.turn,
     }
 }
 
