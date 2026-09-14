@@ -1421,20 +1421,19 @@ impl Pipeline {
         // Like `idle_commit`, failures here are advisory: the pending state
         // survives them, so the next tick retries, and nothing is waiting on
         // a reply.
-        let before = self.last_generation;
-        let before_row = self.last_checkpoint_row;
+        // The marker is keyed on the generation current *after* the drain:
+        // a drain that re-baselined (structural root hint, `Recovered` row)
+        // moved it, and edits the rescan captured after that row still need
+        // a checkpoint. `try_auto_checkpoint` records nothing when the tree
+        // hashes the same as the last row, so a recovery that captured
+        // nothing new costs no spurious `Auto` row either.
         let mark_pending = |pipeline: &mut Self| {
             pipeline.auto_pending = Some(AutoPending {
-                since_generation: before,
+                since_generation: pipeline.last_generation,
                 last_change: Instant::now(),
             });
         };
         match self.drain_watcher().await {
-            // A structural root hint makes `drain_watcher` re-baseline and
-            // record a `Recovered` row itself (row ids only grow, so a new
-            // row is the exact signal, even when the rebuilt tree hashes
-            // the same); nothing is left to record.
-            Ok(true) if self.last_checkpoint_row != before_row => self.auto_pending = None,
             Ok(true) => mark_pending(self),
             Ok(false) => {}
             Err(error) => {
@@ -1482,6 +1481,16 @@ impl Pipeline {
 
     async fn try_auto_checkpoint(&mut self) -> Result<()> {
         let generation = self.checkpoint_engine().await?;
+        if generation == self.last_generation {
+            // Whatever was drained left the tree identical to the last
+            // recorded row (a recovery baseline, or a write that restored
+            // the previous bytes): nothing to record.
+            crate::trace!(
+                "pipeline",
+                "auto-checkpoint: tree unchanged since last row, no row"
+            );
+            return Ok(());
+        }
         let row = self
             .index
             .record(generation, CheckpointKind::Auto, &Attribution::default())?;

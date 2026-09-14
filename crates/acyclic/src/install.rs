@@ -444,18 +444,16 @@ impl McpEntry {
         );
         let repo_arg = repo.display().to_string();
         let plain = format!("{NAME}-{basename}");
-        // A key is free when absent, or already ours for this very repo.
-        // Anything else there (another repo, a hand-written server, even
-        // an entry with no args) is somebody's and must not be replaced,
+        // A key is free when absent, or already ours for this very repo
+        // (args are exactly `mcp --repo <this path>`; the command may have
+        // moved). Anything else there (another repo, a hand-written server,
+        // an entry with other args) is somebody's and must not be replaced,
         // so keep extending the candidate until one is free.
+        let ours = json!(["mcp", "--repo", repo_arg]);
         let occupied = |key: &str| {
-            taken.get(key).is_some_and(|entry| {
-                entry
-                    .get("args")
-                    .and_then(|args| args.get(2))
-                    .and_then(Value::as_str)
-                    != Some(repo_arg.as_str())
-            })
+            taken
+                .get(key)
+                .is_some_and(|entry| entry.get("args") != Some(&ours))
         };
         let hashed = format!("{plain}-{:08x}", fnv1a(repo_arg.as_bytes()));
         let key = std::iter::once(plain)

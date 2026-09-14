@@ -74,8 +74,9 @@ check_width 200 "shell" "$SHELL_FILES"
 #    must carry a `TODO(topic)` somewhere on the line (opening one or
 #    referring to one), and a line that *opens* one must write `TODO(topic):`
 #    with the colon, so the topic and the note are visibly separate.
-comment_lines="$(scan "$RUST_FILES
-$SHELL_FILES" '^[[:space:]]*(//|#)' | grep -vE '^scripts/check-code-quality\.sh:' || true)"
+comment_raw="$(scan "$RUST_FILES
+$SHELL_FILES" '^[[:space:]]*(//|#)')"
+comment_lines="$(printf '%s\n' "$comment_raw" | grep -vE '^scripts/check-code-quality\.sh:' || true)"
 todo_hits="$(printf '%s\n' "$comment_lines" \
   | grep -E '\b(TODO|FIXME|XXX)\b' \
   | grep -vE '\b(TODO|FIXME)\([A-Za-z0-9/ -]+\)' || true)"
