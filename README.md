@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main
 cd your-repo
 acyclic init                       # starts the daemon, builds the first snapshot
 acyclic install claude-code        # hooks, /rewind /timeline /fork, two skills; checked in
+acyclic install codex               # .codex/hooks.json + AGENTS.md cheatsheet; checked in
+acyclic install cursor              # .cursor/hooks.json + always-applied rule; checked in
 ```
 
 Any shell-capable agent can use the CLI directly; `acyclic install agents-md` teaches it the verbs. Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
@@ -55,7 +57,7 @@ V1 is entirely local: no sandboxes, no managed sessions, no cloud sync. It ships
 One engine, thin adapters:
 
 - **`acyclic` CLI + daemon** — watcher, Merkle-DAG snapshot store, index. Host-agnostic.
-- **Per-host adapters** — Claude Code (built: hooks, `/rewind` `/timeline` `/fork`, two skills; `acyclic install claude-code`), anything shell-capable (built: `acyclic install agents-md`), Codex and OpenCode (planned).
+- **Per-host adapters** — Claude Code (built: hooks, `/rewind` `/timeline` `/fork`, two skills; `acyclic install claude-code`), Codex (built: `.codex/hooks.json` + AGENTS.md; `acyclic install codex`), Cursor (built: `.cursor/hooks.json` + an always-applied rule; `acyclic install cursor`), anything shell-capable (built: `acyclic install agents-md`), OpenCode (planned).
 
 ## Launch plan
 

@@ -15,21 +15,41 @@ use acyclic_proto as proto;
 
 use crate::client::{Client, ConnectError, Spawn};
 
-/// Claude Code hook payload (superset-tolerant: unknown fields ignored).
+/// Host hook payload (superset-tolerant: unknown fields ignored). Claude
+/// Code and Codex both use `session_id`/`tool_name`/`tool_use_id`; Cursor
+/// instead sends `conversation_id` and, for `beforeShellExecution`, a bare
+/// `command` string with no tool name at all.
 #[derive(Debug, serde::Deserialize, Default)]
 struct Payload {
     #[serde(default)]
     session_id: Option<String>,
+    /// Cursor's stand-in for `session_id` on most events.
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
     tool_use_id: Option<String>,
-    /// `UserPromptSubmit`: the prompt text.
+    /// `UserPromptSubmit` (Cursor: `beforeSubmitPrompt`): the prompt text.
     #[serde(default)]
     prompt: Option<String>,
     /// `SessionStart`: "startup" | "resume" | "clear" | "compact".
     #[serde(default)]
     source: Option<String>,
+    /// Cursor's `beforeShellExecution`/`afterShellExecution`: the command
+    /// run, standing in for `tool_name` when that field is absent.
+    #[serde(default)]
+    command: Option<String>,
+}
+
+impl Payload {
+    fn session(&mut self) -> Option<String> {
+        self.session_id.take().or_else(|| self.conversation_id.take())
+    }
+
+    fn tool(&mut self) -> Option<String> {
+        self.tool_name.take().or_else(|| self.command.take().map(|_| "Bash".to_string()))
+    }
 }
 
 /// The bound on a pre-tool wait: an exact boundary is nice to have, but the
@@ -41,7 +61,8 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     // Reading stdin can't hang the agent: hosts close it after writing.
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
-    let payload = parse_payload(&raw);
+    let mut payload = parse_payload(&raw);
+    let host = std::env::var("ACYCLIC_HOST").unwrap_or_else(|_| "claude-code".into());
 
     let spawn = if event == "session-start" {
         Spawn::Allowed
@@ -62,31 +83,31 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     let op = match event {
         "pre-tool" => proto::Op::Checkpoint {
             kind: "pre".into(),
-            session_id: payload.session_id,
-            tool_call_id: payload.tool_use_id,
-            tool_name: payload.tool_name,
+            session_id: payload.session(),
+            tool_call_id: payload.tool_use_id.take(),
+            tool_name: payload.tool(),
             label: None,
             wait: true,
             durable: false,
         },
         "post-tool" => proto::Op::Checkpoint {
             kind: "post".into(),
-            session_id: payload.session_id,
-            tool_call_id: payload.tool_use_id,
-            tool_name: payload.tool_name,
+            session_id: payload.session(),
+            tool_call_id: payload.tool_use_id.take(),
+            tool_name: payload.tool(),
             label: None,
             wait: false,
             durable: false,
         },
         "user-prompt" => proto::Op::TurnStart {
-            session_id: payload.session_id.unwrap_or_default(),
+            session_id: payload.session().unwrap_or_default(),
             prompt: payload.prompt.unwrap_or_default(),
         },
         "session-start" => {
-            let session_id = payload.session_id.unwrap_or_default();
+            let session_id = payload.session().unwrap_or_default();
             let registered = client.call(proto::Op::SessionStart {
                 session_id: session_id.clone(),
-                host: "claude-code".into(),
+                host,
             });
             if let Err(message) = registered {
                 eprintln!("{NAME} hook (session-start): {message}");
@@ -107,7 +128,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             return 0;
         }
         "session-end" => proto::Op::SessionEnd {
-            session_id: payload.session_id.unwrap_or_default(),
+            session_id: payload.session().unwrap_or_default(),
         },
         other => {
             eprintln!("{NAME} hook: unknown event {other:?}");
@@ -122,6 +143,13 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     if let Err(message) = client.call(op) {
         // Deadline overruns and daemon hiccups are advisory only.
         eprintln!("{NAME} hook ({event}): {message}");
+    }
+    // Cursor's permission-controlled hooks (beforeShellExecution,
+    // beforeSubmitPrompt) require a JSON response on stdout. Claude Code
+    // injects UserPromptSubmit stdout into the conversation as context, so
+    // this must stay Cursor-only rather than firing for every host.
+    if host == "cursor" && (event == "pre-tool" || event == "user-prompt") {
+        println!("{{\"permission\":\"allow\"}}");
     }
     0
 }
@@ -164,6 +192,23 @@ mod tests {
         assert_eq!(payload.prompt.as_deref(), Some("fix the JWT refactor"));
         let start = parse_payload(r#"{"session_id":"abc","source":"compact"}"#);
         assert_eq!(start.source.as_deref(), Some("compact"));
+    }
+
+    #[test]
+    fn cursor_payload_falls_back_to_conversation_id_and_command() {
+        let mut payload = parse_payload(
+            r#"{"conversation_id":"c1","command":"ls -la","cwd":"/x",
+                "hook_event_name":"beforeShellExecution"}"#,
+        );
+        assert_eq!(payload.session_id, None);
+        assert_eq!(payload.session(), Some("c1".to_string()));
+        assert_eq!(payload.tool(), Some("Bash".to_string()));
+    }
+
+    #[test]
+    fn session_prefers_session_id_over_conversation_id() {
+        let mut payload = parse_payload(r#"{"session_id":"s1","conversation_id":"c1"}"#);
+        assert_eq!(payload.session(), Some("s1".to_string()));
     }
 
     #[test]

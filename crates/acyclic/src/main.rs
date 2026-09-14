@@ -159,7 +159,7 @@ enum Command {
     },
     /// Wire a host's adapter into the current repo.
     Install {
-        /// claude-code | agents-md
+        /// claude-code | codex | cursor | agents-md
         host: String,
     },
     /// Record a host session starting (hook use).

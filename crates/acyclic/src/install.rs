@@ -3,6 +3,15 @@
 //! claude-code: merges hook entries into the repo's `.claude/settings.json`
 //! and drops the `/rewind`, `/timeline`, and `/fork` commands and the
 //! self-rollback and fork-decompose skills into `.claude/`.
+//! codex: merges the same lifecycle hooks into `.codex/hooks.json` (Codex's
+//! own event names and payload shape match Claude Code's closely enough
+//! that `acyclic hook` needs no host-specific parsing) and appends the
+//! agents-md cheatsheet, since Codex already reads AGENTS.md.
+//! cursor: merges Cursor's differently-named agent hooks into
+//! `.cursor/hooks.json` and drops an always-applied rule at
+//! `.cursor/rules/acyclic.mdc`; Cursor's payload shape (`conversation_id`
+//! instead of `session_id`, no `tool_name` on shell hooks) is normalized in
+//! `hook::Payload`.
 //! Checked-in files, so the whole team inherits the wiring.
 //! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
 //! shell-capable agent.
@@ -15,9 +24,11 @@ use serde_json::{json, Value};
 pub fn run(repo: &Path, host: &str) -> Result<(), String> {
     match host {
         "claude-code" => claude_code(repo),
+        "codex" => codex(repo),
+        "cursor" => cursor(repo),
         "agents-md" | "--agents-md" => agents_md(repo),
         other => Err(format!(
-            "unknown host {other:?} (expected claude-code | agents-md)"
+            "unknown host {other:?} (expected claude-code | codex | cursor | agents-md)"
         )),
     }
 }
@@ -56,6 +67,38 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The five lifecycle events every adapter wires, and the matcher (tool
+/// filter) and hook command each needs. Shared across hosts because Claude
+/// Code and Codex use the same event names and payload shape; only the
+/// container file's shape around this table differs. `host`, when it's
+/// anything other than `acyclic hook`'s default (`claude-code`), is passed
+/// through `ACYCLIC_HOST` so `session-start` records the right adapter and
+/// Cursor's permission-controlled hooks get their required JSON reply.
+fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] {
+    let cmd = |verb: &str| {
+        if host == "claude-code" {
+            format!("{NAME} hook {verb}")
+        } else {
+            format!("ACYCLIC_HOST={host} {NAME} hook {verb}")
+        }
+    };
+    [
+        (
+            "PreToolUse",
+            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            cmd("pre-tool"),
+        ),
+        (
+            "PostToolUse",
+            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            cmd("post-tool"),
+        ),
+        ("UserPromptSubmit", None, cmd("user-prompt")),
+        ("SessionStart", None, cmd("session-start")),
+        ("SessionEnd", None, cmd("session-end")),
+    ]
+}
+
 /// Merges our hook entries into settings.json without disturbing anything
 /// else in the file. Idempotent: an entry whose command mentions
 /// `acyclic hook` is replaced, never duplicated.
@@ -67,34 +110,32 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     };
 
-    let events: [(&str, Option<&str>, &str); 5] = [
-        (
-            "PreToolUse",
-            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            &format!("{NAME} hook pre-tool"),
-        ),
-        (
-            "PostToolUse",
-            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            &format!("{NAME} hook post-tool"),
-        ),
-        ("UserPromptSubmit", None, &format!("{NAME} hook user-prompt")),
-        ("SessionStart", None, &format!("{NAME} hook session-start")),
-        ("SessionEnd", None, &format!("{NAME} hook session-end")),
-    ];
-
     let hooks = settings
         .as_object_mut()
         .ok_or("settings.json is not an object")?
         .entry("hooks")
         .or_insert(json!({}));
     let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
+    merge_event_hooks(hooks, "hooks", "claude-code")?;
 
-    for (event, matcher, command) in events {
-        let entries = hooks.entry(event).or_insert(json!([]));
+    let text = serde_json::to_string_pretty(&settings).map_err(stringify)?;
+    std::fs::write(settings_path, text + "\n").map_err(stringify)?;
+    Ok(())
+}
+
+/// Merges our entries into a map keyed directly by event name (Codex's
+/// `.codex/hooks.json` shape — no enclosing `"hooks"` key). Same
+/// idempotency contract as `merge_hooks`.
+fn merge_event_hooks(
+    events_map: &mut serde_json::Map<String, Value>,
+    label: &str,
+    host: &str,
+) -> Result<(), String> {
+    for (event, matcher, command) in hook_events(host) {
+        let entries = events_map.entry(event).or_insert(json!([]));
         let entries = entries
             .as_array_mut()
-            .ok_or_else(|| format!("hooks.{event} is not an array"))?;
+            .ok_or_else(|| format!("{label}.{event} is not an array"))?;
         entries.retain(|entry| !is_ours(entry));
         let mut entry = json!({
             "hooks": [{ "type": "command", "command": command }]
@@ -104,22 +145,128 @@ fn merge_hooks(settings_path: &Path) -> Result<(), String> {
         }
         entries.push(entry);
     }
-
-    let text = serde_json::to_string_pretty(&settings).map_err(stringify)?;
-    std::fs::write(settings_path, text + "\n").map_err(stringify)?;
     Ok(())
 }
 
-/// An entry is ours iff one of its commands invokes `acyclic hook`.
-/// Structural, not substring-over-JSON: a user hook that merely mentions
-/// the phrase in an argument is left alone.
+/// An entry is ours iff one of its commands invokes `acyclic hook`, with or
+/// without our `ACYCLIC_HOST=<host>` env prefix (Codex/Cursor). Structural,
+/// not substring-over-JSON: a user hook that merely mentions the phrase in
+/// an argument is left alone.
 fn is_ours(entry: &Value) -> bool {
     entry["hooks"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|hook| hook["command"].as_str())
-        .any(|command| command == NAME || command.starts_with(&format!("{NAME} hook")))
+        .any(is_our_command)
+}
+
+fn is_our_command(command: &str) -> bool {
+    let command = command
+        .strip_prefix("ACYCLIC_HOST=")
+        .and_then(|rest| rest.split_once(' '))
+        .map_or(command, |(_, rest)| rest);
+    command == NAME || command.starts_with(&format!("{NAME} hook"))
+}
+
+/// Codex CLI: `.codex/hooks.json` keyed directly by event name (no
+/// enclosing `"hooks"` object, unlike Claude Code's settings.json), plus
+/// the same host-neutral cheatsheet block Codex reads from AGENTS.md.
+fn codex(repo: &Path) -> Result<(), String> {
+    let codex_dir = repo.join(".codex");
+    std::fs::create_dir_all(&codex_dir).map_err(stringify)?;
+    merge_codex_hooks(&codex_dir.join("hooks.json"))?;
+    agents_md(repo)?;
+
+    println!("codex adapter installed into {}", codex_dir.display());
+    println!("  hooks: .codex/hooks.json (pre/post tool, prompt, session)");
+    println!("  AGENTS.md carries the {NAME} cheatsheet");
+    println!("check these files in so the whole team inherits checkpointing.");
+    Ok(())
+}
+
+fn merge_codex_hooks(hooks_path: &Path) -> Result<(), String> {
+    let mut hooks: Value = match std::fs::read_to_string(hooks_path) {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", hooks_path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.to_string()),
+    };
+    let events_map = hooks.as_object_mut().ok_or("hooks.json is not an object")?;
+    merge_event_hooks(events_map, "hooks.json", "codex")?;
+
+    let text = serde_json::to_string_pretty(&hooks).map_err(stringify)?;
+    std::fs::write(hooks_path, text + "\n").map_err(stringify)?;
+    Ok(())
+}
+
+/// Cursor: `.cursor/hooks.json` (schema version 1, entries carry `command`
+/// and `type` directly rather than Claude/Codex's nested `hooks` array),
+/// plus an always-applied project rule so the model has the CLI verbs in
+/// context. Cursor's hook events and payload shape differ from Claude
+/// Code/Codex (see `hook::Payload`'s `conversation_id`/`command` fallbacks
+/// and `hook::run`'s Cursor-only `{"permission":"allow"}` reply), so this
+/// writes Cursor's own event names rather than reusing `hook_events()`.
+fn cursor(repo: &Path) -> Result<(), String> {
+    let cursor_dir = repo.join(".cursor");
+    std::fs::create_dir_all(cursor_dir.join("rules")).map_err(stringify)?;
+    merge_cursor_hooks(&cursor_dir.join("hooks.json"))?;
+    std::fs::write(
+        cursor_dir.join("rules/acyclic.mdc"),
+        product::render(CURSOR_RULE),
+    )
+    .map_err(stringify)?;
+
+    println!("cursor adapter installed into {}", cursor_dir.display());
+    println!("  hooks: .cursor/hooks.json (shell + file-edit + prompt + session)");
+    println!("  rule:  .cursor/rules/acyclic.mdc");
+    println!("check these files in so the whole team inherits checkpointing.");
+    Ok(())
+}
+
+fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
+    let mut root: Value = match std::fs::read_to_string(hooks_path) {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", hooks_path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.to_string()),
+    };
+    let root_obj = root.as_object_mut().ok_or("hooks.json is not an object")?;
+    root_obj.entry("version").or_insert(json!(1));
+    let hooks = root_obj.entry("hooks").or_insert(json!({}));
+    let hooks = hooks.as_object_mut().ok_or("hooks.hooks is not an object")?;
+
+    // Cursor entries carry `command`/`type` directly (no nested `hooks`
+    // array), so its own merge loop rather than `merge_event_hooks`.
+    let events: [(&str, &str); 6] = [
+        ("sessionStart", "session-start"),
+        ("sessionEnd", "session-end"),
+        ("beforeShellExecution", "pre-tool"),
+        ("afterShellExecution", "post-tool"),
+        ("afterFileEdit", "post-tool"),
+        ("beforeSubmitPrompt", "user-prompt"),
+    ];
+    for (event, verb) in events {
+        let entries = hooks.entry(event).or_insert(json!([]));
+        let entries = entries
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.hooks.{event} is not an array"))?;
+        entries.retain(|entry| !is_our_cursor_entry(entry));
+        entries.push(json!({
+            "type": "command",
+            "command": format!("ACYCLIC_HOST=cursor {NAME} hook {verb}"),
+        }));
+    }
+
+    let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
+    std::fs::write(hooks_path, text + "\n").map_err(stringify)?;
+    Ok(())
+}
+
+fn is_our_cursor_entry(entry: &Value) -> bool {
+    entry["command"].as_str().is_some_and(is_our_command)
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
@@ -451,6 +598,31 @@ of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
 `exclude` in .{{name}}/config.toml are never checkpointed; a rewind leaves
 them untouched.
 "#;
+
+const CURSOR_RULE: &str = r#"---
+description: {{name}} checkpoints - use the CLI to inspect and restore history
+alwaysApply: true
+---
+
+## {{name}} checkpoints
+
+This repo uses {{name}}: the working tree (untracked + gitignored files
+included) is snapshotted by a local daemon. Useful commands:
+
+    {{name}} checkpoint --wait -m "msg"   snapshot now, note the id
+    {{name}} timeline                     recent checkpoints
+    {{name}} rewind <id> --yes            restore the tree exactly
+    {{name}} diff --stat                  everything changed this session
+    {{name}} turns                        which prompt caused which checkpoints
+    {{name}} diff --turn N                what one conversation turn changed
+    {{name}} restore <id> <path>          bring back one file, leave the rest
+    {{name}} brief                        where the previous session ended
+
+Before a risky change, checkpoint. After a failed attempt, rewind instead
+of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
+`exclude` in .{{name}}/config.toml are never checkpointed; a rewind leaves
+them untouched.
+"#;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +704,80 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("AGENTS.md")).expect("read");
         assert!(text.starts_with("# Existing\n"));
         assert_eq!(text.matches(&format!("## {NAME} checkpoints")).count(), 1);
+    }
+
+    #[test]
+    fn codex_install_is_idempotent_and_writes_agents_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        codex(dir.path()).expect("first install");
+        codex(dir.path()).expect("second install");
+
+        let hooks_path = dir.path().join(".codex/hooks.json");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read")).expect("json");
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "UserPromptSubmit",
+            "SessionStart",
+            "SessionEnd",
+        ] {
+            let entries = value[event].as_array().expect("array");
+            assert_eq!(entries.iter().filter(|e| is_ours(e)).count(), 1, "{event}");
+        }
+        assert_eq!(
+            value["SessionStart"][0]["hooks"][0]["command"],
+            format!("ACYCLIC_HOST=codex {NAME} hook session-start")
+        );
+
+        let agents_md = std::fs::read_to_string(dir.path().join("AGENTS.md")).expect("read");
+        assert_eq!(
+            agents_md.matches(&format!("## {NAME} checkpoints")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cursor_install_is_idempotent_and_writes_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        cursor(dir.path()).expect("first install");
+        cursor(dir.path()).expect("second install");
+
+        let hooks_path = dir.path().join(".cursor/hooks.json");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read")).expect("json");
+        assert_eq!(value["version"], 1);
+        for event in [
+            "sessionStart",
+            "sessionEnd",
+            "beforeShellExecution",
+            "afterShellExecution",
+            "afterFileEdit",
+            "beforeSubmitPrompt",
+        ] {
+            let entries = value["hooks"][event].as_array().expect("array");
+            assert_eq!(
+                entries.iter().filter(|e| is_our_cursor_entry(e)).count(),
+                1,
+                "{event}"
+            );
+        }
+        assert_eq!(
+            value["hooks"]["beforeShellExecution"][0]["command"],
+            format!("ACYCLIC_HOST=cursor {NAME} hook pre-tool")
+        );
+
+        let rule = std::fs::read_to_string(dir.path().join(".cursor/rules/acyclic.mdc")).expect("read");
+        assert!(rule.contains(&format!("## {NAME} checkpoints")));
+    }
+
+    #[test]
+    fn is_our_command_recognizes_host_prefixed_form() {
+        assert!(is_our_command(&format!("ACYCLIC_HOST=cursor {NAME} hook pre-tool")));
+        assert!(is_our_command(&format!("{NAME} hook pre-tool")));
+        assert!(!is_our_command("echo not ours"));
+        // A user command mentioning our phrase as an argument, not invoking
+        // it, is left alone.
+        assert!(!is_our_command(&format!("echo {NAME} hook mention")));
     }
 }

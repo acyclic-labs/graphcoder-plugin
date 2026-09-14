@@ -85,3 +85,48 @@ setup_repo() {
 settle() {
   sleep "${1:-1}"
 }
+
+# Portable bound on a live host CLI session: stock macOS ships neither GNU
+# `timeout` nor `gtimeout` (coreutils), so scripts that shell out to a real
+# agent CLI (codex-e2e.sh, cursor-e2e.sh) cannot rely on either being
+# present. Runs "$@" as its own process group (`set -m`) and signals the
+# whole group, not just the direct child, if it outlives $1 seconds — a
+# plain `kill $pid` only reaches the CLI's own process, and codex/cursor
+# spawn subprocess trees for tool calls (shell commands the agent runs);
+# without the group kill those grandchildren outlive the "timed out" test
+# and can wedge the next script's daemon or repo. TERM first, KILL 2s
+# later for anything that ignored it. Preserves "$@"'s exit code; stdout/
+# stderr pass through untouched so the caller's own redirection and
+# command substitution work exactly as with a real `timeout`.
+with_timeout() {
+  local secs="$1"
+  shift
+  local was_m
+  case "$-" in *m*) was_m=1 ;; *) was_m=0 ;; esac
+  set -m
+  ("$@") &
+  local pid=$!
+  [ "$was_m" -eq 1 ] || set +m
+  (
+    sleep "$secs" 2>/dev/null
+    kill -TERM "-$pid" 2>/dev/null
+    sleep 2
+    kill -KILL "-$pid" 2>/dev/null
+  ) &
+  local watchdog=$!
+  local code=0
+  wait "$pid" 2>/dev/null || code=$?
+  kill "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+  return "$code"
+}
+
+# Fails the calling script's skip() path (must be defined by the caller)
+# with a clear reason when an installed host CLI's --help output doesn't
+# mention a flag the test depends on, rather than letting a stale flag
+# produce an opaque CLI error partway through a live session.
+require_flag() {
+  local help_output="$1" flag="$2" cli_name="$3"
+  printf '%s' "$help_output" | grep -qe "$flag" \
+    || skip "$cli_name CLI is missing expected flag $flag (version drift? check its --help)"
+}
