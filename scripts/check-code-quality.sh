@@ -29,28 +29,38 @@ fail=0
 RUST_FILES="$(git ls-files --cached --others --exclude-standard 'crates/*.rs' 'crates/**/*.rs')"
 SHELL_FILES="$(git ls-files --cached --others --exclude-standard '*.sh' 'scripts/*.sh' 'tests/**/*.sh' 'packaging/**/*.sh')"
 
-# grep over the file list, failing closed: exit 1 (no match) is an empty
-# result, anything else (unreadable file, bad pattern) fails the check
-# instead of silently passing it. One grep per file rather than xargs, so
-# a real error is not folded into xargs' single "some grep exited 1-125"
-# status.
+# grep over the file list (one path per line), failing closed: exit 1 (no
+# match) is an empty result, anything else (unreadable file, bad pattern)
+# returns 2 so the caller can abort instead of silently passing. One grep
+# per file rather than xargs, so a real error is not folded into xargs'
+# single "some grep exited 1-125" status; `read -r` rather than word
+# splitting, so a path with glob characters is not expanded.
 grep_files() {
   local files="$1" pattern="$2" file rc
-  for file in $files; do
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
     rc=0
     grep -nHE "$pattern" "$file" || rc=$?
     if [ "$rc" -gt 1 ]; then
       echo "grep failed (exit $rc) on $file while checking: $pattern" >&2
-      exit 2
+      return 2
     fi
-  done
+  done <<< "$files"
+}
+
+# Captures grep_files' output; a grep error is fatal here, outside any
+# `|| true` a later filtering stage needs.
+scan() {
+  local out
+  out="$(grep_files "$1" "$2")" || exit 2
+  printf '%s' "$out"
 }
 
 # 1. Line length.
 check_width() {
-  local limit="$1" label="$2" files="$3" hits
-  hits="$(grep_files "$files" ".{$((limit + 1)),}" \
-    | grep -vE '^[^:]+:[0-9]+:(description|name): ' || true)"
+  local limit="$1" label="$2" files="$3" raw hits
+  raw="$(scan "$files" ".{$((limit + 1)),}")"
+  hits="$(printf '%s\n' "$raw" | grep -vE '^[^:]+:[0-9]+:(description|name): ' | grep -v '^$' || true)"
   if [ -n "$hits" ]; then
     echo "$label lines over $limit columns (wrap the string or comment):" >&2
     echo "$hits" | cut -c1-160 >&2
@@ -64,8 +74,8 @@ check_width 200 "shell" "$SHELL_FILES"
 #    must carry a `TODO(topic)` somewhere on the line (opening one or
 #    referring to one), and a line that *opens* one must write `TODO(topic):`
 #    with the colon, so the topic and the note are visibly separate.
-comment_lines="$(grep_files "$RUST_FILES $SHELL_FILES" '^[[:space:]]*(//|#)' \
-  | grep -vE '^scripts/check-code-quality\.sh:' || true)"
+comment_lines="$(scan "$RUST_FILES
+$SHELL_FILES" '^[[:space:]]*(//|#)' | grep -vE '^scripts/check-code-quality\.sh:' || true)"
 todo_hits="$(printf '%s\n' "$comment_lines" \
   | grep -E '\b(TODO|FIXME|XXX)\b' \
   | grep -vE '\b(TODO|FIXME)\([A-Za-z0-9/ -]+\)' || true)"

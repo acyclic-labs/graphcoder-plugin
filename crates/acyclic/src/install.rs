@@ -444,17 +444,25 @@ impl McpEntry {
         );
         let repo_arg = repo.display().to_string();
         let plain = format!("{NAME}-{basename}");
-        let points_elsewhere = |key: &str| {
-            taken
-                .get(key)
-                .and_then(|entry| entry.get("args")?.get(2)?.as_str())
-                .is_some_and(|existing| existing != repo_arg)
+        // A key is free when absent, or already ours for this very repo.
+        // Anything else there (another repo, a hand-written server, even
+        // an entry with no args) is somebody's and must not be replaced,
+        // so keep extending the candidate until one is free.
+        let occupied = |key: &str| {
+            taken.get(key).is_some_and(|entry| {
+                entry
+                    .get("args")
+                    .and_then(|args| args.get(2))
+                    .and_then(Value::as_str)
+                    != Some(repo_arg.as_str())
+            })
         };
-        let key = if points_elsewhere(&plain) {
-            format!("{plain}-{:08x}", fnv1a(repo_arg.as_bytes()))
-        } else {
-            plain
-        };
+        let hashed = format!("{plain}-{:08x}", fnv1a(repo_arg.as_bytes()));
+        let key = std::iter::once(plain)
+            .chain(std::iter::once(hashed.clone()))
+            .chain((2u32..).map(|n| format!("{hashed}-{n}")))
+            .find(|candidate| !occupied(candidate))
+            .unwrap_or(hashed);
         Self {
             key,
             command: exe.display().to_string(),
@@ -1307,9 +1315,10 @@ mod tests {
             merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("merge");
             entry.key
         };
+        // Twice: the second install must be idempotent.
         register(repo);
-        register(repo); // idempotent
-                        // A second repo lands alongside, not on top of, the first.
+        register(repo);
+        // A second repo lands alongside, not on top of, the first.
         let other_repo = std::path::Path::new("/Users/dev/other-repo");
         register(other_repo);
         // A third repo with the same directory name as the first gets a
@@ -1322,6 +1331,23 @@ mod tests {
             "{twin_key}"
         );
         assert_eq!(register(twin_repo), twin_key, "the suffixed key is stable");
+        // Even the suffixed key is checked: a hand-written server sitting on
+        // it is left alone and the next candidate is used.
+        let planted = {
+            let mut config: Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
+                    .expect("json");
+            let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+            let fourth = std::path::Path::new("/Users/dev/again/my-repo");
+            let would_be = McpEntry::per_machine(exe, fourth, &taken).key;
+            config["mcpServers"][&would_be] = json!({ "command": "/usr/bin/theirs", "args": [] });
+            std::fs::write(&config_path, config.to_string()).expect("plant");
+            let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+            let entry = McpEntry::per_machine(exe, fourth, &taken);
+            merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("merge");
+            (would_be, entry.key)
+        };
+        assert_ne!(planted.0, planted.1, "occupied suffix skipped");
 
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
@@ -1350,7 +1376,16 @@ mod tests {
             value["mcpServers"][&twin_key]["args"][2],
             twin_repo.display().to_string()
         );
-        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(4));
+        assert_eq!(
+            value["mcpServers"][&planted.0]["command"], "/usr/bin/theirs",
+            "planted server untouched"
+        );
+        assert_eq!(
+            value["mcpServers"][&planted.1]["args"][2],
+            "/Users/dev/again/my-repo"
+        );
+        // other-tool, my-repo, other-repo, twin, planted, fourth.
+        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(6));
     }
 
     #[test]

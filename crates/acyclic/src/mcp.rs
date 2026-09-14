@@ -278,10 +278,11 @@ impl McpServer {
                 return Ok("no turns recorded yet".into());
             }
             let mut lines = Vec::with_capacity(turns.len());
-            // Newest TURNS_SHOWN turns, prompts clipped: a long history of
-            // raw prompts would crowd the host's context. The session
-            // prefix is what tells `t1` of one session from another's.
-            for turn in turns.into_iter().take(TURNS_SHOWN) {
+            // Newest TURNS_SHOWN turns (the daemon lists oldest first),
+            // prompts clipped: a long history of raw prompts would crowd the
+            // host's context. The session prefix is what tells `t1` of one
+            // session from another's.
+            for turn in turns.into_iter().rev().take(TURNS_SHOWN) {
                 let range = match (turn.first_checkpoint, turn.last_checkpoint) {
                     (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
                     (Some(first), _) => format!("#{first}"),

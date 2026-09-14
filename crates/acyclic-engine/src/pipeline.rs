@@ -1422,6 +1422,7 @@ impl Pipeline {
         // survives them, so the next tick retries, and nothing is waiting on
         // a reply.
         let before = self.last_generation;
+        let before_row = self.last_checkpoint_row;
         let mark_pending = |pipeline: &mut Self| {
             pipeline.auto_pending = Some(AutoPending {
                 since_generation: before,
@@ -1430,8 +1431,10 @@ impl Pipeline {
         };
         match self.drain_watcher().await {
             // A structural root hint makes `drain_watcher` re-baseline and
-            // record a `Recovered` row itself; nothing is left to record.
-            Ok(true) if self.last_generation != before => self.auto_pending = None,
+            // record a `Recovered` row itself (row ids only grow, so a new
+            // row is the exact signal, even when the rebuilt tree hashes
+            // the same); nothing is left to record.
+            Ok(true) if self.last_checkpoint_row != before_row => self.auto_pending = None,
             Ok(true) => mark_pending(self),
             Ok(false) => {}
             Err(error) => {
