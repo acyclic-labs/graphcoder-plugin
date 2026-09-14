@@ -1,33 +1,19 @@
-//! `acyclic install <host>` — wires the adapter into the current repo.
+//! `acyclic install <host>` — wires one host's adapter into the current repo.
 //!
-//! claude-code: merges hook entries into the repo's `.claude/settings.json`
-//! and drops the `/rewind`, `/timeline`, and `/fork` commands and the
-//! self-rollback and fork-decompose skills into `.claude/`.
-//! codex: merges the same lifecycle hooks into `.codex/hooks.json` (Codex's
-//! own event names and payload shape match Claude Code's closely enough
-//! that `acyclic hook` needs no host-specific parsing) and appends the
-//! agents-md cheatsheet, since Codex already reads AGENTS.md.
-//! cursor: merges Cursor's differently-named agent hooks into
-//! `.cursor/hooks.json` and drops an always-applied, product-named rule
-//! file under `.cursor/rules/`; Cursor's payload shape (`conversation_id`
-//! instead of `session_id`, no `tool_name` on shell hooks) is normalized in
-//! `hook::Payload`. Also registers `acyclic mcp` as a project-scoped MCP
-//! server at `.cursor/mcp.json`, since Cursor speaks MCP directly too.
-//! Checked-in files, so the whole team inherits the wiring.
-//! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
-//! shell-capable agent.
-//! claude-desktop: no lifecycle-hook API exists, so this registers `acyclic
-//! mcp` (an MCP stdio server; see `crate::mcp`) as an `mcpServers` entry in
-//! the user's *global* `claude_desktop_config.json` instead of writing
-//! anything under the repo — per-machine, not something a team can check in.
-//! vscode: same shape as claude-desktop (no hook API, MCP is the only
-//! extension point), but VS Code supports a project-scoped config file
-//! (`.vscode/mcp.json`, different JSON shape — see `McpConfigShape`), so
-//! this one IS checked-in like the hook-based adapters.
+//! Two adapter shapes. Hook-based hosts (claude-code, codex, cursor) get
+//! lifecycle-hook config that calls `acyclic hook <event>` around every
+//! edit and command, plus the commands/skills/rules that teach the agent
+//! the verbs; all of it is checked-in, so the whole team inherits it.
+//! MCP-based hosts (claude-desktop, vscode; cursor gets both) have no hook
+//! API, so they get `acyclic mcp` (see `crate::mcp`) registered as an MCP
+//! server in whatever config file that host reads — project-scoped and
+//! checked in where the host supports it, the user's global config where
+//! it doesn't. agents-md is the fallback for anything shell-capable: a
+//! cheatsheet block in AGENTS.md and no hooks at all.
 //!
-//! Codex's MCP path (a fifth JSON-based option would be nice, but Codex's
-//! MCP config is TOML) and Cursor/Codex desktop-vs-CLI hook parity are open
-//! TODOs — see the doc comments on `codex()` and `cursor()`.
+//! Each `HostAdapter` below documents exactly what its host gets. The
+//! README's per-host table is the user-facing version of the same list,
+//! with how far each adapter has been verified.
 
 use acyclic_engine::product::{self, NAME};
 use std::path::{Path, PathBuf};
@@ -441,7 +427,7 @@ fn is_our_cursor_entry(entry: &Value) -> bool {
 ///
 /// Codex is deliberately absent: its MCP config is TOML
 /// (`[mcp_servers.<name>]` in `config.toml`), not JSON, so it needs its own
-/// writer — see the TODO on `codex()` below before adding one.
+/// writer — see `TODO(desktop/IDE parity)` on `codex()` before adding one.
 struct McpConfigShape {
     /// "mcpServers" (Claude Desktop, Cursor) or "servers" (VS Code).
     servers_key: &'static str,
@@ -494,7 +480,7 @@ fn merge_mcp_server_json(
     if shape.explicit_stdio_type {
         entry["type"] = json!("stdio");
     }
-    servers.insert(NAME.to_string(), entry);
+    servers.insert(NAME.to_owned(), entry);
 
     let text = serde_json::to_string_pretty(&config).map_err(stringify)?;
     std::fs::write(config_path, text + "\n").map_err(stringify)?;
@@ -530,7 +516,7 @@ fn claude_desktop(repo: &Path) -> Result<(), String> {
 fn claude_desktop_config_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned())?;
         Ok(PathBuf::from(home)
             .join("Library/Application Support/Claude/claude_desktop_config.json"))
     }

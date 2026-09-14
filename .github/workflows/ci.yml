@@ -73,6 +73,8 @@ jobs:
         run: bash scripts/check-product-name.sh
       - name: No forbidden files or credential patterns
         run: bash scripts/check-no-secrets.sh
+      - name: Code quality (line width, TODO format, comment blocks, duplication)
+        run: bash scripts/check-code-quality.sh
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
@@ -102,6 +104,48 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # Line coverage of the unit and integration tests, as a job summary and
+  # an lcov artifact, with a floor so a change can't quietly delete tests.
+  # The daemon, client, and MCP server are exercised by the acceptance
+  # scripts rather than `cargo test`, so they read as 0% here; raise the
+  # floor as unit coverage of those grows, not by counting the scripts.
+  coverage:
+    needs: [changes, deny, lint]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: cargo-llvm-cov
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: cargo llvm-cov
+        run: |
+          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 48
+          {
+            echo '## Test coverage (lines)'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lcov
+          path: lcov.info
 
   test:
     needs: [changes, deny, lint]

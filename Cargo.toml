@@ -18,3 +18,32 @@ homepage = "https://acyclic.dev"
 acyclic-fs = { git = "https://github.com/acyclic-labs/sdk.git", rev = "8eced489729235929b769e831c1170c85aa1f7ba", features = ["local", "native-watch", "native-mount"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 
+# Code-quality guards beyond clippy's defaults. CI runs clippy with
+# `-D warnings`, so every "warn" here fails the build. Each crate opts in
+# with `[lints] workspace = true`. Thresholds live in clippy.toml.
+[workspace.lints.clippy]
+# Size and shape: a function that outgrows a screen, or a match whose arms
+# are copy-pasted, is where the next bug hides. Existing dispatchers that
+# are one arm per protocol op carry an explicit `allow` with a reason.
+too_many_lines = "warn"
+cognitive_complexity = "warn"
+match_same_arms = "warn"
+single_match_else = "warn"
+manual_let_else = "warn"
+if_not_else = "warn"
+# Ownership and cost: clones and by-value arguments that aren't needed.
+redundant_clone = "warn"
+needless_pass_by_value = "warn"
+inefficient_to_string = "warn"
+str_to_string = "warn"
+map_unwrap_or = "warn"
+# Never in committed code.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+# Docs read as prose: identifiers in backticks, no stray semicolons.
+doc_markdown = "warn"
+missing_panics_doc = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+

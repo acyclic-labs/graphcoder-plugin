@@ -610,6 +610,12 @@ fn strip_root_hints(batch: WatchBatch) -> (WatchBatch, RootHint) {
     )
 }
 
+/// Starts the pipeline on its own thread and returns the handle to it.
+///
+/// # Panics
+///
+/// If the OS refuses to create the thread or tokio its runtime: nothing
+/// else in the daemon can run without the pipeline, so this is fatal.
 pub fn spawn(
     store: Store,
     index: Index,
@@ -694,8 +700,12 @@ async fn run(store: Store, index: Index, config: Config, mut receiver: mpsc::Rec
     }
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "the arms look identical but each `reply` is a differently typed sender"
+)]
 fn fail_request(request: Request, message: &str) {
-    let error = || EngineError::Store(message.to_string());
+    let error = || EngineError::Store(message.to_owned());
     match request {
         Request::Checkpoint { reply, .. } => drop(reply.send(Err(error()))),
         Request::Commit { reply } => drop(reply.send(Err(error()))),
@@ -846,6 +856,10 @@ impl Pipeline {
     }
 
     /// Handles one request; returns true when the pipeline should exit.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per Request variant; the dispatch table reads best whole"
+    )]
     async fn handle(&mut self, request: Request) -> bool {
         self.last_activity = Instant::now();
         match request {
@@ -856,7 +870,8 @@ impl Pipeline {
             } => {
                 crate::trace!(
                     "pipeline",
-                    "request Checkpoint kind={kind:?} session={:?} tool={:?} admitted (queue depth unknown to the hook: ack was sent on send)",
+                    "request Checkpoint kind={kind:?} session={:?} tool={:?} admitted \
+                     (queue depth unknown to the hook: ack was sent on send)",
                     attribution.session_id,
                     attribution.tool_name
                 );
@@ -1184,9 +1199,14 @@ impl Pipeline {
         }
         crate::trace!(
             "pipeline",
-            "checkpoint row #{row} kind={:?}: drain {drain_ms:.1}ms ({}), {} {capture_ms:.1}ms, index {record_ms:.1}ms, publish {commit_ms:.1}ms, total {:.1}ms",
+            "checkpoint row #{row} kind={:?}: drain {drain_ms:.1}ms ({}), {} {capture_ms:.1}ms, \
+             index {record_ms:.1}ms, publish {commit_ms:.1}ms, total {:.1}ms",
             kind,
-            if changed { "changes captured" } else { "no changes" },
+            if changed {
+                "changes captured"
+            } else {
+                "no changes"
+            },
             if changed { "snapshot" } else { "noop" },
             crate::trace::ms(started)
         );
@@ -1259,9 +1279,14 @@ impl Pipeline {
                     if last_change.elapsed() >= quiesce || started.elapsed() >= cap {
                         crate::trace!(
                             "pipeline",
-                            "drain: done after {:.1}ms, {polls} polls, {batches} batch(es), {hints} hint(s); stopped by {}",
+                            "drain: done after {:.1}ms, {polls} polls, {batches} batch(es), \
+                             {hints} hint(s); stopped by {}",
                             crate::trace::ms(started),
-                            if started.elapsed() >= cap { "cap" } else { "quiesce window" }
+                            if started.elapsed() >= cap {
+                                "cap"
+                            } else {
+                                "quiesce window"
+                            }
                         );
                         return Ok(changed);
                     }
@@ -1688,7 +1713,7 @@ impl Pipeline {
             generation,
             CheckpointKind::Manual,
             &Attribution {
-                label: Some(label.to_string()),
+                label: Some(label.to_owned()),
                 ..Attribution::default()
             },
         )?;
@@ -1818,7 +1843,7 @@ impl Pipeline {
             generation,
             CheckpointKind::Manual,
             &Attribution {
-                label: Some(label.to_string()),
+                label: Some(label.to_owned()),
                 ..Attribution::default()
             },
         )?;

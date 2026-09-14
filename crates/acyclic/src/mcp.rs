@@ -118,7 +118,9 @@ struct RestoreParams {
 #[tool_router]
 impl McpServer {
     #[tool(
-        description = "Snapshot the working tree now (untracked and gitignored files included). Call this before a risky change so a bad attempt can be rewound instead of hand-reverted."
+        description = "Snapshot the working tree now (untracked and gitignored files included). \
+                       Call this before a risky change so a bad attempt can be rewound instead \
+                       of hand-reverted."
     )]
     async fn checkpoint(
         &self,
@@ -203,7 +205,7 @@ impl McpServer {
             let range = match (turn.first_checkpoint, turn.last_checkpoint) {
                 (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
                 (Some(first), _) => format!("#{first}"),
-                _ => "no checkpoints".to_string(),
+                _ => "no checkpoints".to_owned(),
             };
             lines.push(format!(
                 "t{} {} {} {}",
@@ -217,7 +219,10 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Restore the working tree exactly to an earlier checkpoint (including untracked and gitignored files). Call `timeline` first and confirm the target checkpoint with the user before calling this — a safety checkpoint of the current state is taken automatically first."
+        description = "Restore the working tree exactly to an earlier checkpoint (including \
+                       untracked and gitignored files). Call `timeline` first and confirm the \
+                       target checkpoint with the user before calling this — a safety checkpoint \
+                       of the current state is taken automatically first."
     )]
     async fn rewind(
         &self,
@@ -241,7 +246,8 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Show everything that changed between two checkpoints (defaults: session/baseline start to latest) — the blast radius of a session."
+        description = "Show everything that changed between two checkpoints (defaults: \
+                       session/baseline start to latest) — the blast radius of a session."
     )]
     async fn diff(&self, Parameters(params): Parameters<DiffParams>) -> Result<String, McpError> {
         let mut client = self.connect()?;
@@ -269,7 +275,8 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Bring back one or more files from an earlier checkpoint, leaving the rest of the tree untouched. Each restore is itself recorded as a checkpoint."
+        description = "Bring back one or more files from an earlier checkpoint, leaving the rest \
+                       of the tree untouched. Each restore is itself recorded as a checkpoint."
     )]
     async fn restore(
         &self,
@@ -300,7 +307,8 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Call this once at the start of a conversation grounded in this repo: summarizes where the previous session left off and any abandoned branches."
+        description = "Call this once at the start of a conversation grounded in this repo: \
+                       summarizes where the previous session left off and any abandoned branches."
     )]
     async fn brief(&self) -> Result<String, McpError> {
         let mut client = self.connect()?;

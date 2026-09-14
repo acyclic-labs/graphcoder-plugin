@@ -33,8 +33,8 @@ pub enum Op {
         tool_name: Option<String>,
         #[serde(default)]
         label: Option<String>,
-        /// true: reply after the checkpoint lands (PreToolUse / --wait).
-        /// false: reply on enqueue (PostToolUse hook path).
+        /// true: reply after the checkpoint lands (`PreToolUse` / --wait).
+        /// false: reply on enqueue (`PostToolUse` hook path).
         #[serde(default)]
         wait: bool,
         /// Also publish to the authority (coarse boundary).
@@ -443,5 +443,5 @@ pub struct DiffEntry {
 }
 
 fn default_fork_mode() -> String {
-    "mount".to_string()
+    "mount".to_owned()
 }

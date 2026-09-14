@@ -40,10 +40,38 @@ Run these locally — CI enforces all of them:
 ```sh
 scripts/check-product-name.sh   # the public name only comes from product.toml
 scripts/check-no-secrets.sh     # no forbidden files or credential patterns
+scripts/check-code-quality.sh   # line width, TODO(topic) format, comment-block length, duplication
 cargo deny check                # dependency licenses, advisories, bans
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo llvm-cov --workspace --all-features --fail-under-lines 48   # needs cargo-llvm-cov
 ```
+
+Or all of it, in CI's order, with one summary at the end: `scripts/ci-local.sh` (add
+`--no-acceptance` to skip the slow end-to-end suite while iterating).
+
+## Code quality rules
+
+Beyond rustfmt and clippy's defaults, the workspace enables a lint set in `Cargo.toml`
+(`[workspace.lints.clippy]`, thresholds in `clippy.toml`) and `scripts/check-code-quality.sh`
+guards what those can't express. The rules, and why each exists:
+
+- **Functions under 100 lines, cognitive complexity under 30.** A dispatcher that is one arm per
+  protocol op may carry `#[allow(clippy::too_many_lines, reason = "...")]`; anything else that
+  trips it should be split.
+- **No identical match arms, no `match` for a single pattern, `let ... else` over manual
+  matches.** Copy-pasted arms were the recurring review finding — the lints catch the next one.
+- **No `todo!`, `unimplemented!`, or `dbg!` in committed code.** Open work is a `TODO(topic):`
+  comment (the script rejects a bare `TODO`), so it names who or what it is waiting on.
+- **Lines: 120 columns in Rust, 200 in shell.** rustfmt wraps code at 100 but leaves strings
+  and comments alone; split long format strings with `\` continuations.
+- **Comment blocks under 30 lines.** A longer one is a design note (`docs/design/`) or a sign
+  the code needs to be simpler, not explained harder. Comments say *why*; the code says what.
+- **Duplication under 3% of tokens** (`jscpd`, config in `.jscpd.json`). Extract a helper
+  before the third copy.
+- **Line coverage floor of 48%** from `cargo test` alone. The daemon, client, and MCP server
+  are exercised by the acceptance scripts, not unit tests, so they read as 0% — the floor moves
+  up as unit coverage of those grows.
 
 ## Product naming
 

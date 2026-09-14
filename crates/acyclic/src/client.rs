@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
+#[derive(Clone, Copy)]
 pub enum Spawn {
     /// Interactive: start the daemon if it isn't running (waits for baseline).
     Allowed,
@@ -88,11 +89,7 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let name = format!("{op:?}");
-        let name = name
-            .split([' ', '{', '('])
-            .next()
-            .unwrap_or("?")
-            .to_string();
+        let name = name.split([' ', '{', '(']).next().unwrap_or("?").to_owned();
         let started = std::time::Instant::now();
         acyclic_engine::trace!("client", "call #{id} {name}");
         let result = self.call_inner(id, op);

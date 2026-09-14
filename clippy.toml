@@ -1,0 +1,6 @@
+# Thresholds for the lints enabled in [workspace.lints.clippy] (Cargo.toml).
+too-many-lines-threshold = 100
+cognitive-complexity-threshold = 30
+# Product and vendor names doc_markdown would otherwise want in backticks.
+# `..` keeps clippy's built-in list (GitHub, macOS, JavaScript, ...).
+doc-valid-idents = ["OpenAI", "ChatGPT", "MoonshotAI", ".."]

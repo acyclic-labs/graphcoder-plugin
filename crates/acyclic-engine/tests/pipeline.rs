@@ -106,9 +106,7 @@ fn checkpoint_rewind_journey() {
     thread.join().expect("pipeline thread");
 
     // Diff runs against the reopened store (no daemon needed).
-    let store = runtime
-        .block_on(Store::open(paths.clone()))
-        .expect("reopen");
+    let store = runtime.block_on(Store::open(paths)).expect("reopen");
     let changes = runtime
         .block_on(diff::diff(&store, pre_generation, post_generation))
         .expect("diff");
@@ -258,6 +256,10 @@ fn enqueued_checkpoint_survives_immediate_shutdown() {
 /// path only, handles files, directory subtrees, and absence, and is itself
 /// recorded (and so undoable) in the timeline.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario walked end to end; splitting it would hide the ordering it tests"
+)]
 fn single_path_restore_leaves_the_rest_alone() {
     let repo = tempfile::tempdir().expect("repo");
     let stores = tempfile::tempdir().expect("stores");

@@ -298,6 +298,10 @@ fn plan_and_merge_generation_over_real_generations() {
 /// Conflicts of every kind are collected in full before anything is
 /// written, and the rebase generation R carries the markers.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every conflict kind is set up in one rig so the all-or-nothing rule is what's tested"
+)]
 fn conflicts_are_collected_and_r_carries_markers() {
     let rig = Rig::start();
     rig.runtime.block_on(async {
@@ -340,25 +344,57 @@ fn conflicts_are_collected_and_r_carries_markers() {
                 (p("src/shared.txt"), ConflictKind::Hunks),
             ]
         );
-        let shared = plan.conflicted.iter().find(|c| c.path == p("src/shared.txt")).unwrap();
+        let shared = plan
+            .conflicted
+            .iter()
+            .find(|c| c.path == p("src/shared.txt"))
+            .unwrap();
         let text = String::from_utf8(shared.bytes.clone()).unwrap();
-        assert!(text.starts_with("1\n2\n<<<<<<< fork c\n3 fork\n||||||| original\n3\n=======\n3 head\n>>>>>>> mainline\n"), "{text}");
+        assert!(
+            text.starts_with(
+                "1\n2\n<<<<<<< fork c\n3 fork\n||||||| original\n3\n=======\n3 head\n\
+                 >>>>>>> mainline\n"
+            ),
+            "{text}"
+        );
         assert_eq!(shared.describe(), "1 conflicting hunk(s)");
-        let del = plan.conflicted.iter().find(|c| c.path == p("del.txt")).unwrap();
+        let del = plan
+            .conflicted
+            .iter()
+            .find(|c| c.path == p("del.txt"))
+            .unwrap();
         assert!(String::from_utf8_lossy(&del.bytes).starts_with("<<<<<<< fork c (modified)\n"));
         assert_eq!(del.describe(), "mainline deleted, fork modified");
 
         // R = H + take_ours + conflicted (markers).
         let mut entries = vec![(p("clean.txt"), Entry::FromGeneration { generation: ours })];
         entries.extend(plan.conflicted.iter().map(|c| {
-            (c.path.clone(), Entry::Regular { bytes: c.bytes.clone(), mode: c.mode })
+            (
+                c.path.clone(),
+                Entry::Regular {
+                    bytes: c.bytes.clone(),
+                    mode: c.mode,
+                },
+            )
         }));
-        let rebased = rig.handle.build_generation(theirs, entries).await.expect("R");
+        let rebased = rig
+            .handle
+            .build_generation(theirs, entries)
+            .await
+            .expect("R");
         let markers = read(&rig, rebased, "src/shared.txt").await.unwrap();
-        assert!(merge::has_conflict_markers(std::str::from_utf8(&markers).unwrap()));
-        assert_eq!(read(&rig, rebased, "clean.txt").await.unwrap(), b"clean fork\n");
+        assert!(merge::has_conflict_markers(
+            std::str::from_utf8(&markers).unwrap()
+        ));
+        assert_eq!(
+            read(&rig, rebased, "clean.txt").await.unwrap(),
+            b"clean fork\n"
+        );
         // Head-only content is present in R (a rebase brings the fork up to H).
-        assert_eq!(read(&rig, rebased, "d/k.txt").await.map(|b| merge::has_conflict_markers(std::str::from_utf8(&b).unwrap())), Some(true));
+        let rebased_k = read(&rig, rebased, "d/k.txt")
+            .await
+            .map(|b| merge::has_conflict_markers(std::str::from_utf8(&b).unwrap()));
+        assert_eq!(rebased_k, Some(true));
 
         // Writing R − F into the fork overlay makes the overlay equal R.
         let changes: Vec<PathBuf> = rig
@@ -373,7 +409,14 @@ fn conflicts_are_collected_and_r_carries_markers() {
         let roots = merge::subtree_roots(&changes);
         let entries: Vec<(PathBuf, Entry)> = roots
             .iter()
-            .map(|path| (path.clone(), Entry::FromGeneration { generation: rebased }))
+            .map(|path| {
+                (
+                    path.clone(),
+                    Entry::FromGeneration {
+                        generation: rebased,
+                    },
+                )
+            })
             .collect();
         rig.handle
             .apply_to_overlay(Arc::clone(&seed.shared), entries)

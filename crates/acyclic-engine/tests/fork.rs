@@ -145,7 +145,7 @@ fn promote_lands_fork_changes() {
     rig.finish();
 }
 
-/// Safe Mode: resolve_session + apply_session together must land a fork's
+/// Safe Mode: `resolve_session` + `apply_session` together must land a fork's
 /// changes identically to promote's single-shot version.
 #[test]
 fn resolve_then_apply_session_lands_fork_changes() {
@@ -190,7 +190,7 @@ fn resolve_then_apply_session_lands_fork_changes() {
     rig.finish();
 }
 
-/// Safe Mode: discarding a resolved session (never calling apply_session)
+/// Safe Mode: discarding a resolved session (never calling `apply_session`)
 /// must leave the real tree completely untouched.
 #[test]
 fn resolved_session_left_unapplied_leaves_zero_trace() {

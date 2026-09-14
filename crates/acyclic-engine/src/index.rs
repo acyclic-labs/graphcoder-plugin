@@ -1,4 +1,4 @@
-//! Checkpoint metadata index: SQLite, WAL, owned by the daemon.
+//! Checkpoint metadata index: `SQLite`, WAL, owned by the daemon.
 //!
 //! This is plugin-domain data (sessions, tool calls, labels) — never derived
 //! from fs authority replay. The `published` flag records whether an authority
@@ -301,7 +301,7 @@ impl Index {
     }
 
     /// Most recent checkpoint a user would rewind to: real snapshots only,
-    /// skipping bookkeeping rows (noop, pre_rewind, recovered, failed).
+    /// skipping bookkeeping rows (noop, `pre_rewind`, recovered, failed).
     pub fn latest_target(&self) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(
@@ -567,7 +567,7 @@ impl Index {
     }
 
     /// A turn or checkpoint for a session the daemon never saw start (its
-    /// SessionStart hook fired while the daemon was down) still gets a
+    /// `SessionStart` hook fired while the daemon was down) still gets a
     /// session row, so `sessions`, `diff --turn`, and `brief` can find it.
     /// The host is unknown at this point; a later `session_started` is
     /// ignored by the primary key, so the row keeps its earliest start.
@@ -593,7 +593,7 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow>
         rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Blob,
-            message.to_string().into(),
+            message.to_owned().into(),
         )
     };
     let generation_bytes: Vec<u8> = row.get(1)?;
@@ -677,7 +677,7 @@ fn add_column_if_missing(
 }
 
 /// A database created before `auto` checkpoints existed has a `kind` CHECK
-/// constraint that predates that variant; SQLite has no `ALTER TABLE ...
+/// constraint that predates that variant; `SQLite` has no `ALTER TABLE ...
 /// DROP/ADD CONSTRAINT`, so widening it means rebuilding the table. Detected
 /// via the stored `CREATE TABLE` text (idempotent: a no-op once rebuilt, and
 /// a no-op on a fresh database, whose `CREATE TABLE` already carries 'auto').
@@ -743,8 +743,7 @@ pub fn excerpt(prompt: &str) -> String {
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -870,7 +869,7 @@ mod tests {
             .into_iter()
             .map(|s| s.session_id)
             .collect();
-        assert!(ids.contains(&"orphan".to_string()));
+        assert!(ids.contains(&"orphan".to_owned()));
 
         // A late session-start fills in the host without resetting the row.
         let started = index.sessions(10).expect("s")[0].started_at;
@@ -1046,7 +1045,7 @@ mod tests {
 
     /// A database from before `auto` checkpoints existed has a `kind` CHECK
     /// constraint that predates that variant. `Index::open` must widen it
-    /// (SQLite can't `ALTER ... DROP CONSTRAINT`, so this is a table
+    /// (`SQLite` can't `ALTER ... DROP CONSTRAINT`, so this is a table
     /// rebuild) without losing any existing row.
     #[test]
     fn pre_auto_kind_database_is_rebuilt_and_keeps_its_rows() {

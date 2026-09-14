@@ -563,7 +563,7 @@ pub async fn execute(
             repo_root: repo.clone(),
             tmp: tmp.clone(),
             phase: Phase::Swapping,
-            carried: carried.clone(),
+            carried,
         },
     )?;
     atomic_exchange(repo, &tmp)?;
@@ -572,16 +572,14 @@ pub async fn execute(
     let trash_root = store.paths.trash();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs());
     let trashed = trash_root.join(format!("{name}-{stamp}"));
-    let old_tree = match std::fs::rename(&tmp, &trashed) {
-        Ok(()) => trashed,
-        Err(_) => {
-            let sibling = parent.join(format!(".{name}.{}-trash-{stamp}", crate::product::NAME));
-            std::fs::rename(&tmp, &sibling)?;
-            sibling
-        }
+    let old_tree = if let Ok(()) = std::fs::rename(&tmp, &trashed) {
+        trashed
+    } else {
+        let sibling = parent.join(format!(".{name}.{}-trash-{stamp}", crate::product::NAME));
+        std::fs::rename(&tmp, &sibling)?;
+        sibling
     };
     std::fs::remove_file(&journal_path)?;
     prune_trash(&trash_root, trash_ttl_days);
@@ -657,7 +655,7 @@ fn prune_trash(trash_root: &Path, ttl_days: u32) {
         let Ok(modified) = metadata.modified() else {
             continue;
         };
-        if modified.elapsed().map(|age| age > ttl).unwrap_or(false) {
+        if modified.elapsed().is_ok_and(|age| age > ttl) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }

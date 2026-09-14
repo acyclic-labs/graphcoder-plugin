@@ -239,6 +239,11 @@ impl Server {
         payload
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "one arm per protocol Op; the wire-to-engine table reads best whole"
+    )]
     async fn dispatch_inner(&self, op: proto::Op) -> Result<proto::Reply, String> {
         match op {
             proto::Op::Ping => Ok(proto::Reply::Pong),
@@ -250,7 +255,7 @@ impl Server {
                     unpublished: status.unpublished,
                     store_bytes: directory_bytes(&self.store_root.join("store")),
                     repo_root: self.repo_root.display().to_string(),
-                    mount_provider: self.mounts.provider.to_string(),
+                    mount_provider: self.mounts.provider.to_owned(),
                     mount_available: self.mounts.available,
                     mount_reason: self.mounts.reason.clone(),
                 }))
@@ -289,7 +294,7 @@ impl Server {
                     Ok(proto::Reply::Checkpoint(proto::CheckpointInfo {
                         row_id: outcome.row_id,
                         generation: hex_generation(outcome.generation),
-                        kind: outcome.kind.as_str().to_string(),
+                        kind: outcome.kind.as_str().to_owned(),
                     }))
                 } else {
                     // Enqueue-ack: the hook path. Admission into the FIFO
@@ -389,7 +394,7 @@ impl Server {
                     id: row.id,
                     generation: hex_generation(row.generation),
                     created_at: row.created_at,
-                    kind: row.kind.as_str().to_string(),
+                    kind: row.kind.as_str().to_owned(),
                     published: row.published,
                     session_id: row.session_id,
                     host,
@@ -451,7 +456,7 @@ impl Server {
                         rewind::RestoreAction::Restored => "restored",
                         rewind::RestoreAction::Removed => "removed",
                     }
-                    .to_string(),
+                    .to_owned(),
                     recorded_checkpoint,
                 }))
             }
@@ -462,7 +467,7 @@ impl Server {
                 Ok(proto::Reply::Rewind(proto::RewindInfo {
                     restored_checkpoint: row_id,
                     old_tree: outcome.old_tree.display().to_string(),
-                    warning: outcome.warning.to_string(),
+                    warning: outcome.warning.to_owned(),
                 }))
             }
             proto::Op::Diff {
@@ -600,7 +605,7 @@ impl Server {
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
-                        mode: ForkMode::Mount.as_str().to_string(),
+                        mode: ForkMode::Mount.as_str().to_owned(),
                         base: acyclic_engine::generation_hex(seed.base),
                         created_at: unix_now(),
                         session_id: session_id.clone(),
@@ -903,7 +908,7 @@ impl Server {
             ));
         }
         if self.dry_session.lock().await.is_some() {
-            return Err("a Safe Mode session is already active for this repo".to_string());
+            return Err("a Safe Mode session is already active for this repo".to_owned());
         }
         let seed = self.handle.fork().await.map_err(stringify)?;
         let shared = Arc::clone(&seed.shared);
@@ -971,7 +976,7 @@ impl Server {
             let entry = proto::ForkEntry {
                 id: id.clone(),
                 path: dir.display().to_string(),
-                mode: ForkMode::Copy.as_str().to_string(),
+                mode: ForkMode::Copy.as_str().to_owned(),
                 base: acyclic_engine::generation_hex(seed.base),
                 created_at: unix_now(),
                 session_id: session_id.clone(),
@@ -1065,7 +1070,7 @@ impl Server {
                     "LANDED ({paths} path(s) written, {merged} merged by content, {} ignored kept)",
                     kept.len()
                 ),
-                Ok(Landed::Nothing { .. }) => "NOTHING to land".to_string(),
+                Ok(Landed::Nothing { .. }) => "NOTHING to land".to_owned(),
                 Ok(Landed::Conflicted { files, .. }) => format!(
                     "CONFLICT: {} file(s) rebased into the fork with markers",
                     files.len()
@@ -1126,7 +1131,7 @@ impl Server {
         let mut mount = self.fork_mount.lock().await;
         mount
             .router
-            .add_route(id.to_string().into_bytes(), source)
+            .add_route(id.to_owned().into_bytes(), source)
             .map_err(|error| format!("route: {error:?}"))?;
         // The ONE session, mounted lazily on the first fork. A route
         // insert is all later forks pay.
@@ -1204,6 +1209,10 @@ impl Server {
     /// nothing lands. Otherwise M = head + fork's paths + merged files is
     /// written onto the real tree path by path with the same atomic
     /// single-path restore a `restore` uses, then checkpointed and published.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "plan, conflict scan, rebase-or-land, and record are one transaction"
+    )]
     async fn merge_onto_head(
         &self,
         id: &str,
@@ -1465,29 +1474,26 @@ impl Server {
         .map(|change| change.path)
         .collect();
         let roots = merge::subtree_roots(&changed);
-        match copy_dir {
-            Some(dir) => {
-                for root in &roots {
-                    self.handle
-                        .restore_path_into(rebased, dir.to_path_buf(), root.clone())
-                        .await
-                        .map_err(stringify)?;
-                }
-            }
-            None => {
-                // A mounted fork: write THROUGH the mount, never behind it.
-                // The driver and the kernel keep name and attribute caches
-                // that only their own operations update; a write via the
-                // checkout leaves a file the fork had deleted invisible for
-                // good, and the FUSE transport has no invalidation at all.
-                let dir = fork::forks_mount_root(&self.repo_root)
-                    .ok_or("repo root has no parent for fork workspaces")?
-                    .join(id);
+        if let Some(dir) = copy_dir {
+            for root in &roots {
                 self.handle
-                    .materialize_paths(rebased, dir, roots)
+                    .restore_path_into(rebased, dir.to_path_buf(), root.clone())
                     .await
                     .map_err(stringify)?;
             }
+        } else {
+            // A mounted fork: write THROUGH the mount, never behind it.
+            // The driver and the kernel keep name and attribute caches
+            // that only their own operations update; a write via the
+            // checkout leaves a file the fork had deleted invisible for
+            // good, and the FUSE transport has no invalidation at all.
+            let dir = fork::forks_mount_root(&self.repo_root)
+                .ok_or("repo root has no parent for fork workspaces")?
+                .join(id);
+            self.handle
+                .materialize_paths(rebased, dir, roots)
+                .await
+                .map_err(stringify)?;
         }
         Ok(())
     }
@@ -1556,7 +1562,7 @@ impl Server {
                 index.session_start(&session).map_err(stringify)?
             }
         };
-        let row = row.ok_or_else(|| "no matching checkpoint".to_string())?;
+        let row = row.ok_or_else(|| "no matching checkpoint".to_owned())?;
         if !row.is_restorable() {
             return Err(format!(
                 "checkpoint #{} records a failed capture, not a tree state; pick another from `{NAME} timeline`",
@@ -1579,13 +1585,17 @@ impl Server {
             Some(row) => Some(row),
             None => index.oldest().map_err(stringify)?,
         };
-        base.ok_or_else(|| "no checkpoints yet".to_string())
+        base.ok_or_else(|| "no checkpoints yet".to_owned())
     }
 
     /// Builds the previous-session brief: where the last session (other
     /// than `current`) ended, what it changed, and every branch it abandoned
     /// by rewinding. Diffs are computed against the store, so counts are
     /// exact rather than remembered.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass over the session's rows builds every section of the brief"
+    )]
     async fn brief(&self, current: Option<&str>) -> Result<proto::BriefInfo, String> {
         let index = self.open_index()?;
         let Some(session) = index
@@ -1739,8 +1749,7 @@ fn short_id() -> String {
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 /// How a fork ended up in the real tree.
@@ -1777,7 +1786,7 @@ fn op_name(op: &proto::Op) -> String {
         .split([' ', '{', '('])
         .next()
         .unwrap_or("?")
-        .to_string()
+        .to_owned()
 }
 
 fn reply_name(reply: &proto::Reply) -> String {
@@ -1786,7 +1795,7 @@ fn reply_name(reply: &proto::Reply) -> String {
         .split([' ', '{', '('])
         .next()
         .unwrap_or("?")
-        .to_string()
+        .to_owned()
 }
 
 fn unresolved_message(paths: &[PathBuf]) -> String {
@@ -1814,6 +1823,10 @@ fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as `.map_err(stringify)`, which hands over the error by value"
+)]
 fn stringify(error: EngineError) -> String {
     error.to_string()
 }
@@ -1827,6 +1840,10 @@ fn parse_kind(kind: &str) -> Result<CheckpointKind, String> {
     })
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as `.map(diff_entry)` over an owning iterator"
+)]
 fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
     proto::DiffEntry {
         path: change.path.display().to_string(),
@@ -1836,7 +1853,7 @@ fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
             acyclic_engine::diff::ChangeKind::Modified => "modified",
             acyclic_engine::diff::ChangeKind::MetadataOnly => "metadata",
         }
-        .to_string(),
+        .to_owned(),
         file_kind: format!("{:?}", change.file_kind).to_lowercase(),
         ignored: false,
     }
@@ -1846,7 +1863,7 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     proto::TimelineEntry {
         id: row.id,
         created_at: row.created_at,
-        kind: row.kind.as_str().to_string(),
+        kind: row.kind.as_str().to_owned(),
         published: row.published,
         session_id: row.session_id,
         tool_name: row.tool_name,

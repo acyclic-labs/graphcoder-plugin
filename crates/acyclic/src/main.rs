@@ -82,7 +82,7 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
-    /// Previous-session summary (what the SessionStart hook hands the agent).
+    /// Previous-session summary (what the `SessionStart` hook hands the agent).
     Brief {
         /// The session asking, excluded from the summary.
         #[arg(long)]
@@ -160,12 +160,12 @@ enum Command {
     },
     /// Wire a host's adapter into the current repo.
     Install {
-        /// claude-code | codex | cursor | agents-md | claude-desktop
+        /// claude-code | codex | cursor | agents-md | claude-desktop | vscode
         host: String,
     },
     /// MCP stdio server: exposes checkpoint/timeline/rewind/diff/restore/
-    /// turns/brief as tools for hosts with no lifecycle-hook API (Claude
-    /// Desktop). Runs until stdin closes.
+    /// turns/brief as tools for hosts that speak MCP (Claude Desktop, VS
+    /// Code, Cursor). Runs until stdin closes.
     Mcp,
     /// Record a host session starting (hook use).
     #[command(hide = true)]
@@ -244,8 +244,7 @@ fn stranded_in_trash(repo: &Path) -> bool {
         if name == "trash" {
             return ancestor
                 .parent()
-                .map(|store| store.join("meta.json").is_file())
-                .unwrap_or(false);
+                .is_some_and(|store| store.join("meta.json").is_file());
         }
         name.starts_with('.') && name.contains(&format!(".{}-trash-", product::NAME))
     })
@@ -374,18 +373,18 @@ fn init(repo: &Path) -> i32 {
         let stores_root = config.store_dir.as_ref().map(PathBuf::from);
         let paths = acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
             .map_err(|error| error.to_string())?;
-        if !paths.meta().exists() {
+        if paths.meta().exists() {
+            println!("store already exists at {}", paths.root.display());
+        } else {
             let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
             runtime
                 .block_on(acyclic_engine::store::Store::init(repo, paths.clone()))
                 .map_err(|error| error.to_string())?;
             println!("store created at {}", paths.root.display());
-        } else {
-            println!("store already exists at {}", paths.root.display());
         }
         // Spawning the daemon builds (or refreshes) the baseline.
         let mut client = connect(repo, Spawn::Allowed).map_err(|error| match error {
-            ConnectError::NoDaemon => "daemon failed to start".to_string(),
+            ConnectError::NoDaemon => "daemon failed to start".to_owned(),
             ConnectError::Other(message) => message,
         })?;
         client.call(proto::Op::Ping)?;
@@ -402,6 +401,10 @@ fn init(repo: &Path) -> i32 {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per Command; each arm is a single call plus its printing"
+)]
 fn execute(client: &mut Client, command: Command) -> Result<(), String> {
     match command {
         Command::Checkpoint {
@@ -497,7 +500,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 let range = match (turn.first_checkpoint, turn.last_checkpoint) {
                     (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
                     (Some(first), _) => format!("#{first}"),
-                    _ => "no checkpoints".to_string(),
+                    _ => "no checkpoints".to_owned(),
                 };
                 println!(
                     "{}  t{:<3} {:<10} {:<14} {}",
@@ -576,16 +579,15 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     short_session(&session.session_id),
                     session.host.unwrap_or_default(),
                     age(session.started_at),
-                    session
-                        .ended_at
-                        .map(|ended| format!("ended {}", age(ended)))
-                        .unwrap_or_else(|| "(no end)".into()),
+                    session.ended_at.map_or_else(
+                        || "(no end)".into(),
+                        |ended| format!("ended {}", age(ended))
+                    ),
                     session.turns,
                     session.checkpoints,
                     session
                         .end_checkpoint
-                        .map(|id| format!("#{id}"))
-                        .unwrap_or_else(|| "-".into()),
+                        .map_or_else(|| "-".into(), |id| format!("#{id}")),
                 );
             }
             Ok(())
@@ -663,16 +665,13 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             session,
             ..
         } => {
-            let (before, after, before_hex, after_hex) = match turn {
-                Some(turn) => {
-                    let (before, after) = turn_range(client, session, turn)?;
-                    (before, after, None, None)
-                }
-                None => {
-                    let (before, before_hex) = checkpoint_ref(before.as_deref())?;
-                    let (after, after_hex) = checkpoint_ref(after.as_deref())?;
-                    (before, after, before_hex, after_hex)
-                }
+            let (before, after, before_hex, after_hex) = if let Some(turn) = turn {
+                let (before, after) = turn_range(client, session, turn)?;
+                (before, after, None, None)
+            } else {
+                let (before, before_hex) = checkpoint_ref(before.as_deref())?;
+                let (after, after_hex) = checkpoint_ref(after.as_deref())?;
+                (before, after, before_hex, after_hex)
             };
             let reply = client.call(proto::Op::Diff {
                 before,
@@ -825,8 +824,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             println!(
                 "last checkpoint: {}",
                 info.last_checkpoint
-                    .map(|id| format!("#{id}"))
-                    .unwrap_or_else(|| "none".into())
+                    .map_or_else(|| "none".into(), |id| format!("#{id}"))
             );
             println!("unpublished:   {}", info.unpublished);
             println!("store size:    {}", human_bytes(info.store_bytes));
@@ -960,10 +958,11 @@ fn checkpoint_ref(arg: Option<&str>) -> Result<(Option<i64>, Option<String>), St
         return Ok((Some(id), None));
     }
     if arg.len() >= 6 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok((None, Some(arg.to_string())));
+        return Ok((None, Some(arg.to_owned())));
     }
     Err(format!(
-        "{arg:?} is neither a checkpoint row id (see `{NAME} timeline`) nor a generation hex prefix of at least 6 digits"
+        "{arg:?} is neither a checkpoint row id (see `{NAME} timeline`) \
+         nor a generation hex prefix of at least 6 digits"
     ))
 }
 
@@ -972,19 +971,18 @@ fn turn_range(
     session: Option<String>,
     turn: i64,
 ) -> Result<(Option<i64>, Option<i64>), String> {
-    let session = match session {
-        Some(session) => session,
-        None => {
-            let proto::Reply::Sessions(sessions) = client.call(proto::Op::Sessions { limit: 1 })?
-            else {
-                return Err("unexpected reply".into());
-            };
-            sessions
-                .into_iter()
-                .next()
-                .map(|session| session.session_id)
-                .ok_or("no sessions recorded")?
-        }
+    let session = if let Some(session) = session {
+        session
+    } else {
+        let proto::Reply::Sessions(sessions) = client.call(proto::Op::Sessions { limit: 1 })?
+        else {
+            return Err("unexpected reply".into());
+        };
+        sessions
+            .into_iter()
+            .next()
+            .map(|session| session.session_id)
+            .ok_or("no sessions recorded")?
     };
     let proto::Reply::Turns(turns) = client.call(proto::Op::Turns {
         session_id: Some(session.clone()),
@@ -1013,8 +1011,7 @@ fn short_session(session_id: &str) -> String {
 fn age(created_at: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs() as i64);
     let delta = (now - created_at).max(0);
     if delta < 60 {
         format!("{delta}s ago")

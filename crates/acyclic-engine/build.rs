@@ -25,7 +25,8 @@ fn main() {
             && name
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-        "product.toml: `name` must be lowercase ASCII letters, digits, or '-' (it becomes a command, a dotfile, and an env-var prefix)"
+        "product.toml: `name` must be lowercase ASCII letters, digits, or '-' \
+         (it becomes a command, a dotfile, and an env-var prefix)"
     );
     println!("cargo:rustc-env=PRODUCT_NAME={name}");
     println!(

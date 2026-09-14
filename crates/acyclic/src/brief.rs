@@ -1,6 +1,6 @@
 //! Renders the previous-session brief as agent-readable text.
 //!
-//! Budget: under 1KB, always. The SessionStart hook prints this into the
+//! Budget: under 1KB, always. The `SessionStart` hook prints this into the
 //! agent's context on every session start, so it must earn its bytes: where
 //! the last session ended, what it changed, which branches it abandoned, and
 //! the verbs that reach the rest.
@@ -13,12 +13,12 @@ pub const BUDGET_BYTES: usize = 1000;
 
 pub fn render(info: &proto::BriefInfo) -> String {
     let Some(session) = &info.session else {
-        return "{NAME}: no previous session on record for this repo.\n".to_string();
+        return "{NAME}: no previous session on record for this repo.\n".to_owned();
     };
     let mut lines = Vec::new();
     let ended = match session.ended_at {
         Some(at) => format!("ended {}", age(at)),
-        None => "did not end cleanly".to_string(),
+        None => "did not end cleanly".to_owned(),
     };
     let end = match session.end_checkpoint {
         Some(id) => format!(" at checkpoint #{id}"),
@@ -53,7 +53,7 @@ pub fn render(info: &proto::BriefInfo) -> String {
         session.turns, session.checkpoints, session.files_changed
     ));
     if session.abandoned.is_empty() {
-        lines.push("  no abandoned branches.".to_string());
+        lines.push("  no abandoned branches.".to_owned());
     } else {
         lines.push(format!(
             "  {} abandoned branch(es):",
@@ -84,12 +84,12 @@ pub fn render(info: &proto::BriefInfo) -> String {
             info.drift_files
         ));
     } else {
-        lines.push("  tree unchanged since then.".to_string());
+        lines.push("  tree unchanged since then.".to_owned());
     }
     lines.push(
         "  verbs: {NAME} turns · timeline · diff --turn N · show <id> · \
          restore <id> <path> · rewind <id>"
-            .to_string(),
+            .to_owned(),
     );
     fit(lines)
 }
@@ -155,8 +155,7 @@ fn short(session_id: &str) -> String {
 fn age(at: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs() as i64);
     let delta = (now - at).max(0);
     if delta < 60 {
         format!("{delta}s ago")

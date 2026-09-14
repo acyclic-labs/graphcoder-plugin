@@ -304,7 +304,8 @@ promote_ok "$A" G19 >/dev/null
 OUT="$(promote_refused "$B" G19)"
 echo "$OUT" | grep -q 'new.txt: 1 conflicting hunk(s)' || fail "G19: add/add must conflict: $OUT"
 [ "$(cat "$R/new.txt")" = "A made it" ] || fail "G19: mainline touched"
-[ "$(cat "$(fork_path "$B")/new.txt")" = "$(printf '<<<<<<< fork %s\nB made it\n||||||| original\n=======\nA made it\n>>>>>>> mainline' "$B")" ] || fail "G19: empty original block expected: $(cat "$(fork_path "$B")/new.txt")"
+[ "$(cat "$(fork_path "$B")/new.txt")" = "$(printf '<<<<<<< fork %s\nB made it\n||||||| original\n=======\nA made it\n>>>>>>> mainline' "$B")" ] \
+  || fail "G19: empty original block expected: $(cat "$(fork_path "$B")/new.txt")"
 acy fork-drop "$B" >/dev/null
 
 # --- G20: both sides add different files under one NEW directory: lands -----
@@ -452,4 +453,7 @@ echo "$OUT" | grep -q 'kept the mainline.s copy of 1 gitignored path(s)' || fail
 cmp -s "$(fork_path "$B")/src/__pycache__/m.pyc" <(printf 'PYC-AA\000\n') || fail "G27: rebase must give the fork the mainline's artifact"
 acy fork-drop "$B" >/dev/null
 
-pass "merge ($MODE mode): disjoint forks replay, same-file edits merge by line, same-line/modify-delete/add-add conflicts rebase the fork with diff3 markers and resolve-then-promote lands, binary/kind/ancestry overlaps are refused leaving the fork untouched, merges are undoable, CRLF survives, all-or-nothing holds, gitignored artifacts never block"
+pass "merge ($MODE mode): disjoint forks replay, same-file edits merge by line," \
+  "same-line/modify-delete/add-add conflicts rebase the fork with diff3 markers and resolve-then-promote lands," \
+  "binary/kind/ancestry overlaps are refused leaving the fork untouched, merges are undoable, CRLF survives," \
+  "all-or-nothing holds, gitignored artifacts never block"

@@ -37,13 +37,12 @@ impl StorePaths {
     /// Resolves the store root for a repo. `stores_root` override comes from
     /// config; the default is `~/.local/share/acyclic/stores`.
     pub fn for_repo(repo_root: &Path, stores_root: Option<&Path>) -> Result<Self> {
-        let base = match stores_root {
-            Some(path) => path.to_path_buf(),
-            None => {
-                let home = std::env::var_os("HOME")
-                    .ok_or_else(|| EngineError::Store("HOME is not set".into()))?;
-                Path::new(&home).join(format!(".local/share/{}/stores", crate::product::NAME))
-            }
+        let base = if let Some(path) = stores_root {
+            path.to_path_buf()
+        } else {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| EngineError::Store("HOME is not set".into()))?;
+            Path::new(&home).join(format!(".local/share/{}/stores", crate::product::NAME))
         };
         let canonical = repo_root
             .canonicalize()
@@ -65,11 +64,10 @@ impl StorePaths {
     /// the store: `sun_path` is capped (~104 bytes on macOS) and store roots
     /// can be arbitrarily deep.
     pub fn socket(&self) -> PathBuf {
-        let store_key = self
-            .root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "default".into());
+        let store_key = self.root.file_name().map_or_else(
+            || "default".into(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         runtime_dir().join(format!("{store_key}.sock"))
     }
     pub fn pidfile(&self) -> PathBuf {

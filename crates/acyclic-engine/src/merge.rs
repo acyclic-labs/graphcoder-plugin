@@ -467,6 +467,10 @@ fn changed_paths(
 }
 
 /// Computes the merge of fork `ours` onto mainline `theirs` from `base`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per (base, ours, theirs) kind combination; the table reads best whole"
+)]
 pub async fn plan(
     store: &Store,
     base: GenerationId,
@@ -512,21 +516,15 @@ pub async fn plan(
         let f = ours_map.get(path);
         let kind = |summary: Option<&RecordSummary>| summary.map(|s| s.kind);
         match (kind(b), kind(f), kind(h)) {
-            // Both deleted it (or both changed it inside a now-absent dir).
-            (_, None, None) => {}
-            // Independent edits below one directory resolve by descendants.
-            (
+            // Nothing to decide here: both deleted it (or both changed it
+            // inside a now-absent dir), or independent edits below one
+            // directory resolve by descendants.
+            (_, None, None)
+            | (
                 None | Some(FileKind::Directory),
                 Some(FileKind::Directory),
                 Some(FileKind::Directory),
             ) => {}
-            (_, Some(FileKind::Directory), Some(FileKind::Directory)) => {
-                plan.refusals.push(Refusal {
-                    path: path.clone(),
-                    reason: Reason::KindChange,
-                });
-                decided_root = Some(path.clone());
-            }
             // Regular files on both sides.
             (_, Some(FileKind::Regular), Some(FileKind::Regular)) => {
                 if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) {
@@ -612,9 +610,12 @@ pub async fn plan(
                 });
                 decided_root = Some(path.clone());
             }
-            // Symlinks retargeted identically are fine; anything else is a kind clash.
+            // Symlinks retargeted identically are fine.
             (_, Some(FileKind::SymbolicLink), Some(FileKind::SymbolicLink))
                 if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) => {}
+            // Everything else is a kind clash: a file on one side and a
+            // directory or symlink on the other, symlinks retargeted
+            // differently, or a file that became a directory on both sides.
             _ => {
                 plan.refusals.push(Refusal {
                     path: path.clone(),
@@ -646,7 +647,7 @@ fn push_content(
                 hunks,
                 kind,
                 mode,
-            })
+            });
         }
         Err(reason) => plan.refusals.push(Refusal {
             path: path.to_path_buf(),
@@ -1309,7 +1310,10 @@ mod tests {
         assert!(has_conflict_markers(
             "<<<<<<< fork a\nx\n=======\ny\n>>>>>>> mainline\n"
         ));
-        assert!(has_conflict_markers("<<<<<<< fork a (deleted)\n||||||| original\nb\n=======\ny\n>>>>>>> mainline (modified)\n"));
+        assert!(has_conflict_markers(
+            "<<<<<<< fork a (deleted)\n||||||| original\nb\n=======\ny\n\
+             >>>>>>> mainline (modified)\n"
+        ));
         assert!(has_conflict_markers(
             "pre\n<<<<<<< x\r\na\r\n=======\r\nb\r\n>>>>>>> y\r\n"
         ));
@@ -1406,7 +1410,10 @@ mod tests {
         };
         assert_eq!(kind, ConflictKind::OursDeleted);
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("<<<<<<< fork a (deleted)\n||||||| original\nbase\n=======\ntheirs\n>>>>>>> mainline (modified)\n"));
+        assert!(text.starts_with(
+            "<<<<<<< fork a (deleted)\n||||||| original\nbase\n=======\ntheirs\n\
+             >>>>>>> mainline (modified)\n"
+        ));
         assert!(has_conflict_markers(&text));
     }
 
@@ -1500,7 +1507,7 @@ mod tests {
             .args(["init", "-q"])
             .current_dir(repo.path())
             .status();
-        if !init.map(|s| s.success()).unwrap_or(false) {
+        if !init.is_ok_and(|s| s.success()) {
             eprintln!("git unavailable; skipping");
             return;
         }

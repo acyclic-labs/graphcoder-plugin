@@ -52,7 +52,7 @@ impl Payload {
     fn tool(&mut self) -> Option<String> {
         self.tool_name
             .take()
-            .or_else(|| self.command.take().map(|_| "Bash".to_string()))
+            .or_else(|| self.command.take().map(|_| "Bash".to_owned()))
     }
 }
 
@@ -205,14 +205,14 @@ mod tests {
                 "hook_event_name":"beforeShellExecution"}"#,
         );
         assert_eq!(payload.session_id, None);
-        assert_eq!(payload.session(), Some("c1".to_string()));
-        assert_eq!(payload.tool(), Some("Bash".to_string()));
+        assert_eq!(payload.session(), Some("c1".to_owned()));
+        assert_eq!(payload.tool(), Some("Bash".to_owned()));
     }
 
     #[test]
     fn session_prefers_session_id_over_conversation_id() {
         let mut payload = parse_payload(r#"{"session_id":"s1","conversation_id":"c1"}"#);
-        assert_eq!(payload.session(), Some("s1".to_string()));
+        assert_eq!(payload.session(), Some("s1".to_owned()));
     }
 
     #[test]
