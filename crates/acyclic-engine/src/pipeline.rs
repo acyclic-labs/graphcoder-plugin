@@ -1198,10 +1198,14 @@ impl Pipeline {
             self.baseline(CheckpointKind::Recovered).await?;
         }
         let drain_started = Instant::now();
-        let changed = self.drain_watcher().await?;
+        // Changes an idle tick already drained into the checkout but has
+        // not recorded yet count as pending too: without this the row
+        // would be a noop at the previous generation and lose them.
+        let changed = self.drain_watcher().await? || self.auto_pending.is_some();
         let drain_ms = crate::trace::ms(drain_started);
         let capture_started = Instant::now();
         let (generation, kind) = if changed {
+            self.auto_pending = None;
             (self.checkpoint_engine().await?, kind)
         } else {
             (self.last_generation, CheckpointKind::Noop)
@@ -1524,7 +1528,8 @@ impl Pipeline {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
-        if self.drain_watcher().await? {
+        if self.drain_watcher().await? || self.auto_pending.is_some() {
+            self.auto_pending = None;
             let safety = self.checkpoint_engine().await?;
             let row = self.index.record(
                 safety,

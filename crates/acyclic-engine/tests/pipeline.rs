@@ -217,6 +217,56 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     assert_eq!(latest.kind, CheckpointKind::Baseline);
 }
 
+/// An idle tick that has drained an edit into the checkout but not yet
+/// recorded it must not turn the next requested checkpoint into a noop at
+/// the previous generation: the requested row has to carry the edit.
+#[test]
+fn requested_checkpoint_records_changes_an_idle_tick_already_drained() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("a.txt"), b"one\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let config = Config {
+        quiesce_ms: 20,
+        quiesce_cap_ms: 200,
+        // Ticks every 200 ms; a row needs a further 200 ms of quiet, so a
+        // request issued right after the first tick meets drained,
+        // unrecorded changes.
+        auto_checkpoint_idle_ms: 200,
+        commit_every: 100,
+        commit_idle_ms: 60_000,
+        trash_ttl_days: 1,
+        store_dir: None,
+        ..Config::default()
+    };
+    let (handle, thread) = pipeline::spawn(store, index, config);
+
+    let outcome = runtime.block_on(async {
+        handle.status().await.expect("status");
+        std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let outcome = handle
+            .checkpoint(CheckpointKind::Post, Attribution::default())
+            .await
+            .expect("post checkpoint");
+        handle.shutdown().await.expect("shutdown");
+        outcome
+    });
+    thread.join().expect("pipeline thread");
+
+    assert_eq!(outcome.kind, CheckpointKind::Post, "must not be a noop");
+    let index = read_only_index(&paths.index_db());
+    let latest = index.latest().expect("query").expect("a row exists");
+    assert_eq!(latest.id, outcome.row_id);
+    assert_eq!(latest.kind, CheckpointKind::Post);
+}
+
 /// The idle tick is a fixed deadline, not a timeout restarted per request:
 /// a host polling `status` must not be able to postpone the auto checkpoint
 /// forever.
