@@ -1,5 +1,9 @@
 # Phase 0 verdict — qualifying `acyclic-fs` for the Rewind milestone
 
+> **Historical snapshot.** This records the qualification decision made at a point in time,
+> including its dated numbers and status line below. It is not kept in sync with the current
+> codebase — check the code and `CHANGELOG.md` for present-day status.
+
 > Produced by the `acyclic-qual` harness (`crates/acyclic-qual`). Machine: macOS (APFS). Status: **GO, with one architecture change and two fs patches.**
 
 ## Headline

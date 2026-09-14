@@ -3,6 +3,8 @@ name = "acyclic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Agent-native state engine: checkpoints, rewind, and blast-radius diff for coding-agent sessions"
 

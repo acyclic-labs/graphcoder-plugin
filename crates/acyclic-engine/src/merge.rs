@@ -1,4 +1,4 @@
-//! Content-level merge (Merge v2, see plans/implementation-merge.md).
+//! Content-level merge (Merge v2, see docs/design/implementation-merge.md).
 //!
 //! Three generations take part: the fork base **B**, the mainline head
 //! **H** ("theirs"), and the fork snapshot **F** ("ours"; the fork is
@@ -191,13 +191,21 @@ impl std::fmt::Display for Reason {
             Reason::Binary => write!(f, "binary"),
             Reason::TooLarge => write!(f, "too large"),
             Reason::Ancestry { inner } => {
-                let shown: Vec<String> = inner.iter().take(4).map(|p| p.display().to_string()).collect();
+                let shown: Vec<String> = inner
+                    .iter()
+                    .take(4)
+                    .map(|p| p.display().to_string())
+                    .collect();
                 let more = inner.len().saturating_sub(shown.len());
                 write!(
                     f,
                     "deleted on one side, changed inside on the other ({}{})",
                     shown.join(", "),
-                    if more > 0 { format!(" +{more} more") } else { String::new() }
+                    if more > 0 {
+                        format!(" +{more} more")
+                    } else {
+                        String::new()
+                    }
                 )
             }
         }
@@ -247,7 +255,10 @@ pub fn merge_file(
     theirs_name: &str,
     limits: &MergeLimits,
 ) -> std::result::Result<ContentMerge, Reason> {
-    fn gate<'a>(side: Option<&'a [u8]>, limits: &MergeLimits) -> std::result::Result<Option<&'a str>, Reason> {
+    fn gate<'a>(
+        side: Option<&'a [u8]>,
+        limits: &MergeLimits,
+    ) -> std::result::Result<Option<&'a str>, Reason> {
         match side {
             None => Ok(None),
             Some(bytes) => text_gate(bytes, limits).map(Some),
@@ -261,7 +272,13 @@ pub fn merge_file(
             if ours == theirs {
                 return Ok(ContentMerge::Merged(ours.as_bytes().to_vec()));
             }
-            let result = merge3(base_text.unwrap_or(""), ours, theirs, ours_name, theirs_name);
+            let result = merge3(
+                base_text.unwrap_or(""),
+                ours,
+                theirs,
+                ours_name,
+                theirs_name,
+            );
             if result.clean {
                 Ok(ContentMerge::Merged(result.content.into_bytes()))
             } else {
@@ -414,7 +431,10 @@ fn subtree_changed(set: &BTreeSet<PathBuf>, path: &Path) -> bool {
         .is_some_and(|next| next.starts_with(path))
 }
 
-fn descendants<'a>(set: &'a BTreeSet<PathBuf>, path: &'a Path) -> impl Iterator<Item = &'a PathBuf> + 'a {
+fn descendants<'a>(
+    set: &'a BTreeSet<PathBuf>,
+    path: &'a Path,
+) -> impl Iterator<Item = &'a PathBuf> + 'a {
     let owned = path.to_path_buf();
     let root = owned.clone();
     set.range(owned..)
@@ -495,9 +515,16 @@ pub async fn plan(
             // Both deleted it (or both changed it inside a now-absent dir).
             (_, None, None) => {}
             // Independent edits below one directory resolve by descendants.
-            (None | Some(FileKind::Directory), Some(FileKind::Directory), Some(FileKind::Directory)) => {}
+            (
+                None | Some(FileKind::Directory),
+                Some(FileKind::Directory),
+                Some(FileKind::Directory),
+            ) => {}
             (_, Some(FileKind::Directory), Some(FileKind::Directory)) => {
-                plan.refusals.push(Refusal { path: path.clone(), reason: Reason::KindChange });
+                plan.refusals.push(Refusal {
+                    path: path.clone(),
+                    reason: Reason::KindChange,
+                });
                 decided_root = Some(path.clone());
             }
             // Regular files on both sides.
@@ -509,7 +536,10 @@ pub async fn plan(
                     Some(FileKind::Regular) => Some(read_regular(&mut base_checkout, path).await?),
                     None => None,
                     Some(_) => {
-                        plan.refusals.push(Refusal { path: path.clone(), reason: Reason::KindChange });
+                        plan.refusals.push(Refusal {
+                            path: path.clone(),
+                            reason: Reason::KindChange,
+                        });
                         continue;
                     }
                 };
@@ -568,19 +598,28 @@ pub async fn plan(
             // One side deleted a directory the other changed inside.
             (Some(FileKind::Directory), None, Some(FileKind::Directory)) => {
                 let inner: Vec<PathBuf> = descendants(&theirs_changed, path).cloned().collect();
-                plan.refusals.push(Refusal { path: path.clone(), reason: Reason::Ancestry { inner } });
+                plan.refusals.push(Refusal {
+                    path: path.clone(),
+                    reason: Reason::Ancestry { inner },
+                });
                 decided_root = Some(path.clone());
             }
             (Some(FileKind::Directory), Some(FileKind::Directory), None) => {
                 let inner: Vec<PathBuf> = descendants(&ours_changed, path).cloned().collect();
-                plan.refusals.push(Refusal { path: path.clone(), reason: Reason::Ancestry { inner } });
+                plan.refusals.push(Refusal {
+                    path: path.clone(),
+                    reason: Reason::Ancestry { inner },
+                });
                 decided_root = Some(path.clone());
             }
             // Symlinks retargeted identically are fine; anything else is a kind clash.
             (_, Some(FileKind::SymbolicLink), Some(FileKind::SymbolicLink))
                 if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) => {}
             _ => {
-                plan.refusals.push(Refusal { path: path.clone(), reason: Reason::KindChange });
+                plan.refusals.push(Refusal {
+                    path: path.clone(),
+                    reason: Reason::KindChange,
+                });
                 decided_root = Some(path.clone());
             }
         }
@@ -600,13 +639,15 @@ fn push_content(
             bytes,
             mode,
         }),
-        Ok(ContentMerge::Conflicted { bytes, hunks, kind }) => plan.conflicted.push(ConflictedFile {
-            path: path.to_path_buf(),
-            bytes,
-            hunks,
-            kind,
-            mode,
-        }),
+        Ok(ContentMerge::Conflicted { bytes, hunks, kind }) => {
+            plan.conflicted.push(ConflictedFile {
+                path: path.to_path_buf(),
+                bytes,
+                hunks,
+                kind,
+                mode,
+            })
+        }
         Err(reason) => plan.refusals.push(Refusal {
             path: path.to_path_buf(),
             reason,
@@ -645,7 +686,12 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
     let length = match record.payload {
         acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
         acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
-        _ => return Err(EngineError::Fs(format!("{}: not a regular file", path.display()))),
+        _ => {
+            return Err(EngineError::Fs(format!(
+                "{}: not a regular file",
+                path.display()
+            )))
+        }
     };
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
@@ -656,7 +702,10 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
         let read = checkout
             .read_file_range(
                 &namespace,
-                ByteRange { offset, length: take },
+                ByteRange {
+                    offset,
+                    length: take,
+                },
                 WorkCounters::UNBOUNDED,
                 &cancel,
             )
@@ -670,7 +719,11 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
 }
 
 /// Content of `path` in `generation` if it is a regular file there.
-pub async fn read_file(store: &Store, generation: GenerationId, path: &Path) -> Result<Option<Vec<u8>>> {
+pub async fn read_file(
+    store: &Store,
+    generation: GenerationId,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
     let mut checkout = store.checkout_exact(generation).await?;
     let cancel = CancellationToken::new();
     let namespace = namespace_of(path)?;
@@ -680,7 +733,9 @@ pub async fn read_file(store: &Store, generation: GenerationId, path: &Path) -> 
         .map_err(EngineError::fs("lookup"))?
         .value;
     match lookup.record {
-        Some(record) if record.kind == FileKind::Regular => Ok(Some(read_regular(&mut checkout, path).await?)),
+        Some(record) if record.kind == FileKind::Regular => {
+            Ok(Some(read_regular(&mut checkout, path).await?))
+        }
         _ => Ok(None),
     }
 }
@@ -746,41 +801,50 @@ async fn apply_entry(
     {
         {
             match entry {
-            Entry::Regular { bytes, mode } => {
-                remove_subtree(dst, namespace, cancel).await?;
-                ensure_parents(dst, namespace, cancel).await?;
-                dst.create_file(
-                    namespace.clone(),
-                    Bytes::copy_from_slice(bytes),
-                    WorkCounters::UNBOUNDED,
-                    cancel,
-                )
-                .await
-                .map_err(EngineError::fs("create file"))?;
-                if let Some(mode) = mode {
-                    let metadata = FileMetadata {
-                        posix_mode: MetadataField::Value(*mode),
-                        ..FileMetadata::default()
-                    };
-                    dst.set_metadata(namespace.clone(), metadata, WorkCounters::UNBOUNDED, cancel)
+                Entry::Regular { bytes, mode } => {
+                    remove_subtree(dst, namespace, cancel).await?;
+                    ensure_parents(dst, namespace, cancel).await?;
+                    dst.create_file(
+                        namespace.clone(),
+                        Bytes::copy_from_slice(bytes),
+                        WorkCounters::UNBOUNDED,
+                        cancel,
+                    )
+                    .await
+                    .map_err(EngineError::fs("create file"))?;
+                    if let Some(mode) = mode {
+                        let metadata = FileMetadata {
+                            posix_mode: MetadataField::Value(*mode),
+                            ..FileMetadata::default()
+                        };
+                        dst.set_metadata(
+                            namespace.clone(),
+                            metadata,
+                            WorkCounters::UNBOUNDED,
+                            cancel,
+                        )
                         .await
                         .map_err(EngineError::fs("set metadata"))?;
+                    }
+                }
+                Entry::FromGeneration { generation } => {
+                    let mut src = store.checkout_exact(*generation).await?;
+                    remove_subtree(dst, namespace, cancel).await?;
+                    ensure_parents(dst, namespace, cancel).await?;
+                    copy_node(&mut src, dst, namespace, cancel).await?;
                 }
             }
-            Entry::FromGeneration { generation } => {
-                let mut src = store.checkout_exact(*generation).await?;
-                remove_subtree(dst, namespace, cancel).await?;
-                ensure_parents(dst, namespace, cancel).await?;
-                copy_node(&mut src, dst, namespace, cancel).await?;
-            }
         }
-    }
     }
     Ok(())
 }
 
 /// Creates missing ancestor directories of `namespace` in `dst`.
-async fn ensure_parents(dst: &mut LocalCheckout, namespace: &NamespacePath, cancel: &CancellationToken) -> Result<()> {
+async fn ensure_parents(
+    dst: &mut LocalCheckout,
+    namespace: &NamespacePath,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let limits = dst.volume_config().limits;
     let components = namespace.components();
     for depth in 1..components.len() {
@@ -800,10 +864,15 @@ async fn ensure_parents(dst: &mut LocalCheckout, namespace: &NamespacePath, canc
     Ok(())
 }
 
-fn child_path(parent: &NamespacePath, name: &acyclic_fs::kernel::LogicalName, limits: acyclic_fs::model::VolumeLimits) -> Result<NamespacePath> {
+fn child_path(
+    parent: &NamespacePath,
+    name: &acyclic_fs::kernel::LogicalName,
+    limits: acyclic_fs::model::VolumeLimits,
+) -> Result<NamespacePath> {
     let mut components = parent.components().to_vec();
     components.push(name.clone());
-    NamespacePath::new(components, limits).map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
+    NamespacePath::new(components, limits)
+        .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
 }
 
 async fn list_children(
@@ -815,7 +884,13 @@ async fn list_children(
     let mut after = None;
     loop {
         let page = checkout
-            .list_directory_records(namespace, after.as_ref(), PAGE_ENTRIES, WorkCounters::UNBOUNDED, cancel)
+            .list_directory_records(
+                namespace,
+                after.as_ref(),
+                PAGE_ENTRIES,
+                WorkCounters::UNBOUNDED,
+                cancel,
+            )
             .await
             .map_err(EngineError::fs("list directory"))?
             .value;
@@ -898,9 +973,14 @@ async fn copy_node(
         match record.kind {
             FileKind::Regular => {
                 let bytes = read_regular_ns(src, &path, &record.payload, cancel).await?;
-                dst.create_file(path.clone(), Bytes::from(bytes), WorkCounters::UNBOUNDED, cancel)
-                    .await
-                    .map_err(EngineError::fs("create file"))?;
+                dst.create_file(
+                    path.clone(),
+                    Bytes::from(bytes),
+                    WorkCounters::UNBOUNDED,
+                    cancel,
+                )
+                .await
+                .map_err(EngineError::fs("create file"))?;
             }
             FileKind::SymbolicLink => {
                 let target = src
@@ -962,7 +1042,15 @@ async fn read_regular_ns(
     while offset < length {
         let take = chunk.min(length - offset);
         let read = checkout
-            .read_file_range(namespace, ByteRange { offset, length: take }, WorkCounters::UNBOUNDED, cancel)
+            .read_file_range(
+                namespace,
+                ByteRange {
+                    offset,
+                    length: take,
+                },
+                WorkCounters::UNBOUNDED,
+                cancel,
+            )
             .await
             .map_err(EngineError::fs("read file range"))?
             .value;
@@ -1218,11 +1306,17 @@ mod tests {
 
     #[test]
     fn marker_detection_matches_markers_ts() {
-        assert!(has_conflict_markers("<<<<<<< fork a\nx\n=======\ny\n>>>>>>> mainline\n"));
+        assert!(has_conflict_markers(
+            "<<<<<<< fork a\nx\n=======\ny\n>>>>>>> mainline\n"
+        ));
         assert!(has_conflict_markers("<<<<<<< fork a (deleted)\n||||||| original\nb\n=======\ny\n>>>>>>> mainline (modified)\n"));
-        assert!(has_conflict_markers("pre\n<<<<<<< x\r\na\r\n=======\r\nb\r\n>>>>>>> y\r\n"));
+        assert!(has_conflict_markers(
+            "pre\n<<<<<<< x\r\na\r\n=======\r\nb\r\n>>>>>>> y\r\n"
+        ));
         // No opening marker at a line start.
-        assert!(!has_conflict_markers("text <<<<<<< not a marker\n=======\n"));
+        assert!(!has_conflict_markers(
+            "text <<<<<<< not a marker\n=======\n"
+        ));
         // Opening marker but no separator line.
         assert!(!has_conflict_markers("<<<<<<< x\nalone\n"));
         // Separator alone.
@@ -1235,10 +1329,25 @@ mod tests {
 
     #[test]
     fn merge_file_clean_and_conflict() {
-        let merged = merge_file(Some(b"1\n2\n3\n"), Some(b"1x\n2\n3\n"), Some(b"1\n2\n3y\n"), "fork a", "mainline", &LIMITS)
-            .expect("gate");
+        let merged = merge_file(
+            Some(b"1\n2\n3\n"),
+            Some(b"1x\n2\n3\n"),
+            Some(b"1\n2\n3y\n"),
+            "fork a",
+            "mainline",
+            &LIMITS,
+        )
+        .expect("gate");
         assert_eq!(merged, ContentMerge::Merged(b"1x\n2\n3y\n".to_vec()));
-        let conflicted = merge_file(Some(b"1\n"), Some(b"a\n"), Some(b"b\n"), "fork a", "mainline", &LIMITS).expect("gate");
+        let conflicted = merge_file(
+            Some(b"1\n"),
+            Some(b"a\n"),
+            Some(b"b\n"),
+            "fork a",
+            "mainline",
+            &LIMITS,
+        )
+        .expect("gate");
         let ContentMerge::Conflicted { bytes, hunks, kind } = conflicted else {
             panic!("expected conflict")
         };
@@ -1252,13 +1361,29 @@ mod tests {
 
     #[test]
     fn identical_changes_take_either_without_diffing() {
-        let merged = merge_file(Some(b"1\n"), Some(b"same\n"), Some(b"same\n"), "f", "m", &LIMITS).unwrap();
+        let merged = merge_file(
+            Some(b"1\n"),
+            Some(b"same\n"),
+            Some(b"same\n"),
+            "f",
+            "m",
+            &LIMITS,
+        )
+        .unwrap();
         assert_eq!(merged, ContentMerge::Merged(b"same\n".to_vec()));
     }
 
     #[test]
     fn modify_delete_is_a_labelled_conflict() {
-        let ours_modified = merge_file(Some(b"base\n"), Some(b"ours\n"), None, "fork a", "mainline", &LIMITS).unwrap();
+        let ours_modified = merge_file(
+            Some(b"base\n"),
+            Some(b"ours\n"),
+            None,
+            "fork a",
+            "mainline",
+            &LIMITS,
+        )
+        .unwrap();
         let ContentMerge::Conflicted { bytes, hunks, kind } = ours_modified else {
             panic!("expected conflict")
         };
@@ -1267,7 +1392,15 @@ mod tests {
             String::from_utf8(bytes).unwrap(),
             "<<<<<<< fork a (modified)\nours\n||||||| original\nbase\n=======\n>>>>>>> mainline (deleted)\n"
         );
-        let ours_deleted = merge_file(Some(b"base"), None, Some(b"theirs"), "fork a", "mainline", &LIMITS).unwrap();
+        let ours_deleted = merge_file(
+            Some(b"base"),
+            None,
+            Some(b"theirs"),
+            "fork a",
+            "mainline",
+            &LIMITS,
+        )
+        .unwrap();
         let ContentMerge::Conflicted { bytes, kind, .. } = ours_deleted else {
             panic!("expected conflict")
         };
@@ -1309,17 +1442,35 @@ mod tests {
 
     #[test]
     fn mode_comes_from_the_side_that_changed_it() {
-        assert_eq!(merged_mode(Some(0o644), Some(0o644), Some(0o755)), Some(0o755));
-        assert_eq!(merged_mode(Some(0o644), Some(0o755), Some(0o644)), Some(0o755));
-        assert_eq!(merged_mode(Some(0o644), Some(0o700), Some(0o755)), Some(0o700));
-        assert_eq!(merged_mode(Some(0o644), Some(0o644), Some(0o644)), Some(0o644));
+        assert_eq!(
+            merged_mode(Some(0o644), Some(0o644), Some(0o755)),
+            Some(0o755)
+        );
+        assert_eq!(
+            merged_mode(Some(0o644), Some(0o755), Some(0o644)),
+            Some(0o755)
+        );
+        assert_eq!(
+            merged_mode(Some(0o644), Some(0o700), Some(0o755)),
+            Some(0o700)
+        );
+        assert_eq!(
+            merged_mode(Some(0o644), Some(0o644), Some(0o644)),
+            Some(0o644)
+        );
     }
 
     #[test]
     fn keep_mainline_for_drops_only_ignored_entries() {
         let mut plan = MergePlan::default();
-        plan.refusals.push(Refusal { path: PathBuf::from("a.pyc"), reason: Reason::Binary });
-        plan.refusals.push(Refusal { path: PathBuf::from("b.bin"), reason: Reason::Binary });
+        plan.refusals.push(Refusal {
+            path: PathBuf::from("a.pyc"),
+            reason: Reason::Binary,
+        });
+        plan.refusals.push(Refusal {
+            path: PathBuf::from("b.bin"),
+            reason: Reason::Binary,
+        });
         plan.conflicted.push(ConflictedFile {
             path: PathBuf::from(".env"),
             bytes: Vec::new(),
@@ -1353,7 +1504,11 @@ mod tests {
             eprintln!("git unavailable; skipping");
             return;
         }
-        std::fs::write(repo.path().join(".gitignore"), "__pycache__/\n*.log\n.env\n").unwrap();
+        std::fs::write(
+            repo.path().join(".gitignore"),
+            "__pycache__/\n*.log\n.env\n",
+        )
+        .unwrap();
         let asked = vec![
             PathBuf::from("src/__pycache__/m.cpython-313.pyc"),
             PathBuf::from("src/m.py"),
@@ -1386,7 +1541,11 @@ mod tests {
         let inner: Vec<&PathBuf> = descendants(&set, Path::new("a")).collect();
         assert_eq!(inner, vec![&PathBuf::from("a/b/c"), &PathBuf::from("a/bc")]);
         assert_eq!(
-            subtree_roots(&[PathBuf::from("x/y/z"), PathBuf::from("x/y"), PathBuf::from("w")]),
+            subtree_roots(&[
+                PathBuf::from("x/y/z"),
+                PathBuf::from("x/y"),
+                PathBuf::from("w")
+            ]),
             vec![PathBuf::from("w"), PathBuf::from("x/y")]
         );
     }

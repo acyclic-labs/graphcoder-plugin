@@ -246,32 +246,6 @@ fn stranded_in_trash(repo: &Path) -> bool {
     })
 }
 
-#[cfg(test)]
-mod stranded_tests {
-    use super::stranded_in_trash;
-
-    #[test]
-    fn store_trash_and_sibling_trash_are_detected() {
-        let work = tempfile::tempdir().expect("tempdir");
-        let store = work.path().join("stores/944d51144ca00be5");
-        let trashed = store.join("trash/demo-1789144724/src");
-        std::fs::create_dir_all(&trashed).expect("trash tree");
-        std::fs::write(store.join("meta.json"), b"{}").expect("meta");
-        assert!(stranded_in_trash(&trashed));
-        assert!(stranded_in_trash(trashed.parent().unwrap()));
-
-        let sibling = work.path().join(format!(".demo.{}-trash-1789144724/src", super::product::NAME));
-        std::fs::create_dir_all(&sibling).expect("sibling");
-        assert!(stranded_in_trash(&sibling));
-
-        // A directory merely named trash, with no store above it, is fine.
-        let plain = work.path().join("project/trash/notes");
-        std::fs::create_dir_all(&plain).expect("plain");
-        assert!(!stranded_in_trash(&plain));
-        assert!(!stranded_in_trash(&work.path().join("demo")));
-    }
-}
-
 fn run(cli: Cli, repo: &Path) -> i32 {
     match cli.command {
         Command::Daemon { repo_root } => match server::run(&repo_root) {
@@ -368,7 +342,10 @@ fn policy(repo: &Path) -> i32 {
                 None => println!("test_command = (infer from the repo)"),
             }
             println!("tie_break = {:?}", d.tie_break);
-            println!("# set these under [decompose] in {}", product::repo_config_file());
+            println!(
+                "# set these under [decompose] in {}",
+                product::repo_config_file()
+            );
             0
         }
         Err(error) => {
@@ -785,7 +762,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     report.push('\n');
                     report.push_str(kept_note.trim_end());
                 }
-                return Err(report.into());
+                return Err(report);
             }
             print!("{kept_note}");
             match (info.old_tree, info.replayed_paths, info.merged_files) {
@@ -1046,4 +1023,33 @@ fn human_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod stranded_tests {
+    use super::stranded_in_trash;
+
+    #[test]
+    fn store_trash_and_sibling_trash_are_detected() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let store = work.path().join("stores/944d51144ca00be5");
+        let trashed = store.join("trash/demo-1789144724/src");
+        std::fs::create_dir_all(&trashed).expect("trash tree");
+        std::fs::write(store.join("meta.json"), b"{}").expect("meta");
+        assert!(stranded_in_trash(&trashed));
+        assert!(stranded_in_trash(trashed.parent().unwrap()));
+
+        let sibling = work.path().join(format!(
+            ".demo.{}-trash-1789144724/src",
+            super::product::NAME
+        ));
+        std::fs::create_dir_all(&sibling).expect("sibling");
+        assert!(stranded_in_trash(&sibling));
+
+        // A directory merely named trash, with no store above it, is fine.
+        let plain = work.path().join("project/trash/notes");
+        std::fs::create_dir_all(&plain).expect("plain");
+        assert!(!stranded_in_trash(&plain));
+        assert!(!stranded_in_trash(&work.path().join("demo")));
+    }
 }

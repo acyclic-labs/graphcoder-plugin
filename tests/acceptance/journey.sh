@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Maya journey from plans/01-rewind.md, scripted end to end:
+# The Maya journey from docs/design/01-rewind.md, scripted end to end:
 # init -> risky change (edit + bash side effects) -> diff -> rewind ->
 # byte-identical restore incl. gitignored state -> cross-session persistence.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"

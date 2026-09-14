@@ -8,8 +8,8 @@
 //! that `acyclic hook` needs no host-specific parsing) and appends the
 //! agents-md cheatsheet, since Codex already reads AGENTS.md.
 //! cursor: merges Cursor's differently-named agent hooks into
-//! `.cursor/hooks.json` and drops an always-applied rule at
-//! `.cursor/rules/acyclic.mdc`; Cursor's payload shape (`conversation_id`
+//! `.cursor/hooks.json` and drops an always-applied, product-named rule
+//! file under `.cursor/rules/`; Cursor's payload shape (`conversation_id`
 //! instead of `session_id`, no `tool_name` on shell hooks) is normalized in
 //! `hook::Payload`.
 //! Checked-in files, so the whole team inherits the wiring.
@@ -42,14 +42,26 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     std::fs::create_dir_all(claude_dir.join(&decompose_skill)).map_err(stringify)?;
 
     merge_hooks(&claude_dir.join("settings.json"))?;
-    std::fs::write(claude_dir.join("commands/rewind.md"), product::render(REWIND_COMMAND)).map_err(stringify)?;
-    std::fs::write(claude_dir.join("commands/timeline.md"), product::render(TIMELINE_COMMAND)).map_err(stringify)?;
+    std::fs::write(
+        claude_dir.join("commands/rewind.md"),
+        product::render(REWIND_COMMAND),
+    )
+    .map_err(stringify)?;
+    std::fs::write(
+        claude_dir.join("commands/timeline.md"),
+        product::render(TIMELINE_COMMAND),
+    )
+    .map_err(stringify)?;
     std::fs::write(
         claude_dir.join(format!("{rollback_skill}/SKILL.md")),
         product::render(SELF_ROLLBACK_SKILL),
     )
     .map_err(stringify)?;
-    std::fs::write(claude_dir.join("commands/fork.md"), product::render(FORK_COMMAND)).map_err(stringify)?;
+    std::fs::write(
+        claude_dir.join("commands/fork.md"),
+        product::render(FORK_COMMAND),
+    )
+    .map_err(stringify)?;
     std::fs::write(
         claude_dir.join(format!("{decompose_skill}/SKILL.md")),
         product::render(FORK_DECOMPOSE_SKILL),
@@ -187,9 +199,8 @@ fn codex(repo: &Path) -> Result<(), String> {
 
 fn merge_codex_hooks(hooks_path: &Path) -> Result<(), String> {
     let mut hooks: Value = match std::fs::read_to_string(hooks_path) {
-        Ok(text) => {
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", hooks_path.display()))?
-        }
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", hooks_path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.to_string()),
     };
@@ -213,30 +224,31 @@ fn cursor(repo: &Path) -> Result<(), String> {
     std::fs::create_dir_all(cursor_dir.join("rules")).map_err(stringify)?;
     merge_cursor_hooks(&cursor_dir.join("hooks.json"))?;
     std::fs::write(
-        cursor_dir.join("rules/acyclic.mdc"),
+        cursor_dir.join(format!("rules/{NAME}.mdc")),
         product::render(CURSOR_RULE),
     )
     .map_err(stringify)?;
 
     println!("cursor adapter installed into {}", cursor_dir.display());
     println!("  hooks: .cursor/hooks.json (shell + file-edit + prompt + session)");
-    println!("  rule:  .cursor/rules/acyclic.mdc");
+    println!("  rule:  .cursor/rules/{NAME}.mdc");
     println!("check these files in so the whole team inherits checkpointing.");
     Ok(())
 }
 
 fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
     let mut root: Value = match std::fs::read_to_string(hooks_path) {
-        Ok(text) => {
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", hooks_path.display()))?
-        }
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", hooks_path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.to_string()),
     };
     let root_obj = root.as_object_mut().ok_or("hooks.json is not an object")?;
     root_obj.entry("version").or_insert(json!(1));
     let hooks = root_obj.entry("hooks").or_insert(json!({}));
-    let hooks = hooks.as_object_mut().ok_or("hooks.hooks is not an object")?;
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or("hooks.hooks is not an object")?;
 
     // Cursor entries carry `command`/`type` directly (no nested `hooks`
     // array), so its own merge loop rather than `merge_event_hooks`.
@@ -714,7 +726,8 @@ mod tests {
 
         let hooks_path = dir.path().join(".codex/hooks.json");
         let value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read")).expect("json");
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read"))
+                .expect("json");
         for event in [
             "PreToolUse",
             "PostToolUse",
@@ -745,7 +758,8 @@ mod tests {
 
         let hooks_path = dir.path().join(".cursor/hooks.json");
         let value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read")).expect("json");
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read"))
+                .expect("json");
         assert_eq!(value["version"], 1);
         for event in [
             "sessionStart",
@@ -767,13 +781,16 @@ mod tests {
             format!("ACYCLIC_HOST=cursor {NAME} hook pre-tool")
         );
 
-        let rule = std::fs::read_to_string(dir.path().join(".cursor/rules/acyclic.mdc")).expect("read");
+        let rule = std::fs::read_to_string(dir.path().join(format!(".cursor/rules/{NAME}.mdc")))
+            .expect("read");
         assert!(rule.contains(&format!("## {NAME} checkpoints")));
     }
 
     #[test]
     fn is_our_command_recognizes_host_prefixed_form() {
-        assert!(is_our_command(&format!("ACYCLIC_HOST=cursor {NAME} hook pre-tool")));
+        assert!(is_our_command(&format!(
+            "ACYCLIC_HOST=cursor {NAME} hook pre-tool"
+        )));
         assert!(is_our_command(&format!("{NAME} hook pre-tool")));
         assert!(!is_our_command("echo not ours"));
         // A user command mentioning our phrase as an argument, not invoking

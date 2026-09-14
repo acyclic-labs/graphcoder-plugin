@@ -40,6 +40,9 @@ mod tests {
         assert_eq!(ENV_PREFIX, NAME.to_ascii_uppercase().replace('-', "_"));
         assert_eq!(TRACE_ENV, format!("{ENV_PREFIX}_TRACE"));
         assert_eq!(repo_config_file(), format!(".{NAME}/config.toml"));
-        assert_eq!(render("run `{{name}} init` in .{{name}}"), format!("run `{NAME} init` in .{NAME}"));
+        assert_eq!(
+            render("run `{{name}} init` in .{{name}}"),
+            format!("run `{NAME} init` in .{NAME}")
+        );
     }
 }

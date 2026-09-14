@@ -234,10 +234,22 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "src/main.rs".into())
             .await
             .expect("restore file");
-        assert_eq!(outcome.action, acyclic_engine::rewind::RestoreAction::Restored);
-        assert_eq!(std::fs::read(root.join("src/main.rs")).expect("read"), b"v1\n");
-        assert_eq!(std::fs::read(root.join("other.txt")).expect("read"), b"changed\n");
-        assert_eq!(std::fs::read(root.join("src/deep/a.txt")).expect("read"), b"a2\n");
+        assert_eq!(
+            outcome.action,
+            acyclic_engine::rewind::RestoreAction::Restored
+        );
+        assert_eq!(
+            std::fs::read(root.join("src/main.rs")).expect("read"),
+            b"v1\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("other.txt")).expect("read"),
+            b"changed\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("src/deep/a.txt")).expect("read"),
+            b"a2\n"
+        );
         assert!(root.join("new.txt").exists());
 
         // A directory subtree back to v1: a1 restored, b back, c gone.
@@ -245,17 +257,29 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "src/deep".into())
             .await
             .expect("restore dir");
-        assert_eq!(std::fs::read(root.join("src/deep/a.txt")).expect("read"), b"a1\n");
-        assert_eq!(std::fs::read(root.join("src/deep/b.txt")).expect("read"), b"b1\n");
+        assert_eq!(
+            std::fs::read(root.join("src/deep/a.txt")).expect("read"),
+            b"a1\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("src/deep/b.txt")).expect("read"),
+            b"b1\n"
+        );
         assert!(!root.join("src/deep/c.txt").exists());
-        assert_eq!(std::fs::read(root.join("other.txt")).expect("read"), b"changed\n");
+        assert_eq!(
+            std::fs::read(root.join("other.txt")).expect("read"),
+            b"changed\n"
+        );
 
         // A path absent at the checkpoint is removed.
         let outcome = handle
             .restore_path(target(v1.row_id), "new.txt".into())
             .await
             .expect("restore absent");
-        assert_eq!(outcome.action, acyclic_engine::rewind::RestoreAction::Removed);
+        assert_eq!(
+            outcome.action,
+            acyclic_engine::rewind::RestoreAction::Removed
+        );
         assert!(!root.join("new.txt").exists());
 
         #[cfg(unix)]
@@ -267,7 +291,10 @@ fn single_path_restore_leaves_the_rest_alone() {
                 .expect("restore exec");
             let metadata = std::fs::metadata(root.join("run.sh")).expect("meta");
             assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
-            assert_eq!(std::fs::read(root.join("run.sh")).expect("read"), b"#!/bin/sh\n");
+            assert_eq!(
+                std::fs::read(root.join("run.sh")).expect("read"),
+                b"#!/bin/sh\n"
+            );
             handle
                 .restore_path(target(v1.row_id), "link".into())
                 .await
@@ -283,7 +310,10 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "../etc".into())
             .await
             .is_err());
-        assert!(handle.restore_path(target(v1.row_id), ".".into()).await.is_err());
+        assert!(handle
+            .restore_path(target(v1.row_id), ".".into())
+            .await
+            .is_err());
 
         // Each restore is recorded as a `manual` checkpoint, never as a
         // rewind (nothing is abandoned), and the pre-restore state (v2) is
@@ -292,8 +322,13 @@ fn single_path_restore_leaves_the_rest_alone() {
         let rows = index.list(None, None, 100).expect("rows");
         let restores = rows
             .iter()
-            .filter(|row| row.kind == CheckpointKind::Manual
-                && row.label.as_deref().map_or(false, |label| label.starts_with("restore ")))
+            .filter(|row| {
+                row.kind == CheckpointKind::Manual
+                    && row
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.starts_with("restore "))
+            })
             .count();
         assert!(restores >= 3, "restores recorded: {restores}");
         assert!(rows.iter().all(|row| row.kind != CheckpointKind::PreRewind));
@@ -302,7 +337,10 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v2.row_id), "src/main.rs".into())
             .await
             .expect("undo via restore");
-        assert_eq!(std::fs::read(root.join("src/main.rs")).expect("read"), b"v2\n");
+        assert_eq!(
+            std::fs::read(root.join("src/main.rs")).expect("read"),
+            b"v2\n"
+        );
         handle.shutdown().await.expect("shutdown");
     });
     thread.join().expect("pipeline thread");

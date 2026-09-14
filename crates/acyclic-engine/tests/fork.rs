@@ -1,4 +1,4 @@
-//! P-series fork tests (spec: plans/spec-forks.md) — promote logic proven
+//! P-series fork tests (spec: docs/design/spec-forks.md) — promote logic proven
 //! WITHOUT mounts: fork overlays are written through the SDK directly, so
 //! these run even while the native mount layer is being reworked.
 

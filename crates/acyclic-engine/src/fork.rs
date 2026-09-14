@@ -308,7 +308,11 @@ mod tests {
         assert_eq!(capability.available, capability.reason.is_none());
         assert_eq!(
             capability.fork_mode(),
-            if capability.available { ForkMode::Mount } else { ForkMode::Copy }
+            if capability.available {
+                ForkMode::Mount
+            } else {
+                ForkMode::Copy
+            }
         );
         assert!(!mount_setup_hint().is_empty());
     }

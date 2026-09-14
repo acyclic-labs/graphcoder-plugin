@@ -216,14 +216,22 @@ fn plan_and_merge_generation_over_real_generations() {
             .expect("plan");
         assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
         assert!(plan.conflicted.is_empty(), "{:?}", plan.conflicted);
-        assert_eq!(plan.take_ours, vec![p("d/ours.txt"), p("del.txt"), p("fork.txt")]);
+        assert_eq!(
+            plan.take_ours,
+            vec![p("d/ours.txt"), p("del.txt"), p("fork.txt")]
+        );
         assert_eq!(plan.take_theirs, vec![p("d/theirs.txt"), p("head.txt")]);
         assert_eq!(plan.merged.len(), 1);
         assert_eq!(plan.merged[0].path, p("src/shared.txt"));
         assert_eq!(plan.merged[0].bytes, b"1x\n2\n3y\n");
         assert_eq!(
             plan.landing_paths(),
-            vec![p("d/ours.txt"), p("del.txt"), p("fork.txt"), p("src/shared.txt")]
+            vec![
+                p("d/ours.txt"),
+                p("del.txt"),
+                p("fork.txt"),
+                p("src/shared.txt")
+            ]
         );
 
         // M = H + take_ours (from F) + merged.
@@ -241,16 +249,35 @@ fn plan_and_merge_generation_over_real_generations() {
                 },
             )
         }));
-        let merged = rig.handle.build_generation(theirs, entries).await.expect("M");
+        let merged = rig
+            .handle
+            .build_generation(theirs, entries)
+            .await
+            .expect("M");
         assert_ne!(merged, theirs);
-        assert_eq!(read(&rig, merged, "src/shared.txt").await.unwrap(), b"1x\n2\n3y\n");
-        assert_eq!(read(&rig, merged, "fork.txt").await.unwrap(), b"from fork\n");
-        assert_eq!(read(&rig, merged, "head.txt").await.unwrap(), b"from head\n");
+        assert_eq!(
+            read(&rig, merged, "src/shared.txt").await.unwrap(),
+            b"1x\n2\n3y\n"
+        );
+        assert_eq!(
+            read(&rig, merged, "fork.txt").await.unwrap(),
+            b"from fork\n"
+        );
+        assert_eq!(
+            read(&rig, merged, "head.txt").await.unwrap(),
+            b"from head\n"
+        );
         assert_eq!(read(&rig, merged, "d/ours.txt").await.unwrap(), b"ours\n");
-        assert_eq!(read(&rig, merged, "d/theirs.txt").await.unwrap(), b"theirs\n");
+        assert_eq!(
+            read(&rig, merged, "d/theirs.txt").await.unwrap(),
+            b"theirs\n"
+        );
         assert_eq!(read(&rig, merged, "d/k.txt").await.unwrap(), b"k\n");
         assert_eq!(read(&rig, merged, "src/same.txt").await.unwrap(), b"SAME\n");
-        assert!(read(&rig, merged, "del.txt").await.is_none(), "deletion must carry");
+        assert!(
+            read(&rig, merged, "del.txt").await.is_none(),
+            "deletion must carry"
+        );
         // The head is still H: nothing was published.
         assert_eq!(rig.handle.publish_head().await.expect("head"), theirs);
         // M differs from H only by the fork's landing paths.
@@ -383,7 +410,12 @@ fn refusals_name_paths_and_reasons() {
             let cancel = CancellationToken::new();
             let mut guard = seed.shared.lock().await;
             guard
-                .remove(namespace("/src/same.txt"), None, WorkCounters::UNBOUNDED, &cancel)
+                .remove(
+                    namespace("/src/same.txt"),
+                    None,
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
                 .await
                 .expect("rm");
             guard
@@ -419,7 +451,12 @@ fn refusals_name_paths_and_reasons() {
         assert_eq!(refusals[0], (p("bin.dat"), Reason::Binary));
         assert_eq!(
             refusals[1],
-            (p("d"), Reason::Ancestry { inner: vec![p("d/new.txt")] })
+            (
+                p("d"),
+                Reason::Ancestry {
+                    inner: vec![p("d/new.txt")]
+                }
+            )
         );
         assert_eq!(refusals[2], (p("src/same.txt"), Reason::KindChange));
         assert!(plan.conflicted.is_empty());
@@ -449,7 +486,10 @@ fn plan_after_rebase_uses_the_new_base() {
         // Rebase: write R into the fork.
         let entries = vec![(
             p("src/shared.txt"),
-            Entry::Regular { bytes: plan.conflicted[0].bytes.clone(), mode: None },
+            Entry::Regular {
+                bytes: plan.conflicted[0].bytes.clone(),
+                mode: None,
+            },
         )];
         rig.handle
             .apply_to_overlay(Arc::clone(&seed.shared), entries)
@@ -483,19 +523,43 @@ fn nested_directory_subtree_copies_into_merge_generation() {
         {
             let cancel = CancellationToken::new();
             let mut guard = seed.shared.lock().await;
-            guard.create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
-            guard.create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
-            guard.create_directory(namespace("/docs/deep/er"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
+            guard
+                .create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel)
+                .await
+                .expect("mkdir");
+            guard
+                .create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel)
+                .await
+                .expect("mkdir");
+            guard
+                .create_directory(namespace("/docs/deep/er"), WorkCounters::UNBOUNDED, &cancel)
+                .await
+                .expect("mkdir");
         }
         fork_write(&seed, "/docs/deep/er/file.md", b"deep\n").await;
         fork_remove(&seed, "/del.txt").await;
         let ours = snapshot(&rig, &seed).await;
         let theirs = rig.move_mainline(&[("x.txt", Some(b"x\n"))]).await;
-        let plan = rig.handle.merge_plan(seed.base, theirs, ours, "fork n".into()).await.expect("plan");
+        let plan = rig
+            .handle
+            .merge_plan(seed.base, theirs, ours, "fork n".into())
+            .await
+            .expect("plan");
         assert_eq!(plan.take_ours, vec![p("del.txt"), p("docs")]);
-        let entries: Vec<(PathBuf, Entry)> = plan.take_ours.iter().map(|path| (path.clone(), Entry::FromGeneration { generation: ours })).collect();
-        let merged = rig.handle.build_generation(theirs, entries).await.expect("M");
-        assert_eq!(read(&rig, merged, "docs/deep/er/file.md").await.unwrap(), b"deep\n");
+        let entries: Vec<(PathBuf, Entry)> = plan
+            .take_ours
+            .iter()
+            .map(|path| (path.clone(), Entry::FromGeneration { generation: ours }))
+            .collect();
+        let merged = rig
+            .handle
+            .build_generation(theirs, entries)
+            .await
+            .expect("M");
+        assert_eq!(
+            read(&rig, merged, "docs/deep/er/file.md").await.unwrap(),
+            b"deep\n"
+        );
         assert!(read(&rig, merged, "del.txt").await.is_none());
         assert_eq!(read(&rig, merged, "x.txt").await.unwrap(), b"x\n");
     });
@@ -515,8 +579,14 @@ fn materialize_paths_writes_a_generation_into_a_directory() {
         {
             let cancel = CancellationToken::new();
             let mut guard = seed.shared.lock().await;
-            guard.create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
-            guard.create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel).await.expect("mkdir");
+            guard
+                .create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel)
+                .await
+                .expect("mkdir");
+            guard
+                .create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel)
+                .await
+                .expect("mkdir");
         }
         fork_write(&seed, "/docs/deep/file.md", b"deep\n").await;
         let generation = snapshot(&rig, &seed).await;
@@ -536,17 +606,36 @@ fn materialize_paths_writes_a_generation_into_a_directory() {
             )
             .await
             .expect("materialize");
-        assert_eq!(std::fs::read(dir.path().join("src/shared.txt")).unwrap(), b"rewritten\n");
-        assert!(!dir.path().join("del.txt").exists(), "absent in the generation: removed");
-        assert_eq!(std::fs::read(dir.path().join("docs/deep/file.md")).unwrap(), b"deep\n");
-        assert_eq!(std::fs::read(dir.path().join("untouched.txt")).unwrap(), b"keep\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("src/shared.txt")).unwrap(),
+            b"rewritten\n"
+        );
+        assert!(
+            !dir.path().join("del.txt").exists(),
+            "absent in the generation: removed"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("docs/deep/file.md")).unwrap(),
+            b"deep\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("untouched.txt")).unwrap(),
+            b"keep\n"
+        );
         // Recreating a file that was removed from the directory works too.
         std::fs::remove_file(dir.path().join("src/shared.txt")).unwrap();
         rig.handle
-            .materialize_paths(generation, dir.path().to_path_buf(), vec![p("src/shared.txt")])
+            .materialize_paths(
+                generation,
+                dir.path().to_path_buf(),
+                vec![p("src/shared.txt")],
+            )
             .await
             .expect("materialize again");
-        assert_eq!(std::fs::read(dir.path().join("src/shared.txt")).unwrap(), b"rewritten\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("src/shared.txt")).unwrap(),
+            b"rewritten\n"
+        );
     });
     rig.finish();
 }

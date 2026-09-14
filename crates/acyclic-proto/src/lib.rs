@@ -177,7 +177,7 @@ pub struct Response {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Payload {
-    Ok(Reply),
+    Ok(Box<Reply>),
     Err { message: String },
 }
 
