@@ -121,6 +121,92 @@ fn checkpoint_rewind_journey() {
     assert!(by_name.contains(&(".env".into(), ChangeKind::Removed)));
 }
 
+/// The safety net for hosts with no lifecycle-hook API (Claude Desktop over
+/// MCP): an edit with no `handle.checkpoint()` call at all still gets
+/// checkpointed once the idle timer fires.
+#[test]
+fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("a.txt"), b"one\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let config = Config {
+        quiesce_ms: 20,
+        quiesce_cap_ms: 200,
+        auto_checkpoint_idle_ms: 50,
+        commit_every: 100,
+        commit_idle_ms: 60_000,
+        trash_ttl_days: 1,
+        store_dir: None,
+        ..Config::default()
+    };
+    let (handle, thread) = pipeline::spawn(store, index, config);
+
+    runtime.block_on(async {
+        // A round trip first, so baseline capture is guaranteed done before
+        // the edit — otherwise the edit can race into the baseline itself
+        // and leave nothing pending for the idle timer to find.
+        handle.status().await.expect("status");
+
+        // No hook, no explicit checkpoint call — just an edit, like a host
+        // with no lifecycle-hook API would produce.
+        std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
+        // Long enough for the idle timer to notice and fire at least once.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.shutdown().await.expect("shutdown");
+    });
+    thread.join().expect("pipeline thread");
+
+    let index = read_only_index(&paths.index_db());
+    let latest = index.latest().expect("query").expect("a row exists");
+    assert_eq!(latest.kind, CheckpointKind::Auto);
+}
+
+/// `auto_checkpoint_idle_ms: 0` means off: an edit with no checkpoint call
+/// and no other host activity must never gain a checkpoint on its own.
+#[test]
+fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("a.txt"), b"one\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let config = Config {
+        quiesce_ms: 20,
+        quiesce_cap_ms: 200,
+        auto_checkpoint_idle_ms: 0,
+        commit_every: 100,
+        commit_idle_ms: 100,
+        trash_ttl_days: 1,
+        store_dir: None,
+        ..Config::default()
+    };
+    let (handle, thread) = pipeline::spawn(store, index, config);
+
+    runtime.block_on(async {
+        std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.shutdown().await.expect("shutdown");
+    });
+    thread.join().expect("pipeline thread");
+
+    let index = read_only_index(&paths.index_db());
+    // Only the baseline row from init: the idle timer never ran.
+    let latest = index.latest().expect("query").expect("a row exists");
+    assert_eq!(latest.kind, CheckpointKind::Baseline);
+}
+
 /// The hook contract: an acknowledged enqueue is admitted to the FIFO before
 /// the ack, so a shutdown issued immediately after still processes it.
 #[test]

@@ -15,22 +15,93 @@
 //! Checked-in files, so the whole team inherits the wiring.
 //! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
 //! shell-capable agent.
+//! claude-desktop: no lifecycle-hook API exists, so this registers `acyclic
+//! mcp` (an MCP stdio server; see `crate::mcp`) as an `mcpServers` entry in
+//! the user's *global* `claude_desktop_config.json` instead of writing
+//! anything under the repo — per-machine, not something a team can check in.
 
 use acyclic_engine::product::{self, NAME};
 use std::path::Path;
 
 use serde_json::{json, Value};
 
-pub fn run(repo: &Path, host: &str) -> Result<(), String> {
-    match host {
-        "claude-code" => claude_code(repo),
-        "codex" => codex(repo),
-        "cursor" => cursor(repo),
-        "agents-md" | "--agents-md" => agents_md(repo),
-        other => Err(format!(
-            "unknown host {other:?} (expected claude-code | codex | cursor | agents-md)"
-        )),
+trait HostAdapter {
+    fn id(&self) -> &'static str;
+    fn install(&self, repo: &Path) -> Result<(), String>;
+}
+
+struct ClaudeCode;
+struct Codex;
+struct Cursor;
+struct AgentsMd;
+
+impl HostAdapter for ClaudeCode {
+    fn id(&self) -> &'static str {
+        "claude-code"
     }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        claude_code(repo)
+    }
+}
+
+impl HostAdapter for Codex {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        codex(repo)
+    }
+}
+
+impl HostAdapter for Cursor {
+    fn id(&self) -> &'static str {
+        "cursor"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        cursor(repo)
+    }
+}
+
+impl HostAdapter for AgentsMd {
+    fn id(&self) -> &'static str {
+        "agents-md"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        agents_md(repo)
+    }
+}
+
+struct ClaudeDesktop;
+
+impl HostAdapter for ClaudeDesktop {
+    fn id(&self) -> &'static str {
+        "claude-desktop"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        claude_desktop(repo)
+    }
+}
+
+fn adapters() -> Vec<Box<dyn HostAdapter>> {
+    vec![
+        Box::new(ClaudeCode),
+        Box::new(Codex),
+        Box::new(Cursor),
+        Box::new(AgentsMd),
+        Box::new(ClaudeDesktop),
+    ]
+}
+
+pub fn run(repo: &Path, host: &str) -> Result<(), String> {
+    let host = if host == "--agents-md" { "agents-md" } else { host };
+    adapters()
+        .into_iter()
+        .find(|adapter| adapter.id() == host)
+        .ok_or_else(|| {
+            let known: Vec<_> = adapters().iter().map(|adapter| adapter.id()).collect();
+            format!("unknown host {host:?} (expected {})", known.join(" | "))
+        })?
+        .install(repo)
 }
 
 fn claude_code(repo: &Path) -> Result<(), String> {
@@ -279,6 +350,88 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
 
 fn is_our_cursor_entry(entry: &Value) -> bool {
     entry["command"].as_str().is_some_and(is_our_command)
+}
+
+/// Claude Desktop: unlike the other three adapters, there is no repo-local
+/// hook config to drop — Desktop has no lifecycle-hook API, so `acyclic mcp`
+/// (an MCP stdio server) is registered instead, in the user's *global*
+/// `claude_desktop_config.json`. That file is per-machine, not something a
+/// team can check in: each teammate who wants Desktop support runs this
+/// locally once.
+fn claude_desktop(repo: &Path) -> Result<(), String> {
+    let config_path = claude_desktop_config_path()?;
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(stringify)?;
+    }
+    let exe = std::env::current_exe().map_err(stringify)?;
+    merge_claude_desktop_config(&config_path, &exe, repo)?;
+
+    println!("claude-desktop adapter registered in {}", config_path.display());
+    println!("  server: {NAME} mcp --repo {}", repo.display());
+    println!("per-machine, not checked into the repo: each teammate who wants");
+    println!("Desktop support runs `{NAME} install claude-desktop` locally once.");
+    println!("restart Claude Desktop for it to pick up the new server.");
+    Ok(())
+}
+
+/// macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`.
+/// Windows: `%APPDATA%\Claude\claude_desktop_config.json`. Linux:
+/// `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json`, falling back to
+/// `~/.config/Claude/...`.
+fn claude_desktop_config_path() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+        Ok(std::path::PathBuf::from(home)
+            .join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
+        Ok(std::path::PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var("XDG_CONFIG_HOME").ok().map(std::path::PathBuf::from).or_else(|| {
+            std::env::var("HOME").ok().map(|home| std::path::PathBuf::from(home).join(".config"))
+        });
+        base.map(|base| base.join("Claude/claude_desktop_config.json"))
+            .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set".to_string())
+    }
+}
+
+/// Merges an `mcpServers.acyclic` entry into Claude Desktop's config,
+/// preserving everything else — same read-modify-write contract as
+/// `merge_hooks`: idempotent, keyed on the `acyclic` server name rather than
+/// string-matching the whole file.
+fn merge_claude_desktop_config(
+    config_path: &Path,
+    exe: &Path,
+    repo: &Path,
+) -> Result<(), String> {
+    let mut config: Value = match std::fs::read_to_string(config_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", config_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.to_string()),
+    };
+    let servers = config
+        .as_object_mut()
+        .ok_or("claude_desktop_config.json is not an object")?
+        .entry("mcpServers")
+        .or_insert(json!({}));
+    let servers = servers.as_object_mut().ok_or("mcpServers is not an object")?;
+    servers.insert(
+        NAME.to_string(),
+        json!({
+            "command": exe.display().to_string(),
+            "args": ["mcp", "--repo", repo.display().to_string()],
+        }),
+    );
+
+    let text = serde_json::to_string_pretty(&config).map_err(stringify)?;
+    std::fs::write(config_path, text + "\n").map_err(stringify)?;
+    Ok(())
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
@@ -784,6 +937,53 @@ mod tests {
         let rule = std::fs::read_to_string(dir.path().join(format!(".cursor/rules/{NAME}.mdc")))
             .expect("read");
         assert!(rule.contains(&format!("## {NAME} checkpoints")));
+    }
+
+    #[test]
+    fn run_dispatches_known_hosts_and_rejects_unknown() {
+        // claude-desktop is exercised separately (below): its install writes
+        // to a global, per-machine config path, not anything under `repo`.
+        for host in ["claude-code", "codex", "cursor", "agents-md"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            run(dir.path(), host).unwrap_or_else(|error| panic!("{host}: {error}"));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = run(dir.path(), "vscode").expect_err("unknown host");
+        assert_eq!(
+            error,
+            "unknown host \"vscode\" (expected claude-code | codex | cursor | agents-md | claude-desktop)"
+        );
+    }
+
+    #[test]
+    fn claude_desktop_config_merge_is_idempotent_and_preserves_other_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("claude_desktop_config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+              "mcpServers": {
+                "other-tool": {"command": "/usr/bin/other", "args": []}
+              }
+            }"#,
+        )
+        .expect("seed");
+
+        let exe = std::path::Path::new("/usr/local/bin/acyclic");
+        let repo = std::path::Path::new("/Users/dev/my-repo");
+        merge_claude_desktop_config(&config_path, exe, repo).expect("first merge");
+        merge_claude_desktop_config(&config_path, exe, repo).expect("second merge (idempotent)");
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read")).expect("json");
+        // The pre-existing server survives.
+        assert_eq!(value["mcpServers"]["other-tool"]["command"], "/usr/bin/other");
+        // Exactly one acyclic entry, pointing at this exe and repo.
+        assert_eq!(value["mcpServers"][NAME]["command"], exe.display().to_string());
+        assert_eq!(
+            value["mcpServers"][NAME]["args"],
+            json!(["mcp", "--repo", repo.display().to_string()])
+        );
     }
 
     #[test]

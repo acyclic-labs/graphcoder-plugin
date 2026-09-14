@@ -18,6 +18,12 @@ pub struct Config {
     pub commit_every: u32,
     /// Authority commit after this much idle time (ms).
     pub commit_idle_ms: u64,
+    /// Auto-checkpoint after this much idle time (ms), if the watcher has
+    /// pending changes. The safety net for hosts with no lifecycle-hook API
+    /// (e.g. Claude Desktop over MCP): a checkpoint no host asked for, taken
+    /// once things go quiet, so `acyclic mcp`'s tools aren't the only path
+    /// to a checkpoint. Zero disables it (hook-driven hosts don't need it).
+    pub auto_checkpoint_idle_ms: u64,
     /// Days a rewound-away tree is kept in the store's trash.
     pub trash_ttl_days: u32,
     /// Override for the store directory (defaults to the per-machine root).
@@ -106,6 +112,7 @@ impl Default for Config {
             quiesce_cap_ms: 500,
             commit_every: 25,
             commit_idle_ms: 60_000,
+            auto_checkpoint_idle_ms: 5_000,
             trash_ttl_days: 7,
             store_dir: None,
             dry_run: false,
