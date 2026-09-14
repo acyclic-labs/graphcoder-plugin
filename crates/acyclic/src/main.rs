@@ -4,6 +4,7 @@ mod brief;
 mod client;
 mod hook;
 mod install;
+mod mcp;
 mod server;
 
 use std::path::{Path, PathBuf};
@@ -159,9 +160,13 @@ enum Command {
     },
     /// Wire a host's adapter into the current repo.
     Install {
-        /// claude-code | codex | cursor | agents-md
+        /// claude-code | codex | cursor | agents-md | claude-desktop
         host: String,
     },
+    /// MCP stdio server: exposes checkpoint/timeline/rewind/diff/restore/
+    /// turns/brief as tools for hosts with no lifecycle-hook API (Claude
+    /// Desktop). Runs until stdin closes.
+    Mcp,
     /// Record a host session starting (hook use).
     #[command(hide = true)]
     SessionStart {
@@ -258,6 +263,22 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         Command::Init => init(repo),
         Command::Policy => policy(repo),
         Command::Hook { event } => hook::run(repo, &event),
+        Command::Mcp => {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("{}: {error}", product::NAME);
+                    return 1;
+                }
+            };
+            match runtime.block_on(mcp::run(repo.to_path_buf())) {
+                Ok(()) => 0,
+                Err(message) => {
+                    eprintln!("{}: {message}", product::NAME);
+                    1
+                }
+            }
+        }
         Command::Install { host } => match install::run(repo, &host) {
             Ok(()) => {
                 print_mount_capability();
@@ -899,7 +920,8 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         | Command::Policy
         | Command::Daemon { .. }
         | Command::Hook { .. }
-        | Command::Install { .. } => {
+        | Command::Install { .. }
+        | Command::Mcp => {
             unreachable!("handled in run()")
         }
     }

@@ -11,26 +11,147 @@
 //! `.cursor/hooks.json` and drops an always-applied, product-named rule
 //! file under `.cursor/rules/`; Cursor's payload shape (`conversation_id`
 //! instead of `session_id`, no `tool_name` on shell hooks) is normalized in
-//! `hook::Payload`.
+//! `hook::Payload`. Also registers `acyclic mcp` as a project-scoped MCP
+//! server at `.cursor/mcp.json`, since Cursor speaks MCP directly too.
 //! Checked-in files, so the whole team inherits the wiring.
 //! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
 //! shell-capable agent.
+//! claude-desktop: no lifecycle-hook API exists, so this registers `acyclic
+//! mcp` (an MCP stdio server; see `crate::mcp`) as an `mcpServers` entry in
+//! the user's *global* `claude_desktop_config.json` instead of writing
+//! anything under the repo — per-machine, not something a team can check in.
+//! vscode: same shape as claude-desktop (no hook API, MCP is the only
+//! extension point), but VS Code supports a project-scoped config file
+//! (`.vscode/mcp.json`, different JSON shape — see `McpConfigShape`), so
+//! this one IS checked-in like the hook-based adapters.
+//!
+//! Codex's MCP path (a fifth JSON-based option would be nice, but Codex's
+//! MCP config is TOML) and Cursor/Codex desktop-vs-CLI hook parity are open
+//! TODOs — see the doc comments on `codex()` and `cursor()`.
 
 use acyclic_engine::product::{self, NAME};
 use std::path::Path;
 
 use serde_json::{json, Value};
 
-pub fn run(repo: &Path, host: &str) -> Result<(), String> {
-    match host {
-        "claude-code" => claude_code(repo),
-        "codex" => codex(repo),
-        "cursor" => cursor(repo),
-        "agents-md" | "--agents-md" => agents_md(repo),
-        other => Err(format!(
-            "unknown host {other:?} (expected claude-code | codex | cursor | agents-md)"
-        )),
+trait HostAdapter {
+    fn id(&self) -> &'static str;
+    fn install(&self, repo: &Path) -> Result<(), String>;
+}
+
+struct ClaudeCode;
+struct Codex;
+struct Cursor;
+struct AgentsMd;
+
+impl HostAdapter for ClaudeCode {
+    fn id(&self) -> &'static str {
+        "claude-code"
     }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        claude_code(repo)
+    }
+}
+
+impl HostAdapter for Codex {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        codex(repo)
+    }
+}
+
+impl HostAdapter for Cursor {
+    fn id(&self) -> &'static str {
+        "cursor"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        cursor(repo)
+    }
+}
+
+impl HostAdapter for AgentsMd {
+    fn id(&self) -> &'static str {
+        "agents-md"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        agents_md(repo)
+    }
+}
+
+struct ClaudeDesktop;
+
+impl HostAdapter for ClaudeDesktop {
+    fn id(&self) -> &'static str {
+        "claude-desktop"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        claude_desktop(repo)
+    }
+}
+
+struct VsCode;
+
+impl HostAdapter for VsCode {
+    fn id(&self) -> &'static str {
+        "vscode"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        vscode(repo)
+    }
+}
+
+// TODO(more hosts): the two shapes this file already covers — lifecycle
+// hooks (claude_code/codex/cursor) and MCP registration
+// (claude_desktop/cursor/vscode) — generalize to most other coding-agent
+// CLIs and desktop apps, not just the five above. Before adding one:
+// 1. Find its hook config (file, event names, payload shape) and/or its MCP
+//    config (file location, JSON vs TOML, top-level key, whether `type` is
+//    explicit) from its own current docs — don't assume it matches an
+//    existing adapter; VS Code alone differs from Claude Desktop/Cursor on
+//    both the key name and the explicit-type requirement.
+// 2. Prefer the MCP path when the config is JSON-shaped and matches (or is
+//    close to) `McpConfigShape` — reuse `merge_mcp_server_json`, add a
+//    shape constant and a `HostAdapter` impl, the same pattern as `vscode`.
+// 3. Write the merge, add a unit test seeding an existing config to prove
+//    other entries survive and a second install is idempotent (see
+//    `vscode_install_writes_project_scoped_mcp_config`), then verify against
+//    the real app before calling it more than "built."
+// Concrete candidates, not yet done:
+// - Kimi Code CLI: has BOTH lifecycle hooks (`[[hooks]]` in config.toml —
+//   TOML again, like Codex) and MCP support (`kimi mcp` subcommands /
+//   `/mcp-config`); unclear yet which config file MCP entries land in or
+//   its exact JSON/TOML shape — check `kimi mcp` docs before writing.
+// - Windsurf, Zed, JetBrains AI assistants, Gemini CLI, Amazon Q Developer:
+//   unresearched. Likely MCP-capable (most 2026-era agent tools are) but
+//   config location/shape unverified — do not assume any of them match
+//   Claude Desktop/Cursor's shape without checking.
+fn adapters() -> Vec<Box<dyn HostAdapter>> {
+    vec![
+        Box::new(ClaudeCode),
+        Box::new(Codex),
+        Box::new(Cursor),
+        Box::new(AgentsMd),
+        Box::new(ClaudeDesktop),
+        Box::new(VsCode),
+    ]
+}
+
+pub fn run(repo: &Path, host: &str) -> Result<(), String> {
+    let host = if host == "--agents-md" {
+        "agents-md"
+    } else {
+        host
+    };
+    adapters()
+        .into_iter()
+        .find(|adapter| adapter.id() == host)
+        .ok_or_else(|| {
+            let known: Vec<_> = adapters().iter().map(|adapter| adapter.id()).collect();
+            format!("unknown host {host:?} (expected {})", known.join(" | "))
+        })?
+        .install(repo)
 }
 
 fn claude_code(repo: &Path) -> Result<(), String> {
@@ -184,6 +305,18 @@ fn is_our_command(command: &str) -> bool {
 /// Codex CLI: `.codex/hooks.json` keyed directly by event name (no
 /// enclosing `"hooks"` object, unlike Claude Code's settings.json), plus
 /// the same host-neutral cheatsheet block Codex reads from AGENTS.md.
+///
+/// TODO(desktop/IDE parity): OpenAI's own docs state that the ChatGPT
+/// desktop app, the Codex CLI, and Codex's IDE extension all read the same
+/// `~/.codex/config.toml` / `.codex/config.toml`. If that also means they
+/// share whatever fires `.codex/hooks.json`'s lifecycle events, this
+/// adapter may already cover the desktop app and IDE extension too, with no
+/// new code — verify that first. Only if hooks do NOT fire there does this
+/// need an MCP path: Codex's MCP config lives in the same `config.toml`,
+/// under TOML tables shaped `[mcp_servers.<name>]` with `command`/`args`/
+/// `env` keys — a different format (TOML, not JSON) from every adapter in
+/// this file, so it needs its own writer (and a `toml` crate dependency,
+/// not currently in `Cargo.toml`) rather than reusing `merge_mcp_server_json`.
 fn codex(repo: &Path) -> Result<(), String> {
     let codex_dir = repo.join(".codex");
     std::fs::create_dir_all(&codex_dir).map_err(stringify)?;
@@ -229,8 +362,24 @@ fn cursor(repo: &Path) -> Result<(), String> {
     )
     .map_err(stringify)?;
 
+    // Cursor also speaks MCP directly, project-scoped and checked in
+    // (unlike Claude Desktop's global-only config) — see
+    // `merge_mcp_server_json`'s doc comment for the verified schema. Hooks
+    // above already checkpoint automatically; this additionally exposes
+    // named verbs (`checkpoint`, `rewind`, `timeline`, ...) as tools, the
+    // same surface Claude Desktop and VS Code get.
+    // TODO(verify): confirm in a real Cursor session that a hooks.json
+    // adapter and an mcp.json server for the same product coexist cleanly
+    // (expected: yes, they're independent request paths — a hook fires
+    // automatically per tool call, an MCP tool call is model-initiated) and
+    // that Cursor's desktop app fires the same hooks.json events its CLI
+    // does before calling either path "supported" for the desktop app.
+    let exe = std::env::current_exe().map_err(stringify)?;
+    merge_mcp_server_json(&cursor_dir.join("mcp.json"), &CURSOR_MCP_SHAPE, &exe, repo)?;
+
     println!("cursor adapter installed into {}", cursor_dir.display());
     println!("  hooks: .cursor/hooks.json (shell + file-edit + prompt + session)");
+    println!("  mcp:   .cursor/mcp.json ({NAME} tools, project-scoped)");
     println!("  rule:  .cursor/rules/{NAME}.mdc");
     println!("check these files in so the whole team inherits checkpointing.");
     Ok(())
@@ -279,6 +428,155 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
 
 fn is_our_cursor_entry(entry: &Value) -> bool {
     entry["command"].as_str().is_some_and(is_our_command)
+}
+
+/// Every JSON-based MCP host acyclic knows how to register `acyclic mcp`
+/// with, verified against each host's own current docs (2026):
+///
+/// - Claude Desktop and Cursor: `{"mcpServers": {"<name>": {command, args}}}`
+///   — identical shape, `stdio` inferred from the presence of `command`.
+/// - VS Code (Copilot agent mode): `{"servers": {"<name>": {type, command,
+///   args}}}` — different top-level key, and `type` must be explicit
+///   (`"stdio"`); VS Code does not infer it the way the other two do.
+///
+/// Codex is deliberately absent: its MCP config is TOML
+/// (`[mcp_servers.<name>]` in `config.toml`), not JSON, so it needs its own
+/// writer — see the TODO on `codex()` below before adding one.
+struct McpConfigShape {
+    /// "mcpServers" (Claude Desktop, Cursor) or "servers" (VS Code).
+    servers_key: &'static str,
+    /// VS Code requires this; Claude Desktop and Cursor don't accept or need it.
+    explicit_stdio_type: bool,
+}
+
+const CLAUDE_DESKTOP_MCP_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "mcpServers",
+    explicit_stdio_type: false,
+};
+const CURSOR_MCP_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "mcpServers",
+    explicit_stdio_type: false,
+};
+const VSCODE_MCP_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "servers",
+    explicit_stdio_type: true,
+};
+
+/// Merges an `acyclic mcp --repo <repo>` entry into any JSON-based MCP
+/// host's config, preserving everything else — same read-modify-write
+/// contract as `merge_hooks`: idempotent, keyed on the product name rather
+/// than string-matching the whole file, so re-running `install` replaces
+/// only this one entry.
+fn merge_mcp_server_json(
+    config_path: &Path,
+    shape: &McpConfigShape,
+    exe: &Path,
+    repo: &Path,
+) -> Result<(), String> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(stringify)?;
+    }
+    let mut config: Value = match std::fs::read_to_string(config_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", config_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.to_string()),
+    };
+    let servers = config
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not an object", config_path.display()))?
+        .entry(shape.servers_key)
+        .or_insert(json!({}));
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not an object", shape.servers_key))?;
+    let mut entry = json!({
+        "command": exe.display().to_string(),
+        "args": ["mcp", "--repo", repo.display().to_string()],
+    });
+    if shape.explicit_stdio_type {
+        entry["type"] = json!("stdio");
+    }
+    servers.insert(NAME.to_string(), entry);
+
+    let text = serde_json::to_string_pretty(&config).map_err(stringify)?;
+    std::fs::write(config_path, text + "\n").map_err(stringify)?;
+    Ok(())
+}
+
+/// Claude Desktop: unlike the other three adapters, there is no repo-local
+/// hook config to drop — Desktop has no lifecycle-hook API, so `acyclic mcp`
+/// (an MCP stdio server) is registered instead, in the user's *global*
+/// `claude_desktop_config.json`. That file is per-machine, not something a
+/// team can check in: each teammate who wants Desktop support runs this
+/// locally once.
+fn claude_desktop(repo: &Path) -> Result<(), String> {
+    let config_path = claude_desktop_config_path()?;
+    let exe = std::env::current_exe().map_err(stringify)?;
+    merge_mcp_server_json(&config_path, &CLAUDE_DESKTOP_MCP_SHAPE, &exe, repo)?;
+
+    println!(
+        "claude-desktop adapter registered in {}",
+        config_path.display()
+    );
+    println!("  server: {NAME} mcp --repo {}", repo.display());
+    println!("per-machine, not checked into the repo: each teammate who wants");
+    println!("Desktop support runs `{NAME} install claude-desktop` locally once.");
+    println!("restart Claude Desktop for it to pick up the new server.");
+    Ok(())
+}
+
+/// macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`.
+/// Windows: `%APPDATA%\Claude\claude_desktop_config.json`. Linux:
+/// `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json`, falling back to
+/// `~/.config/Claude/...`.
+fn claude_desktop_config_path() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+        Ok(std::path::PathBuf::from(home)
+            .join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
+        Ok(std::path::PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| std::path::PathBuf::from(home).join(".config"))
+            });
+        base.map(|base| base.join("Claude/claude_desktop_config.json"))
+            .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set".to_string())
+    }
+}
+
+/// VS Code (GitHub Copilot's agent mode): like Claude Desktop, there is no
+/// lifecycle-hook API to drop repo-local config into — MCP is the only
+/// extension point. Unlike Desktop, VS Code supports a workspace-local
+/// config file (`.vscode/mcp.json`), so this one *is* checked-in, team-
+/// shared config, same as the hook-based adapters.
+///
+/// TODO(verify): the schema below (`servers` key, explicit `"type":
+/// "stdio"`) is confirmed against VS Code's current MCP docs but has not
+/// been exercised against a real VS Code + Copilot agent-mode session. Test
+/// that before calling this adapter "supported" rather than "built."
+fn vscode(repo: &Path) -> Result<(), String> {
+    let vscode_dir = repo.join(".vscode");
+    let exe = std::env::current_exe().map_err(stringify)?;
+    merge_mcp_server_json(&vscode_dir.join("mcp.json"), &VSCODE_MCP_SHAPE, &exe, repo)?;
+
+    println!("vscode adapter installed into {}", vscode_dir.display());
+    println!("  mcp: .vscode/mcp.json ({NAME} tools, project-scoped)");
+    println!("check this file in so the whole team inherits it.");
+    println!("note: unverified against a real VS Code session — see the TODO on `vscode()`.");
+    Ok(())
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
@@ -784,6 +1082,92 @@ mod tests {
         let rule = std::fs::read_to_string(dir.path().join(format!(".cursor/rules/{NAME}.mdc")))
             .expect("read");
         assert!(rule.contains(&format!("## {NAME} checkpoints")));
+
+        // Cursor also gets a project-scoped MCP server registration,
+        // alongside its hooks — same verified schema as Claude Desktop.
+        let mcp: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".cursor/mcp.json")).expect("read"),
+        )
+        .expect("json");
+        assert_eq!(
+            mcp["mcpServers"][NAME]["command"],
+            std::env::current_exe().unwrap().display().to_string()
+        );
+        assert_eq!(mcp["mcpServers"][NAME]["args"][0], "mcp");
+    }
+
+    #[test]
+    fn vscode_install_writes_project_scoped_mcp_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        vscode(dir.path()).expect("first install");
+        vscode(dir.path()).expect("second install (idempotent)");
+
+        let value: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".vscode/mcp.json")).expect("read"),
+        )
+        .expect("json");
+        // VS Code's schema differs from Claude Desktop/Cursor on both the
+        // top-level key ("servers", not "mcpServers") and requiring an
+        // explicit "type" — see `merge_mcp_server_json`'s doc comment.
+        assert_eq!(value["servers"][NAME]["type"], "stdio");
+        assert_eq!(value["servers"][NAME]["args"][0], "mcp");
+        assert!(value.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn run_dispatches_known_hosts_and_rejects_unknown() {
+        // claude-desktop is exercised separately (below): its install writes
+        // to a global, per-machine config path, not anything under `repo`.
+        for host in ["claude-code", "codex", "cursor", "agents-md", "vscode"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            run(dir.path(), host).unwrap_or_else(|error| panic!("{host}: {error}"));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = run(dir.path(), "jetbrains").expect_err("unknown host");
+        assert_eq!(
+            error,
+            "unknown host \"jetbrains\" (expected claude-code | codex | cursor | agents-md | claude-desktop | vscode)"
+        );
+    }
+
+    #[test]
+    fn claude_desktop_config_merge_is_idempotent_and_preserves_other_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("claude_desktop_config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+              "mcpServers": {
+                "other-tool": {"command": "/usr/bin/other", "args": []}
+              }
+            }"#,
+        )
+        .expect("seed");
+
+        let exe = std::path::Path::new("/usr/local/bin/acyclic");
+        let repo = std::path::Path::new("/Users/dev/my-repo");
+        merge_mcp_server_json(&config_path, &CLAUDE_DESKTOP_MCP_SHAPE, exe, repo)
+            .expect("first merge");
+        merge_mcp_server_json(&config_path, &CLAUDE_DESKTOP_MCP_SHAPE, exe, repo)
+            .expect("second merge (idempotent)");
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
+                .expect("json");
+        // The pre-existing server survives.
+        assert_eq!(
+            value["mcpServers"]["other-tool"]["command"],
+            "/usr/bin/other"
+        );
+        // Exactly one acyclic entry, pointing at this exe and repo.
+        assert_eq!(
+            value["mcpServers"][NAME]["command"],
+            exe.display().to_string()
+        );
+        assert_eq!(
+            value["mcpServers"][NAME]["args"],
+            json!(["mcp", "--repo", repo.display().to_string()])
+        );
     }
 
     #[test]
