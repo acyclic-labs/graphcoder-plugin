@@ -58,8 +58,11 @@ OUT="$(cd "$R" && PATH="$BIN_DIR:$PATH" with_timeout 180 codex exec "$PROMPT" \
   --json 2>"$WORK/codex.stderr")" \
   || skip "codex session failed or timed out: $(tail -c 300 "$WORK/codex.stderr")"
 
-SID="$(printf '%s' "$OUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' \
-  | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+# Codex renamed the JSONL identifier from `session_id` to `thread_id`
+# (0.154 emits `{"type":"thread.started","thread_id":...}`); its hooks
+# still report the same value as `session_id`. Accept either.
+SID="$(printf '%s' "$OUT" | grep -oE '"(session_id|thread_id)"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
 [ -n "$SID" ] || skip "no session_id in codex output: $(printf '%s' "$OUT" | head -c 300)"
 
 # The agent actually did the work.
@@ -70,11 +73,23 @@ SID="$(printf '%s' "$OUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*
 settle 1
 
 # Hooks fired and attributed: the timeline for THIS session has pre and post
-# rows carrying the tool names the host reported.
+# rows carrying the tool names the host reported. A pre row lands as `noop`
+# when the tree is already captured (the idle-timer auto checkpoint usually
+# has it by the time the first tool runs); the hook still fired and is
+# attributed, which is what this asserts.
 TL="$(acy timeline --session "$SID" --limit 100)"
-echo "$TL" | grep -q " pre " || fail "no pre checkpoint for session: $TL"
+echo "$TL" | grep -Eq " (pre|noop) " \
+  || fail "no pre checkpoint for session $SID: $TL
+--- all checkpoints ---
+$(acy timeline --limit 30)
+--- sessions ---
+$(acy sessions)
+--- codex stderr (tail) ---
+$(tail -c 600 "$WORK/codex.stderr")"
 echo "$TL" | grep -q " post " || fail "no post checkpoint for session: $TL"
-echo "$TL" | grep -Eq "Write|Edit" || fail "no Write/Edit attribution: $TL"
+# Codex's edit tool is `apply_patch`; a failed patch (it happens) makes the
+# model fall back to a shell redirect, which arrives as Bash.
+echo "$TL" | grep -Eq "Write|Edit|apply_patch|Bash" || fail "no edit attribution: $TL"
 echo "$TL" | grep -q "Bash" || fail "no Bash attribution: $TL"
 
 # Blast radius across the session (earliest -> latest checkpoint) names the

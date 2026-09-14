@@ -82,7 +82,7 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     std::fs::create_dir_all(claude_dir.join(&rollback_skill)).map_err(stringify)?;
     std::fs::create_dir_all(claude_dir.join(&decompose_skill)).map_err(stringify)?;
 
-    merge_hooks(&claude_dir.join("settings.json"))?;
+    merge_hooks(&claude_dir.join("settings.json"), "claude-code")?;
     std::fs::write(
         claude_dir.join("commands/rewind.md"),
         product::render(REWIND_COMMAND),
@@ -120,6 +120,11 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Tools whose use changes the tree, so a checkpoint brackets them. Claude
+/// Code's names plus Codex's `apply_patch` (its edit tool; shell commands
+/// arrive as `Bash` there too). Hosts treat the matcher as a regex.
+const MUTATING_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch";
+
 /// The five lifecycle events every adapter wires, and the matcher (tool
 /// filter) and hook command each needs. Shared across hosts because Claude
 /// Code and Codex use the same event names and payload shape; only the
@@ -137,14 +142,10 @@ fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] 
         }
     };
     [
-        (
-            "PreToolUse",
-            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            cmd(HookEvent::PreTool),
-        ),
+        ("PreToolUse", Some(MUTATING_TOOLS), cmd(HookEvent::PreTool)),
         (
             "PostToolUse",
-            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            Some(MUTATING_TOOLS),
             cmd(HookEvent::PostTool),
         ),
         ("UserPromptSubmit", None, cmd(HookEvent::UserPrompt)),
@@ -153,33 +154,51 @@ fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] 
     ]
 }
 
-/// Merges our hook entries into settings.json without disturbing anything
-/// else in the file. Idempotent: an entry whose command mentions
+/// Merges our hook entries into a `{"hooks": {<Event>: [...]}}` file
+/// (Claude Code's `settings.json`, Codex's `hooks.json`) without disturbing
+/// anything else in it. Idempotent: an entry whose command invokes
 /// `acyclic hook` is replaced, never duplicated.
-fn merge_hooks(settings_path: &Path) -> Result<(), String> {
-    let mut settings: Value = match std::fs::read_to_string(settings_path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", settings_path.display()))?,
+fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
+    let mut root: Value = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.to_string()),
     };
-
-    let hooks = settings
+    let root_map = root
         .as_object_mut()
-        .ok_or("settings.json is not an object")?
-        .entry("hooks")
-        .or_insert(json!({}));
+        .ok_or_else(|| format!("{} is not an object", path.display()))?;
+    if host == "codex" {
+        remove_flat_codex_hooks(root_map);
+    }
+    let hooks = root_map.entry("hooks").or_insert(json!({}));
     let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
-    merge_event_hooks(hooks, "hooks", "claude-code")?;
+    merge_event_hooks(hooks, "hooks", host)?;
 
-    let text = serde_json::to_string_pretty(&settings).map_err(stringify)?;
-    std::fs::write(settings_path, text + "\n").map_err(stringify)?;
+    let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
+    std::fs::write(path, text + "\n").map_err(stringify)?;
     Ok(())
 }
 
-/// Merges our entries into a map keyed directly by event name (Codex's
-/// `.codex/hooks.json` shape — no enclosing `"hooks"` key). Same
-/// idempotency contract as `merge_hooks`.
+/// Earlier releases wrote Codex's events at the top level of `hooks.json`
+/// (`{"PreToolUse": [...]}`), a shape Codex 0.154 silently ignores. Drop
+/// our entries from that layout so a re-install moves them under `hooks`;
+/// anything a user put there is left alone.
+fn remove_flat_codex_hooks(root: &mut serde_json::Map<String, Value>) {
+    for (event, _, _) in hook_events("codex") {
+        let Some(entries) = root.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        entries.retain(|entry| !is_ours(entry));
+        if entries.is_empty() {
+            root.remove(event);
+        }
+    }
+}
+
+/// Merges our entries into a map keyed by event name (the value under
+/// `"hooks"`). Same idempotency contract as `merge_hooks`.
 fn merge_event_hooks(
     events_map: &mut serde_json::Map<String, Value>,
     label: &str,
@@ -223,46 +242,34 @@ fn is_our_command(command: &str) -> bool {
     command == NAME || command.starts_with(&format!("{NAME} hook"))
 }
 
-/// Codex CLI: `.codex/hooks.json` keyed directly by event name (no
-/// enclosing `"hooks"` object, unlike Claude Code's settings.json), plus
-/// the same host-neutral cheatsheet block Codex reads from AGENTS.md.
+/// Codex CLI: `.codex/hooks.json`, whose shape is the same
+/// `{"hooks": {<Event>: [{matcher, hooks: [{type, command}]}]}}` object as
+/// Claude Code's settings.json (verified against Codex 0.154: a file with
+/// events at the top level is ignored without a warning), plus the same
+/// host-neutral cheatsheet block Codex reads from AGENTS.md. Codex asks the
+/// user to trust project hooks once (`/hooks` in the TUI) before they run.
 ///
 /// TODO(desktop/IDE parity): OpenAI's own docs state that the ChatGPT
 /// desktop app, the Codex CLI, and Codex's IDE extension all read the same
 /// `~/.codex/config.toml` / `.codex/config.toml`. If that also means they
 /// share whatever fires `.codex/hooks.json`'s lifecycle events, this
 /// adapter may already cover the desktop app and IDE extension too, with no
-/// new code — verify that first. Only if hooks do NOT fire there does this
-/// need an MCP path: Codex's MCP config lives in the same `config.toml`,
-/// under TOML tables shaped `[mcp_servers.<name>]` with `command`/`args`/
-/// `env` keys — a different format (TOML, not JSON) from every adapter in
-/// this file, so it needs its own writer (and a `toml` crate dependency,
-/// not currently in `Cargo.toml`) rather than reusing `merge_mcp_server_json`.
+/// new code — verify that first. The MCP fallback is already known to
+/// work (docs/manual-testing.md): `[mcp_servers.<name>]` with `command`,
+/// `args` and `default_tools_approval_mode = "approve"` (without it a
+/// non-interactive session rejects every call). It is TOML, so a writer
+/// needs a `toml` dependency rather than `merge_mcp_server_json`.
 fn codex(repo: &Path) -> Result<(), String> {
     let codex_dir = repo.join(".codex");
     std::fs::create_dir_all(&codex_dir).map_err(stringify)?;
-    merge_codex_hooks(&codex_dir.join("hooks.json"))?;
+    merge_hooks(&codex_dir.join("hooks.json"), "codex")?;
     agents_md(repo)?;
 
     println!("codex adapter installed into {}", codex_dir.display());
     println!("  hooks: .codex/hooks.json (pre/post tool, prompt, session)");
     println!("  AGENTS.md carries the {NAME} cheatsheet");
     println!("check these files in so the whole team inherits checkpointing.");
-    Ok(())
-}
-
-fn merge_codex_hooks(hooks_path: &Path) -> Result<(), String> {
-    let mut hooks: Value = match std::fs::read_to_string(hooks_path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", hooks_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(error) => return Err(error.to_string()),
-    };
-    let events_map = hooks.as_object_mut().ok_or("hooks.json is not an object")?;
-    merge_event_hooks(events_map, "hooks.json", "codex")?;
-
-    let text = serde_json::to_string_pretty(&hooks).map_err(stringify)?;
-    std::fs::write(hooks_path, text + "\n").map_err(stringify)?;
+    println!("codex runs project hooks only after you trust them once: open `/hooks` in the TUI.");
     Ok(())
 }
 
@@ -458,7 +465,7 @@ fn claude_desktop_config_path() -> Result<PathBuf, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
+        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_owned())?;
         Ok(PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -472,7 +479,7 @@ fn claude_desktop_config_path() -> Result<PathBuf, String> {
                     .map(|home| PathBuf::from(home).join(".config"))
             });
         base.map(|base| base.join("Claude/claude_desktop_config.json"))
-            .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set".to_string())
+            .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set".to_owned())
     }
 }
 
@@ -874,8 +881,8 @@ mod tests {
         )
         .expect("seed");
 
-        merge_hooks(&settings).expect("first merge");
-        merge_hooks(&settings).expect("second merge");
+        merge_hooks(&settings, "claude-code").expect("first merge");
+        merge_hooks(&settings, "claude-code").expect("second merge");
 
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
@@ -910,17 +917,14 @@ mod tests {
     fn merge_creates_settings_from_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
-        merge_hooks(&settings).expect("merge");
+        merge_hooks(&settings, "claude-code").expect("merge");
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
         assert_eq!(
             value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             format!("{NAME} hook post-tool")
         );
-        assert_eq!(
-            value["hooks"]["PreToolUse"][0]["matcher"],
-            "Edit|Write|MultiEdit|NotebookEdit|Bash"
-        );
+        assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], MUTATING_TOOLS);
     }
 
     #[test]
@@ -951,11 +955,12 @@ mod tests {
             "SessionStart",
             "SessionEnd",
         ] {
-            let entries = value[event].as_array().expect("array");
+            let entries = value["hooks"][event].as_array().expect("array");
             assert_eq!(entries.iter().filter(|e| is_ours(e)).count(), 1, "{event}");
+            assert!(value.get(event).is_none(), "{event} must not be top-level");
         }
         assert_eq!(
-            value["SessionStart"][0]["hooks"][0]["command"],
+            value["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             format!("ACYCLIC_HOST=codex {NAME} hook session-start")
         );
 
@@ -963,6 +968,44 @@ mod tests {
         assert_eq!(
             agents_md.matches(&format!("## {NAME} checkpoints")).count(),
             1
+        );
+    }
+
+    #[test]
+    fn codex_reinstall_migrates_the_legacy_flat_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join(".codex/hooks.json");
+        std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir");
+        let legacy = json!({
+            "PreToolUse": [
+                { "hooks": [{ "type": "command", "command": "echo user-hook" }] },
+                { "hooks": [{ "type": "command",
+                              "command": format!("ACYCLIC_HOST=codex {NAME} hook pre-tool") }] }
+            ],
+            "SessionEnd": [
+                { "hooks": [{ "type": "command",
+                              "command": format!("ACYCLIC_HOST=codex {NAME} hook session-end") }] }
+            ]
+        });
+        std::fs::write(&hooks_path, legacy.to_string()).expect("seed");
+
+        codex(dir.path()).expect("install");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read"))
+                .expect("json");
+        assert_eq!(
+            value["PreToolUse"].as_array().map(Vec::len),
+            Some(1),
+            "user hook kept"
+        );
+        assert!(
+            value.get("SessionEnd").is_none(),
+            "emptied legacy key removed"
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(1),
+            "ours lives under hooks now"
         );
     }
 

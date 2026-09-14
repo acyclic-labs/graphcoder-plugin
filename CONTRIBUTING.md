@@ -16,6 +16,11 @@ tests/acceptance/run-all.sh
 Individual suites (`journey.sh`, `timeline.sh`, `forks.sh`, `merge.sh`, `safe-mode.sh`, etc.) can
 be run with `bash tests/acceptance/<suite>.sh` if you're iterating on one feature.
 
+The `*-e2e.sh` suites drive the real host CLIs (Claude Code, Codex, cursor-agent, OpenCode) and
+cost a model session each; they run only with `ACYCLIC_E2E=1`. Run them, or the manual
+checklist in `docs/manual-testing.md`, whenever you touch an adapter in `install.rs` or a host
+ships a new release — CI cannot see a host silently ignoring our config.
+
 ## Commit messages
 
 - Summary line: imperative mood ("Add", "Fix", "Rename", not "Added"/"Fixes"), no trailing

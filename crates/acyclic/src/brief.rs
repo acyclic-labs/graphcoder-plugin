@@ -13,7 +13,7 @@ pub const BUDGET_BYTES: usize = 1000;
 
 pub fn render(info: &proto::BriefInfo) -> String {
     let Some(session) = &info.session else {
-        return "{NAME}: no previous session on record for this repo.\n".to_owned();
+        return format!("{NAME}: no previous session on record for this repo.\n");
     };
     let mut lines = Vec::new();
     let ended = match session.ended_at {

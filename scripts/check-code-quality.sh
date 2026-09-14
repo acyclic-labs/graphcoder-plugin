@@ -26,8 +26,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 fail=0
 
-RUST_FILES="$(git ls-files 'crates/*.rs' 'crates/**/*.rs')"
-SHELL_FILES="$(git ls-files '*.sh' 'scripts/*.sh' 'tests/**/*.sh' 'packaging/**/*.sh')"
+RUST_FILES="$(git ls-files --cached --others --exclude-standard 'crates/*.rs' 'crates/**/*.rs')"
+SHELL_FILES="$(git ls-files --cached --others --exclude-standard '*.sh' 'scripts/*.sh' 'tests/**/*.sh' 'packaging/**/*.sh')"
 
 # 1. Line length.
 check_width() {

@@ -10,7 +10,7 @@ SCRIPTS=(journey.sh timeline.sh exclusions.sh growth.sh soak.sh crash.sh latency
 # The live host-session tests need their CLI + credentials and cost a model
 # session each; opt in with ACYCLIC_E2E=1. (mcp-e2e.sh is not one of them:
 # it drives `acyclic mcp` with a scripted client, no host app or model.)
-[ "${ACYCLIC_E2E:-0}" = "1" ] && SCRIPTS+=(claude-e2e.sh claude-merge-e2e.sh codex-e2e.sh cursor-e2e.sh)
+[ "${ACYCLIC_E2E:-0}" = "1" ] && SCRIPTS+=(claude-e2e.sh claude-merge-e2e.sh codex-e2e.sh cursor-e2e.sh mcp-clients-e2e.sh)
 for script in "${SCRIPTS[@]}"; do
   echo "=== $script"
   if ! bash "$HERE/$script"; then
