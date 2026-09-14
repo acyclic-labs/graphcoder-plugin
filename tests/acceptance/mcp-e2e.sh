@@ -87,7 +87,7 @@ timeline="$(response 4)"
 # tool created must be the same row the CLI lists.
 settle
 acy timeline | grep -q "$LABEL" || fail "CLI timeline does not show the MCP checkpoint: $(acy timeline)"
-BASE_ID="$(printf '%s' "$checkpoint" | grep -oE 'checkpoint #[0-9]+' | head -1 | tr -dc '0-9')"
+BASE_ID="$(printf '%s' "$checkpoint" | grep -oE 'checkpoint #[0-9]+' | head -1 | tr -dc '0-9' || true)"
 [ -n "$BASE_ID" ] || fail "could not parse the checkpoint id from: $checkpoint"
 
 # The mutating tools, against a real edit: change a file, checkpoint it,

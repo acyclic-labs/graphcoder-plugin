@@ -31,14 +31,19 @@ SHELL_FILES="$(git ls-files --cached --others --exclude-standard '*.sh' 'scripts
 
 # grep over the file list, failing closed: exit 1 (no match) is an empty
 # result, anything else (unreadable file, bad pattern) fails the check
-# instead of silently passing it. xargs reports a grep exit of 1 as 123.
+# instead of silently passing it. One grep per file rather than xargs, so
+# a real error is not folded into xargs' single "some grep exited 1-125"
+# status.
 grep_files() {
-  local files="$1" pattern="$2" rc=0
-  echo "$files" | xargs grep -nE "$pattern" || rc=$?
-  case "$rc" in
-    0 | 1 | 123) return 0 ;;
-    *) echo "grep failed (exit $rc) while checking: $pattern" >&2; exit 2 ;;
-  esac
+  local files="$1" pattern="$2" file rc
+  for file in $files; do
+    rc=0
+    grep -nHE "$pattern" "$file" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+      echo "grep failed (exit $rc) on $file while checking: $pattern" >&2
+      exit 2
+    fi
+  done
 }
 
 # 1. Line length.

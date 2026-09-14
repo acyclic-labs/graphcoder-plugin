@@ -1019,7 +1019,7 @@ fn turn_range(
     Ok((entry.base_checkpoint, Some(last)))
 }
 
-fn short_session(session_id: &str) -> String {
+pub(crate) fn short_session(session_id: &str) -> String {
     let mut short: String = session_id.chars().take(8).collect();
     if session_id.chars().count() > 8 {
         short.push('…');

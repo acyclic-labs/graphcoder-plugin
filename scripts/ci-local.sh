@@ -9,7 +9,9 @@
 #   scripts/ci-local.sh --no-coverage    skip cargo-llvm-cov (needs `cargo install cargo-llvm-cov`)
 #
 # Needs: stable toolchain with rustfmt + clippy, cargo-deny, node (for the
-# duplication check), cargo-llvm-cov unless --no-coverage. macOS also needs
+# duplication check), and unless --no-coverage: cargo-llvm-cov plus the
+# `llvm-tools-preview` rustup component it drives
+# (`rustup component add llvm-tools-preview`). macOS also needs
 # FUSE-T for the fork/Safe Mode acceptance scripts.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

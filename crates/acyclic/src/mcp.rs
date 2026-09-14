@@ -123,6 +123,9 @@ fn restore_one(client: &mut Client, checkpoint: i64, path: String) -> Result<Str
     Ok(format!("{}: {what}{recorded}", info.path))
 }
 
+/// `turns` shows this many of the newest turns.
+const TURNS_SHOWN: usize = 50;
+
 #[derive(Clone)]
 struct McpServer {
     repo: PathBuf,
@@ -275,18 +278,22 @@ impl McpServer {
                 return Ok("no turns recorded yet".into());
             }
             let mut lines = Vec::with_capacity(turns.len());
-            for turn in turns {
+            // Newest TURNS_SHOWN turns, prompts clipped: a long history of
+            // raw prompts would crowd the host's context. The session
+            // prefix is what tells `t1` of one session from another's.
+            for turn in turns.into_iter().take(TURNS_SHOWN) {
                 let range = match (turn.first_checkpoint, turn.last_checkpoint) {
                     (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
                     (Some(first), _) => format!("#{first}"),
                     _ => "no checkpoints".to_owned(),
                 };
                 lines.push(format!(
-                    "t{} {} {} {}",
+                    "{} t{} {} {} {}",
+                    crate::short_session(&turn.session_id),
                     turn.turn,
                     crate::age(turn.started_at),
                     range,
-                    turn.prompt
+                    crate::brief::quote(&turn.prompt, 72)
                 ));
             }
             Ok(lines.join("\n"))
@@ -376,7 +383,7 @@ impl McpServer {
         annotations(
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = true
+            idempotent_hint = false
         )
     )]
     async fn restore(

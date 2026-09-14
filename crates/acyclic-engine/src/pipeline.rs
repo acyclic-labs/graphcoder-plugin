@@ -1201,11 +1201,11 @@ impl Pipeline {
         // Changes an idle tick already drained into the checkout but has
         // not recorded yet count as pending too: without this the row
         // would be a noop at the previous generation and lose them.
-        let changed = self.drain_watcher().await? || self.auto_pending.is_some();
+        let pending = self.has_pending_drained_changes();
+        let changed = self.drain_watcher().await? || pending;
         let drain_ms = crate::trace::ms(drain_started);
         let capture_started = Instant::now();
         let (generation, kind) = if changed {
-            self.auto_pending = None;
             (self.checkpoint_engine().await?, kind)
         } else {
             (self.last_generation, CheckpointKind::Noop)
@@ -1216,6 +1216,11 @@ impl Pipeline {
         let record_ms = crate::trace::ms(record_started);
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
+        if changed {
+            // Only now: a failure above leaves the marker so a later tick
+            // or request still snapshots what was drained.
+            self.auto_pending = None;
+        }
         self.checkpoints_since_commit += 1;
         let mut commit_ms = 0.0;
         if self.checkpoints_since_commit >= self.config.commit_every {
@@ -1416,27 +1421,36 @@ impl Pipeline {
         // Like `idle_commit`, failures here are advisory: the pending state
         // survives them, so the next tick retries, and nothing is waiting on
         // a reply.
+        let before = self.last_generation;
+        let mark_pending = |pipeline: &mut Self| {
+            pipeline.auto_pending = Some(AutoPending {
+                since_generation: before,
+                last_change: Instant::now(),
+            });
+        };
         match self.drain_watcher().await {
-            Ok(true) => {
-                self.auto_pending = Some(AutoPending {
-                    since_generation: self.last_generation,
-                    last_change: Instant::now(),
-                });
-            }
+            // A structural root hint makes `drain_watcher` re-baseline and
+            // record a `Recovered` row itself; nothing is left to record.
+            Ok(true) if self.last_generation != before => self.auto_pending = None,
+            Ok(true) => mark_pending(self),
             Ok(false) => {}
             Err(error) => {
+                // A batch may have been captured before the failure; keep
+                // (or start) the marker so the next tick snapshots it
+                // rather than trusting an empty watcher.
                 crate::trace!("pipeline", "auto-checkpoint drain failed: {error}");
+                if !self.has_pending_drained_changes() {
+                    mark_pending(self);
+                }
                 return;
             }
+        }
+        if !self.has_pending_drained_changes() {
+            return;
         }
         let Some(pending) = self.auto_pending else {
             return;
         };
-        if pending.since_generation != self.last_generation {
-            // A requested checkpoint already recorded those changes.
-            self.auto_pending = None;
-            return;
-        }
         if pending.last_change.elapsed()
             < Duration::from_millis(self.config.auto_checkpoint_idle_ms)
         {
@@ -1445,6 +1459,21 @@ impl Pipeline {
         match self.try_auto_checkpoint().await {
             Ok(()) => self.auto_pending = None,
             Err(error) => crate::trace!("pipeline", "auto-checkpoint failed: {error}"),
+        }
+    }
+
+    /// Whether an idle tick drained changes that no checkpoint has recorded
+    /// since. A marker from before the last recorded generation is stale
+    /// (a requested checkpoint, rewind, fork or promote snapshotted the
+    /// checkout in between) and is dropped here.
+    fn has_pending_drained_changes(&mut self) -> bool {
+        match self.auto_pending {
+            Some(pending) if pending.since_generation == self.last_generation => true,
+            Some(_) => {
+                self.auto_pending = None;
+                false
+            }
+            None => false,
         }
     }
 
@@ -1528,8 +1557,8 @@ impl Pipeline {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
-        if self.drain_watcher().await? || self.auto_pending.is_some() {
-            self.auto_pending = None;
+        let pending = self.has_pending_drained_changes();
+        if self.drain_watcher().await? || pending {
             let safety = self.checkpoint_engine().await?;
             let row = self.index.record(
                 safety,
@@ -1545,6 +1574,7 @@ impl Pipeline {
             )?;
             self.last_generation = safety;
             self.last_checkpoint_row = Some(row);
+            self.auto_pending = None;
         }
 
         let outcome = rewind::restore_path(&self.store, target.generation, path).await?;

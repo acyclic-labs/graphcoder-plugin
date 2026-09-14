@@ -434,15 +434,31 @@ impl McpEntry {
         }
     }
 
-    fn per_machine(exe: &Path, repo: &Path) -> Self {
+    /// Keyed by the repo's directory name, which is what a user recognises
+    /// in Desktop's server list; two registered repos that share a name get
+    /// a short path-derived suffix so neither replaces the other.
+    fn per_machine(exe: &Path, repo: &Path, taken: &serde_json::Map<String, Value>) -> Self {
         let basename = repo.file_name().map_or_else(
             || "repo".to_owned(),
             |name| name.to_string_lossy().into_owned(),
         );
+        let repo_arg = repo.display().to_string();
+        let plain = format!("{NAME}-{basename}");
+        let points_elsewhere = |key: &str| {
+            taken
+                .get(key)
+                .and_then(|entry| entry.get("args")?.get(2)?.as_str())
+                .is_some_and(|existing| existing != repo_arg)
+        };
+        let key = if points_elsewhere(&plain) {
+            format!("{plain}-{:08x}", fnv1a(repo_arg.as_bytes()))
+        } else {
+            plain
+        };
         Self {
-            key: format!("{NAME}-{basename}"),
+            key,
             command: exe.display().to_string(),
-            repo: Some(repo.display().to_string()),
+            repo: Some(repo_arg),
         }
     }
 
@@ -452,6 +468,25 @@ impl McpEntry {
             None => json!(["mcp"]),
         }
     }
+}
+
+/// FNV-1a over `bytes`: a stable, dependency-free short id for a path.
+/// Not a security boundary, only a disambiguator for same-named repos.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// The servers map a host config currently holds (empty when the file or
+/// the key is absent), so a new entry can be keyed against what is there.
+fn existing_servers(config_path: &Path, shape: &McpConfigShape) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|mut config| config.get_mut(shape.servers_key).map(Value::take))
+        .and_then(|servers| servers.as_object().cloned())
+        .unwrap_or_default()
 }
 
 /// Merges one `McpEntry` into any JSON-based MCP host's config, preserving
@@ -504,10 +539,32 @@ fn merge_mcp_server_json(
 
 /// Write via a sibling temp file and rename, so a crash mid-write can never
 /// leave a half-written config (Claude Desktop's is the user's whole MCP
-/// server list, not just ours).
+/// server list, not just ours). The temp file is created exclusively, so a
+/// planted symlink at the predictable name fails instead of being followed,
+/// and it inherits the existing file's mode (a `0600` config with secrets
+/// in `env` stays `0600`).
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(stringify)?;
+    // A stale temp file from an interrupted earlier run is ours to replace;
+    // `remove_file` on a symlink removes the link, never the target.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: {error}", tmp.display())),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|error| format!("{}: {error}", tmp.display()))?;
+    if let Ok(existing) = std::fs::metadata(path) {
+        file.set_permissions(existing.permissions())
+            .map_err(|error| format!("{}: {error}", tmp.display()))?;
+    }
+    file.write_all(text.as_bytes()).map_err(stringify)?;
+    file.sync_all().map_err(stringify)?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(stringify)
 }
 
@@ -521,7 +578,8 @@ fn claude_desktop(repo: &Path) -> Result<(), String> {
     let config_path = claude_desktop_config_path()?;
     let exe = std::env::current_exe().map_err(stringify)?;
     let repo = repo.canonicalize().map_err(stringify)?;
-    let entry = McpEntry::per_machine(&exe, &repo);
+    let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+    let entry = McpEntry::per_machine(&exe, &repo, &taken);
     merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry)?;
 
     println!(
@@ -533,8 +591,8 @@ fn claude_desktop(repo: &Path) -> Result<(), String> {
         entry.key,
         repo.display()
     );
-    println!("  one entry per repo, keyed by directory name: re-run this in another repo to add");
-    println!("  it alongside (two repos with the same directory name share the entry).");
+    println!("  one entry per repo, keyed by directory name (a second repo with the same name");
+    println!("  gets a short suffix): re-run this in another repo to add it alongside.");
     println!("per-machine, not checked into the repo: each teammate who wants");
     println!("Desktop support runs `{NAME} install claude-desktop` locally once.");
     println!("restart Claude Desktop for it to pick up the new server.");
@@ -1243,18 +1301,27 @@ mod tests {
         let exe_path = format!("/usr/local/bin/{NAME}");
         let exe = std::path::Path::new(&exe_path);
         let repo = std::path::Path::new("/Users/dev/my-repo");
-        let entry = McpEntry::per_machine(exe, repo);
-        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("first merge");
-        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry)
-            .expect("second merge (idempotent)");
-        // A second repo lands alongside, not on top of, the first.
+        let register = |repo: &Path| {
+            let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+            let entry = McpEntry::per_machine(exe, repo, &taken);
+            merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("merge");
+            entry.key
+        };
+        register(repo);
+        register(repo); // idempotent
+                        // A second repo lands alongside, not on top of, the first.
         let other_repo = std::path::Path::new("/Users/dev/other-repo");
-        merge_mcp_server_json(
-            &config_path,
-            &MCP_SERVERS_SHAPE,
-            &McpEntry::per_machine(exe, other_repo),
-        )
-        .expect("second repo");
+        register(other_repo);
+        // A third repo with the same directory name as the first gets a
+        // path-derived suffix instead of retargeting the first entry.
+        let twin_repo = std::path::Path::new("/Users/dev/elsewhere/my-repo");
+        let twin_key = register(twin_repo);
+        assert_ne!(twin_key, format!("{NAME}-my-repo"));
+        assert!(
+            twin_key.starts_with(&format!("{NAME}-my-repo-")),
+            "{twin_key}"
+        );
+        assert_eq!(register(twin_repo), twin_key, "the suffixed key is stable");
 
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
@@ -1279,7 +1346,30 @@ mod tests {
             value["mcpServers"][format!("{NAME}-other-repo")]["args"][2],
             other_repo.display().to_string()
         );
-        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(3));
+        assert_eq!(
+            value["mcpServers"][&twin_key]["args"][2],
+            twin_repo.display().to_string()
+        );
+        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(4));
+    }
+
+    #[test]
+    fn write_atomic_refuses_a_planted_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        // A symlink at the predictable temp name must not be followed.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep me\n").expect("victim");
+        std::os::unix::fs::symlink(&victim, path.with_extension("json.tmp")).expect("plant");
+        write_atomic(&path, "{\"a\":1}\n").expect("write");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep me\n");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{\"a\":1}\n");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing mode preserved");
     }
 
     #[test]

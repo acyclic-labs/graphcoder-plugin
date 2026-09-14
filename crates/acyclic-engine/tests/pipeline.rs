@@ -235,10 +235,10 @@ fn requested_checkpoint_records_changes_an_idle_tick_already_drained() {
     let config = Config {
         quiesce_ms: 20,
         quiesce_cap_ms: 200,
-        // Ticks every 200 ms; a row needs a further 200 ms of quiet, so a
-        // request issued right after the first tick meets drained,
-        // unrecorded changes.
-        auto_checkpoint_idle_ms: 200,
+        // Ticks every 500 ms; a row needs a further 500 ms of quiet, so a
+        // request issued 100 ms after the first tick meets drained,
+        // unrecorded changes with ~400 ms to spare before the second tick.
+        auto_checkpoint_idle_ms: 500,
         commit_every: 100,
         commit_idle_ms: 60_000,
         trash_ttl_days: 1,
@@ -250,7 +250,7 @@ fn requested_checkpoint_records_changes_an_idle_tick_already_drained() {
     let outcome = runtime.block_on(async {
         handle.status().await.expect("status");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         let outcome = handle
             .checkpoint(CheckpointKind::Post, Attribution::default())
             .await

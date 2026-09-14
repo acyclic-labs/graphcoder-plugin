@@ -209,7 +209,7 @@ per-machine state; undo them by hand if the scratch repo goes away.
 |---|---|---|---|
 | Claude Code | 2.1.270 | hooks (`claude-e2e.sh`) | pass: pre/post rows, Write + Bash attribution, diff, rewind |
 | Claude Code | 2.1.270 | MCP client | pass: `brief`, `checkpoint`, `timeline` called, checkpoint landed |
-| Codex | 0.154.0 | hooks (`codex-e2e.sh`) | pass after the fixes below: pre/post rows, `apply_patch` + Bash attribution, diff, rewind |
+| Codex | 0.154.0 | hooks (`codex-e2e.sh`) | pass after the fixes below: pre/post rows with turn attribution, Bash attribution, the edit proven by `diff`, rewind |
 | Codex | 0.154.0 | MCP client | pass with `default_tools_approval_mode = "approve"`; fails without it |
 | cursor-agent | 2026.09.10 | hooks (`cursor-e2e.sh`) | pass |
 | cursor-agent | 2026.09.10 | MCP client | pass after `mcp enable`; seven tools listed, checkpoint landed |
@@ -220,5 +220,7 @@ per-machine state; undo them by hand if the scratch repo goes away.
 Findings fixed during that pass: Codex 0.154 ignores a `hooks.json` without
 the top-level `hooks` key (the adapter wrote the flat shape; now migrated on
 re-install); Codex's edit tool is `apply_patch`, which the hook matcher did
-not name; Codex's JSONL emits `thread_id` rather than `session_id`; and the
+not name (the suite does not require an `apply_patch` row, since a failed
+patch makes the model fall back to a shell redirect; the `diff` check is
+what proves the edit was captured); Codex's JSONL emits `thread_id` rather than `session_id`; and the
 `brief` tool returned a literal `{NAME}` when no session was on record.

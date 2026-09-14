@@ -40,7 +40,9 @@ if command -v cursor-agent >/dev/null 2>&1; then
   for flag in --approve-mcps --force --trust --output-format; do
     require_flag "$CURSOR_HELP" "$flag" cursor-agent
   done
-  require_flag "$(cursor-agent mcp --help 2>&1 || true)" list-tools cursor-agent
+  CURSOR_MCP_HELP="$(cursor-agent mcp --help 2>&1 || true)"
+  require_flag "$CURSOR_MCP_HELP" list-tools cursor-agent
+  require_flag "$CURSOR_MCP_HELP" enable cursor-agent
 fi
 
 setup_repo
@@ -88,7 +90,7 @@ fi
 # all — without it every call fails with "requires approval".
 if command -v codex >/dev/null 2>&1; then
   (cd "$R" && with_timeout 180 codex exec "$(prompt_for mcp-from-codex)" \
-    --skip-git-repo-check --json -o "$WORK/codex.last" \
+    --skip-git-repo-check --json --output-last-message "$WORK/codex.last" \
     -c "mcp_servers.${NAME}.command=\"$BIN\"" \
     -c "mcp_servers.${NAME}.args=[\"mcp\",\"--repo\",\"$R\"]" \
     -c "mcp_servers.${NAME}.default_tools_approval_mode=\"approve\"" \
