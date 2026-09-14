@@ -1365,33 +1365,21 @@ impl Pipeline {
         {
             return;
         }
-        let changed = match self.drain_watcher().await {
-            Ok(changed) => changed,
-            Err(error) => {
-                crate::trace!("pipeline", "auto-checkpoint: drain failed: {error}");
-                return;
-            }
-        };
-        if !changed {
-            return;
+        // Like `idle_commit`, failures here are advisory: the next tick or
+        // the next real request retries, and nothing is waiting on a reply.
+        if let Err(error) = self.try_auto_checkpoint().await {
+            crate::trace!("pipeline", "auto-checkpoint failed: {error}");
         }
-        let generation = match self.checkpoint_engine().await {
-            Ok(generation) => generation,
-            Err(error) => {
-                crate::trace!("pipeline", "auto-checkpoint: capture failed: {error}");
-                return;
-            }
-        };
-        let row = match self
+    }
+
+    async fn try_auto_checkpoint(&mut self) -> Result<()> {
+        if !self.drain_watcher().await? {
+            return Ok(());
+        }
+        let generation = self.checkpoint_engine().await?;
+        let row = self
             .index
-            .record(generation, CheckpointKind::Auto, &Attribution::default())
-        {
-            Ok(row) => row,
-            Err(error) => {
-                crate::trace!("pipeline", "auto-checkpoint: record failed: {error}");
-                return;
-            }
-        };
+            .record(generation, CheckpointKind::Auto, &Attribution::default())?;
         crate::trace!(
             "pipeline",
             "auto-checkpoint row #{row}: idle timer, watcher had pending changes"
@@ -1400,8 +1388,9 @@ impl Pipeline {
         self.last_checkpoint_row = Some(row);
         self.checkpoints_since_commit += 1;
         if self.checkpoints_since_commit >= self.config.commit_every {
-            let _ = self.commit_engine().await;
+            self.commit_engine().await?;
         }
+        Ok(())
     }
 
     async fn rewind(&mut self, target: CheckpointRow) -> Result<RewindOutcome> {

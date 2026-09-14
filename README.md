@@ -8,19 +8,34 @@ Checkpoint every agent action, rewind exactly, see the blast radius. The store c
 
 ## Install
 
+Get the binary, start the daemon in your repo, then wire in each coding tool you use:
+
 ```sh
 npm i -g @acyclic-labs/plugin                                                       # prebuilt binary, macOS + Linux
 curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh   # or: verified download into ~/.local/bin
 cd your-repo
 acyclic init                       # starts the daemon, builds the first snapshot
-acyclic install claude-code        # hooks, /rewind /timeline /fork, two skills; checked in
-acyclic install codex               # .codex/hooks.json + AGENTS.md cheatsheet; checked in
-acyclic install cursor              # .cursor/hooks.json + always-applied rule; checked in
-acyclic install claude-desktop      # registers `acyclic mcp` globally, per machine and per repo
-acyclic install vscode               # .vscode/mcp.json (acyclic tools); checked in
+acyclic install <host>             # one of the hosts below; repeat per tool you use
 ```
 
-Any shell-capable agent can use the CLI directly; `acyclic install agents-md` teaches it the verbs. Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
+Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
+
+### Per host
+
+Two adapter shapes exist. **Hook-based** hosts expose a lifecycle-hook API, so a checkpoint is taken automatically around every edit and command; the adapter is checked-in config the whole team inherits. **MCP-based** hosts have no such API; the adapter registers `acyclic mcp`, an MCP server that exposes `checkpoint`/`timeline`/`rewind`/`diff`/`restore`/`turns`/`brief` as tools the model calls explicitly, and the daemon's idle timer (`auto_checkpoint_idle_ms`) catches edits nothing asked to checkpoint.
+
+| Host | Surface | Shape | Command | What it writes | Verified |
+|---|---|---|---|---|---|
+| Claude Code | CLI | hooks | `acyclic install claude-code` | `.claude/settings.json` hooks, `/rewind` `/timeline` `/fork` commands, two skills — checked in | live session: `tests/acceptance/claude-e2e.sh` |
+| Codex | CLI | hooks | `acyclic install codex` | `.codex/hooks.json` + AGENTS.md cheatsheet — checked in | live session: `codex-e2e.sh` |
+| Cursor | desktop app + CLI | hooks + MCP | `acyclic install cursor` | `.cursor/hooks.json`, `.cursor/rules/acyclic.mdc`, `.cursor/mcp.json` — checked in | hooks, live session: `cursor-e2e.sh`. MCP: server side only (`mcp-e2e.sh`); Cursor reading `.cursor/mcp.json` not yet exercised |
+| Any shell-capable agent | CLI | cheatsheet | `acyclic install agents-md` | AGENTS.md block — checked in | n/a: no host to drive. Checkpoints come from the idle timer, not hooks |
+| Claude Desktop | desktop app | MCP | `acyclic install claude-desktop` | `mcpServers.acyclic` in your global `claude_desktop_config.json` — **per machine and per repo, not checked in**; restart Desktop afterwards | server side: `mcp-e2e.sh` on every CI run; config merge: unit-tested and run against a real config. A tool call from inside the app: not yet |
+| VS Code (Copilot agent mode) | IDE | MCP | `acyclic install vscode` | `.vscode/mcp.json` — checked in | server side: `mcp-e2e.sh`; config shape from VS Code's docs, unit-tested. VS Code reading it: not yet |
+
+"Verified" means what CI or a person has actually run, not what should work. The `*-e2e.sh` live sessions need the host CLI and credentials and run behind `ACYCLIC_E2E=1`; `mcp-e2e.sh` drives `acyclic mcp` with a scripted client and needs only the binary, so it runs on every CI pass. The MCP hosts share one honest gap: nothing yet drives the real app to click a tool. The install-side config merges are unit-tested in `crates/acyclic/src/install.rs`.
+
+Not yet covered: Codex's own MCP path (its MCP config is TOML, and its hooks may already reach the ChatGPT desktop app and IDE extension, which read the same config), Kimi Code CLI, Windsurf, Zed, JetBrains AI assistants, Gemini CLI, Amazon Q Developer, OpenCode. The `TODO(more hosts)` block above `adapters()` in `install.rs` is the checklist for adding one: find the host's hook or MCP config from its own docs, reuse `merge_mcp_server_json` when the shape fits, add a unit test that proves other entries survive, then verify against the real app.
 
 ## The public name
 
@@ -60,11 +75,7 @@ V1 is entirely local: no sandboxes, no managed sessions, no cloud sync. It ships
 One engine, thin adapters:
 
 - **`acyclic` CLI + daemon** — watcher, Merkle-DAG snapshot store, index. Host-agnostic.
-- **Per-host adapters** — Claude Code (built: hooks, `/rewind` `/timeline` `/fork`, two skills; `acyclic install claude-code`), Codex (built: `.codex/hooks.json` + AGENTS.md; `acyclic install codex`), Cursor (built: `.cursor/hooks.json` + an always-applied rule; `acyclic install cursor`), anything shell-capable (built: `acyclic install agents-md`), OpenCode (planned).
-- **Claude Desktop** — Desktop has no lifecycle-hook API, so there is no repo-local hook config to drop. `acyclic install claude-desktop` instead registers `acyclic mcp` (an MCP stdio server exposing `checkpoint`/`timeline`/`rewind`/`diff`/`restore`/`turns`/`brief` as tools) in the user's global, per-machine `claude_desktop_config.json` — not something a team can check in, and one registration per repo (`docs/design/06-installation.md` has the ship decision and its caveats). Checkpointing is not automatic the way it is for hooked hosts: it happens when the model calls `checkpoint`, or via the `auto_checkpoint_idle_ms` idle-timer safety net once the watcher has pending changes.
-- **VS Code (Copilot agent mode)** — same shape as Claude Desktop (MCP is the only extension point), but VS Code supports a project-scoped `.vscode/mcp.json` that the team can check in, unlike Desktop's global-only config. Schema verified against VS Code's own docs but not yet exercised against a real session — see the `TODO(verify)` on `vscode()` in `install.rs`.
-- **Cursor also gets MCP** — alongside its hooks, `acyclic install cursor` now additionally registers a project-scoped `.cursor/mcp.json`, giving the model named tools on top of the automatic hook-driven checkpointing it already had.
-- **More hosts** — the two adapter shapes here (lifecycle hooks; JSON-based MCP registration) generalize to most other coding-agent CLIs and desktop apps. See the `TODO(more hosts)` block above `adapters()` in `crates/acyclic/src/install.rs` for the concrete next candidates (Kimi Code CLI, Windsurf, Zed, JetBrains AI assistants, Gemini CLI, Amazon Q Developer) and the process for adding one.
+- **Per-host adapters** — hook-based for CLIs with a lifecycle-hook API (Claude Code, Codex, Cursor), MCP-based for desktop apps and IDEs without one (Claude Desktop, VS Code; Cursor gets both). Every adapter is a `HostAdapter` in `crates/acyclic/src/install.rs`; the MCP server itself is `crates/acyclic/src/mcp.rs`, a thin translation of each tool call into the same `acyclic-proto::Op` the hooks send. The table under [Install](#per-host) says what each one writes and how far it has been verified; `docs/design/06-installation.md` has the design and the ship decision for the MCP path.
 
 ## Launch plan
 

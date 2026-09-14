@@ -1,13 +1,16 @@
-//! `acyclic mcp` — an MCP stdio server for hosts with no lifecycle-hook API
-//! (Claude Desktop). Exposes the same verbs already surfaced to every other
-//! host via `AGENTS_MD_BLOCK`/`SELF_ROLLBACK_SKILL` (see `install.rs`) as
-//! MCP tools, translating each call directly into the `acyclic-proto::Op`
-//! the daemon already understands. See `install.rs`'s `ClaudeDesktop`
-//! adapter for how this gets registered with the host.
+//! `acyclic mcp` — an MCP stdio server for hosts that speak MCP: the ones
+//! with no lifecycle-hook API at all (Claude Desktop, VS Code) and the ones
+//! that support it alongside hooks (Cursor). Exposes the same verbs already
+//! surfaced to every other host via `AGENTS_MD_BLOCK`/`SELF_ROLLBACK_SKILL`
+//! (see `install.rs`) as MCP tools, translating each call directly into the
+//! `acyclic-proto::Op` the daemon already understands. The MCP adapters in
+//! `install.rs` register it with each host; `tests/acceptance/mcp-e2e.sh`
+//! drives it end-to-end.
 //!
-//! Unlike the hook path, there is no lifecycle event to piggyback on: every
-//! checkpoint here happens because the model decided to call `checkpoint`,
-//! steered by each tool's description text below.
+//! Unlike the hook path, there is no per-tool-call event to piggyback on: a
+//! checkpoint here happens because the model called `checkpoint` (steered
+//! by each tool's description text below), or because the daemon's idle
+//! timer noticed quiet after changes (`auto_checkpoint_idle_ms`).
 
 use std::path::PathBuf;
 
@@ -306,13 +309,14 @@ impl McpServer {
 
 const MCP_INSTRUCTIONS: &str = "\
 This repo uses {{name}}: the working tree (untracked + gitignored files \
-included) is snapshotted on request — nothing here fires automatically the \
-way it does in a hooked host, so call `checkpoint` yourself before a risky \
-change. Call `brief` once at the start of a conversation grounded in this \
-repo. After a failed attempt, call `rewind` instead of hand-reverting — but \
-call `timeline` first and confirm the target checkpoint with the user, since \
-there is no interactive confirmation prompt here. Before finishing, call \
-`diff` and review the blast radius.";
+included) is snapshotted into checkpoints. No hook fires per tool call here \
+the way it does in a hooked host — the daemon checkpoints on its own once \
+edits go quiet, but call `checkpoint` yourself before a risky change so the \
+boundary is exact. Call `brief` once at the start of a conversation grounded \
+in this repo. After a failed attempt, call `rewind` instead of hand-reverting \
+— but call `timeline` first and confirm the target checkpoint with the user, \
+since there is no interactive confirmation prompt here. Before finishing, \
+call `diff` and review the blast radius.";
 
 #[tool_handler]
 impl ServerHandler for McpServer {

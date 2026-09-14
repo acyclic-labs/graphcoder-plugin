@@ -30,7 +30,7 @@
 //! TODOs — see the doc comments on `codex()` and `cursor()`.
 
 use acyclic_engine::product::{self, NAME};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -375,7 +375,7 @@ fn cursor(repo: &Path) -> Result<(), String> {
     // that Cursor's desktop app fires the same hooks.json events its CLI
     // does before calling either path "supported" for the desktop app.
     let exe = std::env::current_exe().map_err(stringify)?;
-    merge_mcp_server_json(&cursor_dir.join("mcp.json"), &CURSOR_MCP_SHAPE, &exe, repo)?;
+    merge_mcp_server_json(&cursor_dir.join("mcp.json"), &MCP_SERVERS_SHAPE, &exe, repo)?;
 
     println!("cursor adapter installed into {}", cursor_dir.display());
     println!("  hooks: .cursor/hooks.json (shell + file-edit + prompt + session)");
@@ -449,11 +449,8 @@ struct McpConfigShape {
     explicit_stdio_type: bool,
 }
 
-const CLAUDE_DESKTOP_MCP_SHAPE: McpConfigShape = McpConfigShape {
-    servers_key: "mcpServers",
-    explicit_stdio_type: false,
-};
-const CURSOR_MCP_SHAPE: McpConfigShape = McpConfigShape {
+/// The `mcpServers` family: Claude Desktop and Cursor read the same shape.
+const MCP_SERVERS_SHAPE: McpConfigShape = McpConfigShape {
     servers_key: "mcpServers",
     explicit_stdio_type: false,
 };
@@ -504,16 +501,16 @@ fn merge_mcp_server_json(
     Ok(())
 }
 
-/// Claude Desktop: unlike the other three adapters, there is no repo-local
-/// hook config to drop — Desktop has no lifecycle-hook API, so `acyclic mcp`
-/// (an MCP stdio server) is registered instead, in the user's *global*
+/// Claude Desktop: unlike the repo-local adapters, there is no hook config
+/// to drop — Desktop has no lifecycle-hook API, so `acyclic mcp` (an MCP
+/// stdio server) is registered instead, in the user's *global*
 /// `claude_desktop_config.json`. That file is per-machine, not something a
 /// team can check in: each teammate who wants Desktop support runs this
 /// locally once.
 fn claude_desktop(repo: &Path) -> Result<(), String> {
     let config_path = claude_desktop_config_path()?;
     let exe = std::env::current_exe().map_err(stringify)?;
-    merge_mcp_server_json(&config_path, &CLAUDE_DESKTOP_MCP_SHAPE, &exe, repo)?;
+    merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &exe, repo)?;
 
     println!(
         "claude-desktop adapter registered in {}",
@@ -530,27 +527,27 @@ fn claude_desktop(repo: &Path) -> Result<(), String> {
 /// Windows: `%APPDATA%\Claude\claude_desktop_config.json`. Linux:
 /// `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json`, falling back to
 /// `~/.config/Claude/...`.
-fn claude_desktop_config_path() -> Result<std::path::PathBuf, String> {
+fn claude_desktop_config_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-        Ok(std::path::PathBuf::from(home)
+        Ok(PathBuf::from(home)
             .join("Library/Application Support/Claude/claude_desktop_config.json"))
     }
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
-        Ok(std::path::PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
+        Ok(PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
-                    .map(|home| std::path::PathBuf::from(home).join(".config"))
+                    .map(|home| PathBuf::from(home).join(".config"))
             });
         base.map(|base| base.join("Claude/claude_desktop_config.json"))
             .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set".to_string())
@@ -575,7 +572,6 @@ fn vscode(repo: &Path) -> Result<(), String> {
     println!("vscode adapter installed into {}", vscode_dir.display());
     println!("  mcp: .vscode/mcp.json ({NAME} tools, project-scoped)");
     println!("check this file in so the whole team inherits it.");
-    println!("note: unverified against a real VS Code session — see the TODO on `vscode()`.");
     Ok(())
 }
 
@@ -1144,11 +1140,11 @@ mod tests {
         )
         .expect("seed");
 
-        let exe = std::path::Path::new("/usr/local/bin/acyclic");
+        let exe_path = format!("/usr/local/bin/{NAME}");
+        let exe = std::path::Path::new(&exe_path);
         let repo = std::path::Path::new("/Users/dev/my-repo");
-        merge_mcp_server_json(&config_path, &CLAUDE_DESKTOP_MCP_SHAPE, exe, repo)
-            .expect("first merge");
-        merge_mcp_server_json(&config_path, &CLAUDE_DESKTOP_MCP_SHAPE, exe, repo)
+        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, exe, repo).expect("first merge");
+        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, exe, repo)
             .expect("second merge (idempotent)");
 
         let value: Value =
