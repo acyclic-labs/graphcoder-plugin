@@ -16,7 +16,9 @@ static START: OnceLock<Instant> = OnceLock::new();
 
 /// Whether tracing is on for this process.
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var_os(crate::product::TRACE_ENV).is_some_and(|v| !v.is_empty() && v != "0"))
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(crate::product::TRACE_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+    })
 }
 
 /// Emits one trace line. Prefer the [`trace!`] macro, which skips the

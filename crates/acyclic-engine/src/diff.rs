@@ -111,23 +111,6 @@ pub(crate) fn is_git_internal(path: &std::path::Path) -> bool {
         .is_some_and(|first| first.as_os_str() == ".git")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_git_internal;
-    use std::path::Path;
-
-    #[test]
-    fn only_root_git_dir_is_internal() {
-        assert!(is_git_internal(Path::new(".git")));
-        assert!(is_git_internal(Path::new(".git/HEAD")));
-        assert!(is_git_internal(Path::new(".git/objects/ab/cd")));
-        assert!(!is_git_internal(Path::new(".gitignore")));
-        assert!(!is_git_internal(Path::new("src/.git/config")));
-        assert!(!is_git_internal(Path::new("vendor/.gitkeep")));
-        assert!(!is_git_internal(Path::new("a.txt")));
-    }
-}
-
 /// Path → record summary of every entry in `generation` (directories included).
 pub(crate) async fn summaries(
     store: &Store,
@@ -202,4 +185,21 @@ fn logical_to_os(name: &acyclic_fs::kernel::LogicalName) -> std::ffi::OsString {
 #[cfg(not(unix))]
 fn logical_to_os(name: &acyclic_fs::kernel::LogicalName) -> std::ffi::OsString {
     String::from_utf8_lossy(name.as_bytes()).into_owned().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_git_internal;
+    use std::path::Path;
+
+    #[test]
+    fn only_root_git_dir_is_internal() {
+        assert!(is_git_internal(Path::new(".git")));
+        assert!(is_git_internal(Path::new(".git/HEAD")));
+        assert!(is_git_internal(Path::new(".git/objects/ab/cd")));
+        assert!(!is_git_internal(Path::new(".gitignore")));
+        assert!(!is_git_internal(Path::new("src/.git/config")));
+        assert!(!is_git_internal(Path::new("vendor/.gitkeep")));
+        assert!(!is_git_internal(Path::new("a.txt")));
+    }
 }

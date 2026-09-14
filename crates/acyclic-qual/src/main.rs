@@ -13,6 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use acyclic_engine::store::local_options;
 use acyclic_fs::model::{
     AccessMode, CheckoutMode, ConsistencyMode, FilesystemProfile, GenerationSelector, Lifecycle,
     MutationMode, VolumeConfig,
@@ -21,7 +22,6 @@ use acyclic_fs::{
     capture_baseline, capture_root_identity, materialize_checkout, CaptureOptions,
     MaterializeOptions,
 };
-use acyclic_engine::store::local_options;
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, LocalFs, OperationId, VolumeId,
     WorkCounters,
@@ -147,8 +147,9 @@ fn restore_gen(args: &[String]) -> Result<(), Failure> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let cancel = CancellationToken::new();
-        let fs_engine =
-            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
+        let fs_engine = LocalFs::local(local_options(&store_dir))
+            .await
+            .map_err(engine_err("open store"))?;
         let volume = fs_engine
             .open_volume(
                 VolumeId::from_bytes(volume_uuid),
@@ -245,8 +246,9 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     let config = volume_config();
     let (checkout, fs_engine) = runtime.block_on(async {
         let cancel = CancellationToken::new();
-        let fs_engine =
-            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("reopen store"))?;
+        let fs_engine = LocalFs::local(local_options(&store_dir))
+            .await
+            .map_err(engine_err("reopen store"))?;
         let volume = fs_engine
             .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
@@ -366,8 +368,9 @@ fn mount_hold(args: &[String]) -> Result<(), Failure> {
     let config = volume_config();
     let checkout = runtime.block_on(async {
         let cancel = CancellationToken::new();
-        let fs_engine =
-            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
+        let fs_engine = LocalFs::local(local_options(&store_dir))
+            .await
+            .map_err(engine_err("open store"))?;
         let volume = fs_engine
             .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
@@ -430,8 +433,9 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
     let config = volume_config();
     let checkout = runtime.block_on(async {
         let cancel = CancellationToken::new();
-        let fs_engine =
-            LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
+        let fs_engine = LocalFs::local(local_options(&store_dir))
+            .await
+            .map_err(engine_err("open store"))?;
         let volume = fs_engine
             .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
@@ -520,8 +524,9 @@ fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
         fs::create_dir_all(&mount_dir)?;
         let checkout = runtime.block_on(async {
             let cancel = CancellationToken::new();
-            let fs_engine =
-                LocalFs::local(local_options(&store_dir)).await.map_err(engine_err("open store"))?;
+            let fs_engine = LocalFs::local(local_options(&store_dir))
+                .await
+                .map_err(engine_err("open store"))?;
             let volume = fs_engine
                 .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
                 .await
@@ -629,8 +634,9 @@ async fn bench_inner(source: &Path, store_dir: &Path, rounds: usize) -> Result<(
     use acyclic_fs::{NativeWatch, NativeWatchOptions, WatchBatch};
 
     let cancel = CancellationToken::new();
-    let fs_engine =
-        LocalFs::local(local_options(store_dir)).await.map_err(engine_err("open store"))?;
+    let fs_engine = LocalFs::local(local_options(store_dir))
+        .await
+        .map_err(engine_err("open store"))?;
     let volume = fs_engine
         .create_volume(volume_config(), WorkCounters::UNBOUNDED, &cancel)
         .await
@@ -821,8 +827,9 @@ async fn capture_and_commit(
     store_dir: &Path,
 ) -> Result<(VolumeId, GenerationId), Failure> {
     let cancel = CancellationToken::new();
-    let fs_engine =
-        LocalFs::local(local_options(store_dir)).await.map_err(engine_err("open store"))?;
+    let fs_engine = LocalFs::local(local_options(store_dir))
+        .await
+        .map_err(engine_err("open store"))?;
 
     let started = Instant::now();
     let volume = fs_engine
@@ -898,8 +905,9 @@ async fn materialize(
     destination: &Path,
 ) -> Result<(), Failure> {
     let cancel = CancellationToken::new();
-    let fs_engine =
-        LocalFs::local(local_options(store_dir)).await.map_err(engine_err("reopen store"))?;
+    let fs_engine = LocalFs::local(local_options(store_dir))
+        .await
+        .map_err(engine_err("reopen store"))?;
     let volume = fs_engine
         .open_volume(volume_id, WorkCounters::UNBOUNDED, &cancel)
         .await

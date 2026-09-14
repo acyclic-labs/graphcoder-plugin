@@ -57,6 +57,10 @@ pub struct StatusReport {
     pub checkpoints_since_commit: u32,
 }
 
+/// A path paired with its regular-file contents, or `None` when the path is
+/// absent or not a regular file.
+type FileContents = Vec<(PathBuf, Option<Vec<u8>>)>;
+
 enum Request {
     Checkpoint {
         kind: CheckpointKind,
@@ -140,7 +144,7 @@ enum Request {
     ReadFiles {
         generation: GenerationId,
         paths: Vec<PathBuf>,
-        reply: oneshot::Sender<Result<Vec<(PathBuf, Option<Vec<u8>>)>>>,
+        reply: oneshot::Sender<Result<FileContents>>,
     },
     /// Plain writes of `paths` from `generation` into `root` (a mounted
     /// fork's directory, written through the mount so its caches stay
@@ -392,7 +396,7 @@ impl PipelineHandle {
         &self,
         generation: GenerationId,
         paths: Vec<PathBuf>,
-    ) -> Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+    ) -> Result<FileContents> {
         request!(
             self,
             ReadFiles {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch 4 Safe Mode acceptance (spec: plans/04-safe-mode.md): session
+# Launch 4 Safe Mode acceptance (spec: docs/design/04-safe-mode.md): session
 # redirection through a shadow mount at the repo root, filesystem-level
 # guarded paths that hold against arbitrary shell, approval-gated
 # apply/discard with zero trace, conflict legibility, and crash sweep.

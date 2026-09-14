@@ -4,7 +4,7 @@
 //! what the product needs on top: store lifecycle, the per-tool-call capture
 //! pipeline, the checkpoint metadata index, rewind, and blast-radius diff.
 //!
-//! The three rules from Phase 0 (see plans/phase0-verdict.md):
+//! The three rules from Phase 0 (see docs/design/phase0-verdict.md):
 //! 1. Per-tool-call snapshots use `checkpoint()`; `commit()` only at coarse
 //!    boundaries (it proves closure over the whole tree).
 //! 2. All engine state (store, socket, index) lives outside the working tree.

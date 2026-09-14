@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M-series fork acceptance (spec: plans/spec-forks.md): the mount-dependent
+# M-series fork acceptance (spec: docs/design/spec-forks.md): the mount-dependent
 # behavior — N simultaneous fork mounts, isolation, promote journey,
 # conflict, evaporation, crash sweep. Skips (exit 0) when the native mount
 # layer is unavailable unless ACYCLIC_FORKS_REQUIRED=1.
