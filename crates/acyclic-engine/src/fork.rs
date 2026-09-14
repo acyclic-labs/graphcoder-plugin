@@ -102,6 +102,13 @@ pub fn mount_setup_hint() -> &'static str {
             "ask your administrator to allow loopback NFS mounts.\n",
             "Safe Mode (dry_run) needs mounts and refuses to start without them.",
         )
+    } else if cfg!(windows) {
+        concat!(
+            "forks will use full copies until Windows Projected File System is enabled.\n",
+            "  Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart\n",
+            "then sign out and back in. ProjFS is present on Windows 10 1809 and later.\n",
+            "Safe Mode (dry_run) needs mounts and refuses to start without them.",
+        )
     } else {
         "native mounts are not supported on this platform; forks use full copies \
          and Safe Mode (dry_run) is unavailable."

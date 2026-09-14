@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ipc;
 use acyclic_engine::config::Config;
 use acyclic_engine::fork::{
     self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
@@ -23,7 +24,6 @@ use acyclic_fs::{
 };
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 
 /// One live fork: the shared checkout its route serves plus wire facts.
@@ -111,10 +111,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
     // Socket + pidfile. A stale socket from a dead daemon is removed; a live
     // one refuses the second daemon via bind failure after removal race.
-    let _ = std::fs::remove_file(paths.socket());
-    let listener = runtime
-        .block_on(async { UnixListener::bind(paths.socket()) })
-        .map_err(|error| format!("bind {}: {error}", paths.socket().display()))?;
+    ipc::cleanup(&paths.socket());
+    let mut listener = runtime
+        .block_on(async { ipc::Listener::bind(&paths.socket()) })
+        .map_err(|error| format!("bind {}: {error}", ipc::endpoint_display(&paths.socket())))?;
     std::fs::write(paths.pidfile(), std::process::id().to_string())
         .map_err(|error| error.to_string())?;
 
@@ -183,7 +183,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { continue };
+                    let Ok(stream) = accepted else { continue };
                     let server = server.clone();
                     tokio::spawn(async move { server.serve(stream).await });
                 }
@@ -198,7 +198,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     if let Some(thread) = spec_thread {
         let _ = thread.join();
     }
-    let _ = std::fs::remove_file(paths.socket());
+    ipc::cleanup(&paths.socket());
     let _ = std::fs::remove_file(paths.pidfile());
     Ok(())
 }
@@ -225,8 +225,8 @@ struct Server {
 }
 
 impl Server {
-    async fn serve(&self, stream: UnixStream) {
-        let (read, mut write) = stream.into_split();
+    async fn serve(&self, stream: ipc::ServerStream) {
+        let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let response = match serde_json::from_str::<proto::Request>(&line) {

@@ -17,6 +17,7 @@ mod brief;
 mod client;
 mod hook;
 mod install;
+mod ipc;
 mod mcp;
 mod server;
 mod spec_runner;

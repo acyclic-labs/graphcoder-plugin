@@ -2,10 +2,10 @@
 //! Interactive verbs may spawn a dead daemon; hook-invoked calls never do.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::ipc::ClientStream;
 use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
@@ -18,7 +18,7 @@ pub enum Spawn {
 }
 
 pub struct Client {
-    stream: BufReader<UnixStream>,
+    stream: BufReader<ClientStream>,
     next_id: u64,
 }
 
@@ -36,11 +36,11 @@ impl Client {
         spawn: Spawn,
     ) -> Result<Self, ConnectError> {
         let started = std::time::Instant::now();
-        if let Ok(stream) = UnixStream::connect(socket) {
+        if let Ok(stream) = ClientStream::connect(socket) {
             acyclic_engine::trace!(
                 "client",
                 "connected to running daemon at {} in {:.1}ms",
-                socket.display(),
+                crate::ipc::endpoint_display(socket),
                 acyclic_engine::trace::ms(started)
             );
             return Self::from_stream(stream);
@@ -50,12 +50,16 @@ impl Client {
                 acyclic_engine::trace!(
                     "client",
                     "no daemon at {} and spawning is not allowed here",
-                    socket.display()
+                    crate::ipc::endpoint_display(socket)
                 );
                 Err(ConnectError::NoDaemon)
             }
             Spawn::Allowed => {
-                acyclic_engine::trace!("client", "no daemon at {}: spawning one", socket.display());
+                acyclic_engine::trace!(
+                    "client",
+                    "no daemon at {}: spawning one",
+                    crate::ipc::endpoint_display(socket)
+                );
                 let child = spawn_daemon(repo_root, log_path)?;
                 let client = wait_for_socket(socket, child, log_path);
                 acyclic_engine::trace!(
@@ -68,7 +72,7 @@ impl Client {
         }
     }
 
-    fn from_stream(stream: UnixStream) -> Result<Self, ConnectError> {
+    fn from_stream(stream: ClientStream) -> Result<Self, ConnectError> {
         stream
             .set_read_timeout(None)
             .map_err(|error| ConnectError::Other(error.to_string()))?;
@@ -164,7 +168,7 @@ fn wait_for_socket(
     let deadline = Duration::from_secs(30 * 60);
     let mut reported = false;
     loop {
-        if let Ok(stream) = UnixStream::connect(socket) {
+        if let Ok(stream) = ClientStream::connect(socket) {
             if let Ok(mut client) = Client::from_stream(stream) {
                 if client.call(proto::Op::Ping).is_ok() {
                     return Ok(client);
