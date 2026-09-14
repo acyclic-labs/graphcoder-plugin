@@ -12,3 +12,6 @@ description = "Phase 0 qualification harness: proves acyclic-fs capture/restore 
 acyclic-engine = { path = "../acyclic-engine" }
 acyclic-fs.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

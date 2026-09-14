@@ -7,6 +7,18 @@
 //!
 //! Exit code 0 = round-trip verified identical; 1 = mismatches or engine failure.
 
+#![allow(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::panic,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "qualification harness, not shipped: a bad invocation or a broken \
+              invariant should crash with its message rather than be handled"
+)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
@@ -213,6 +225,10 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, Failure> {
 // mount-smoke: Launch 3 gate — writable native mount of a captured checkout
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the gate's mount, write, unmount, and verify steps are one straight-line procedure"
+)]
 fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     use acyclic_fs::{
         mount_native, probe_native_mount, CheckoutMountSource, NativeMountRequest, SharedCheckout,
@@ -629,6 +645,10 @@ fn bench(args: &[String]) -> Result<(), Failure> {
     runtime.block_on(bench_inner(&source, &store_dir, rounds))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the benchmark's setup, rounds, and report are one straight-line procedure"
+)]
 async fn bench_inner(source: &Path, store_dir: &Path, rounds: usize) -> Result<(), Failure> {
     use acyclic_fs::model::VolumeLimits;
     use acyclic_fs::{NativeWatch, NativeWatchOptions, WatchBatch};
@@ -999,7 +1019,7 @@ fn compare_trees(source: &Path, restored: &Path) -> Result<Vec<String>, Failure>
         match right.get(path) {
             None => mismatches.push(format!("{}: missing in restore", path.display())),
             Some(other) if other != kind => {
-                mismatches.push(format!("{}: kind {kind:?} vs {other:?}", path.display()))
+                mismatches.push(format!("{}: kind {kind:?} vs {other:?}", path.display()));
             }
             Some(_) => {
                 let a = source.join(path);

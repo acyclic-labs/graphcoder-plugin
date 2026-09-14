@@ -106,9 +106,9 @@ impl Exclusions {
     }
 
     fn covers_bytes(&self, components: &[Vec<u8>]) -> bool {
-        self.prefixes.iter().any(|prefix| {
-            components.len() >= prefix.len() && components[..prefix.len()] == prefix[..]
-        })
+        self.prefixes
+            .iter()
+            .any(|prefix| components.starts_with(prefix))
     }
 
     /// True when `path` is a strict ancestor of an excluded path (the repo

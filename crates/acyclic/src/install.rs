@@ -1,35 +1,76 @@
-//! `acyclic install <host>` — wires the adapter into the current repo.
+//! `acyclic install <host>` — wires one host's adapter into the current repo.
 //!
-//! claude-code: merges hook entries into the repo's `.claude/settings.json`
-//! and drops the `/rewind`, `/timeline`, and `/fork` commands and the
-//! self-rollback and fork-decompose skills into `.claude/`.
-//! codex: merges the same lifecycle hooks into `.codex/hooks.json` (Codex's
-//! own event names and payload shape match Claude Code's closely enough
-//! that `acyclic hook` needs no host-specific parsing) and appends the
-//! agents-md cheatsheet, since Codex already reads AGENTS.md.
-//! cursor: merges Cursor's differently-named agent hooks into
-//! `.cursor/hooks.json` and drops an always-applied, product-named rule
-//! file under `.cursor/rules/`; Cursor's payload shape (`conversation_id`
-//! instead of `session_id`, no `tool_name` on shell hooks) is normalized in
-//! `hook::Payload`.
-//! Checked-in files, so the whole team inherits the wiring.
-//! agents-md: appends the CLI cheatsheet block to AGENTS.md for any
-//! shell-capable agent.
+//! Two adapter shapes. Hook-based hosts (claude-code, codex, cursor) get
+//! lifecycle-hook config that calls `acyclic hook <event>` around every
+//! edit and command, plus the commands/skills/rules that teach the agent
+//! the verbs; all of it is checked-in, so the whole team inherits it.
+//! MCP-based hosts (claude-desktop, vscode; cursor gets both) have no hook
+//! API, so they get `acyclic mcp` (see `crate::mcp`) registered as an MCP
+//! server in whatever config file that host reads — project-scoped and
+//! checked in where the host supports it, the user's global config where
+//! it doesn't. agents-md is the fallback for anything shell-capable: a
+//! cheatsheet block in AGENTS.md and no hooks at all.
+//!
+//! Each `HostAdapter` below documents exactly what its host gets. The
+//! README's per-host table is the user-facing version of the same list,
+//! with how far each adapter has been verified.
 
 use acyclic_engine::product::{self, NAME};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-pub fn run(repo: &Path, host: &str) -> Result<(), String> {
+use crate::hook::HookEvent;
+
+/// Every host `acyclic install` knows. The CLI parses the kebab-case name
+/// (`claude-code`, `agents-md`, ...) and rejects anything else before this
+/// module sees it; the match in `run` is exhaustive, so adding a variant
+/// without an installer is a compile error, not a runtime "unknown host".
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum Host {
+    ClaudeCode,
+    Codex,
+    Cursor,
+    AgentsMd,
+    ClaudeDesktop,
+    #[value(name = "vscode")]
+    VsCode,
+}
+
+// TODO(more hosts): the two shapes this file already covers — lifecycle
+// hooks (claude_code/codex/cursor) and MCP registration
+// (claude_desktop/cursor/vscode) — generalize to most other coding-agent
+// CLIs and desktop apps, not just the ones below. Before adding one:
+// 1. Find its hook config (file, event names, payload shape) and/or its MCP
+//    config (file location, JSON vs TOML, top-level key, whether `type` is
+//    explicit) from its own current docs — don't assume it matches an
+//    existing adapter; VS Code alone differs from Claude Desktop/Cursor on
+//    both the key name and the explicit-type requirement.
+// 2. Prefer the MCP path when the config is JSON-shaped and matches (or is
+//    close to) `McpConfigShape` — reuse `merge_mcp_server_json`, add a
+//    shape constant, a `Host` variant, and its arm in `run`, the same
+//    pattern as `vscode`.
+// 3. Write the merge, add a unit test seeding an existing config to prove
+//    other entries survive and a second install is idempotent (see
+//    `vscode_install_writes_project_scoped_mcp_config`), then verify against
+//    the real app before calling it more than "built."
+// Concrete candidates, not yet done:
+// - Kimi Code CLI: has BOTH lifecycle hooks (`[[hooks]]` in config.toml —
+//   TOML again, like Codex) and MCP support (`kimi mcp` subcommands /
+//   `/mcp-config`); unclear yet which config file MCP entries land in or
+//   its exact JSON/TOML shape — check `kimi mcp` docs before writing.
+// - Windsurf, Zed, JetBrains AI assistants, Gemini CLI, Amazon Q Developer:
+//   unresearched. Likely MCP-capable (most 2026-era agent tools are) but
+//   config location/shape unverified — do not assume any of them match
+//   Claude Desktop/Cursor's shape without checking.
+pub fn run(repo: &Path, host: Host) -> Result<(), String> {
     match host {
-        "claude-code" => claude_code(repo),
-        "codex" => codex(repo),
-        "cursor" => cursor(repo),
-        "agents-md" | "--agents-md" => agents_md(repo),
-        other => Err(format!(
-            "unknown host {other:?} (expected claude-code | codex | cursor | agents-md)"
-        )),
+        Host::ClaudeCode => claude_code(repo),
+        Host::Codex => codex(repo),
+        Host::Cursor => cursor(repo),
+        Host::AgentsMd => agents_md(repo),
+        Host::ClaudeDesktop => claude_desktop(repo),
+        Host::VsCode => vscode(repo),
     }
 }
 
@@ -41,7 +82,7 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     std::fs::create_dir_all(claude_dir.join(&rollback_skill)).map_err(stringify)?;
     std::fs::create_dir_all(claude_dir.join(&decompose_skill)).map_err(stringify)?;
 
-    merge_hooks(&claude_dir.join("settings.json"))?;
+    merge_hooks(&claude_dir.join("settings.json"), "claude-code")?;
     std::fs::write(
         claude_dir.join("commands/rewind.md"),
         product::render(REWIND_COMMAND),
@@ -79,6 +120,11 @@ fn claude_code(repo: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Tools whose use changes the tree, so a checkpoint brackets them. Claude
+/// Code's names plus Codex's `apply_patch` (its edit tool; shell commands
+/// arrive as `Bash` there too). Hosts treat the matcher as a regex.
+const MUTATING_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch";
+
 /// The five lifecycle events every adapter wires, and the matcher (tool
 /// filter) and hook command each needs. Shared across hosts because Claude
 /// Code and Codex use the same event names and payload shape; only the
@@ -87,7 +133,8 @@ fn claude_code(repo: &Path) -> Result<(), String> {
 /// through `ACYCLIC_HOST` so `session-start` records the right adapter and
 /// Cursor's permission-controlled hooks get their required JSON reply.
 fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] {
-    let cmd = |verb: &str| {
+    let cmd = |event: HookEvent| {
+        let verb = event.as_arg();
         if host == "claude-code" {
             format!("{NAME} hook {verb}")
         } else {
@@ -95,49 +142,63 @@ fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] 
         }
     };
     [
-        (
-            "PreToolUse",
-            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            cmd("pre-tool"),
-        ),
+        ("PreToolUse", Some(MUTATING_TOOLS), cmd(HookEvent::PreTool)),
         (
             "PostToolUse",
-            Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            cmd("post-tool"),
+            Some(MUTATING_TOOLS),
+            cmd(HookEvent::PostTool),
         ),
-        ("UserPromptSubmit", None, cmd("user-prompt")),
-        ("SessionStart", None, cmd("session-start")),
-        ("SessionEnd", None, cmd("session-end")),
+        ("UserPromptSubmit", None, cmd(HookEvent::UserPrompt)),
+        ("SessionStart", None, cmd(HookEvent::SessionStart)),
+        ("SessionEnd", None, cmd(HookEvent::SessionEnd)),
     ]
 }
 
-/// Merges our hook entries into settings.json without disturbing anything
-/// else in the file. Idempotent: an entry whose command mentions
+/// Merges our hook entries into a `{"hooks": {<Event>: [...]}}` file
+/// (Claude Code's `settings.json`, Codex's `hooks.json`) without disturbing
+/// anything else in it. Idempotent: an entry whose command invokes
 /// `acyclic hook` is replaced, never duplicated.
-fn merge_hooks(settings_path: &Path) -> Result<(), String> {
-    let mut settings: Value = match std::fs::read_to_string(settings_path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", settings_path.display()))?,
+fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
+    let mut root: Value = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.to_string()),
     };
-
-    let hooks = settings
+    let root_map = root
         .as_object_mut()
-        .ok_or("settings.json is not an object")?
-        .entry("hooks")
-        .or_insert(json!({}));
+        .ok_or_else(|| format!("{} is not an object", path.display()))?;
+    if host == "codex" {
+        remove_flat_codex_hooks(root_map);
+    }
+    let hooks = root_map.entry("hooks").or_insert(json!({}));
     let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
-    merge_event_hooks(hooks, "hooks", "claude-code")?;
+    merge_event_hooks(hooks, "hooks", host)?;
 
-    let text = serde_json::to_string_pretty(&settings).map_err(stringify)?;
-    std::fs::write(settings_path, text + "\n").map_err(stringify)?;
+    let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
+    write_atomic(path, &(text + "\n"))?;
     Ok(())
 }
 
-/// Merges our entries into a map keyed directly by event name (Codex's
-/// `.codex/hooks.json` shape — no enclosing `"hooks"` key). Same
-/// idempotency contract as `merge_hooks`.
+/// Earlier releases wrote Codex's events at the top level of `hooks.json`
+/// (`{"PreToolUse": [...]}`), a shape Codex 0.154 silently ignores. Drop
+/// our entries from that layout so a re-install moves them under `hooks`;
+/// anything a user put there is left alone.
+fn remove_flat_codex_hooks(root: &mut serde_json::Map<String, Value>) {
+    for (event, _, _) in hook_events("codex") {
+        let Some(entries) = root.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        entries.retain(|entry| !is_ours(entry));
+        if entries.is_empty() {
+            root.remove(event);
+        }
+    }
+}
+
+/// Merges our entries into a map keyed by event name (the value under
+/// `"hooks"`). Same idempotency contract as `merge_hooks`.
 fn merge_event_hooks(
     events_map: &mut serde_json::Map<String, Value>,
     label: &str,
@@ -152,8 +213,8 @@ fn merge_event_hooks(
         let mut entry = json!({
             "hooks": [{ "type": "command", "command": command }]
         });
-        if let Some(matcher) = matcher {
-            entry["matcher"] = json!(matcher);
+        if let (Some(matcher), Some(fields)) = (matcher, entry.as_object_mut()) {
+            fields.insert("matcher".to_owned(), json!(matcher));
         }
         entries.push(entry);
     }
@@ -178,37 +239,40 @@ fn is_our_command(command: &str) -> bool {
         .strip_prefix("ACYCLIC_HOST=")
         .and_then(|rest| rest.split_once(' '))
         .map_or(command, |(_, rest)| rest);
-    command == NAME || command.starts_with(&format!("{NAME} hook"))
+    // Word boundary after `hook`: `acyclic hookery ...` is somebody else's.
+    command == NAME
+        || command.starts_with(&format!("{NAME} hook "))
+        || command == format!("{NAME} hook")
 }
 
-/// Codex CLI: `.codex/hooks.json` keyed directly by event name (no
-/// enclosing `"hooks"` object, unlike Claude Code's settings.json), plus
-/// the same host-neutral cheatsheet block Codex reads from AGENTS.md.
+/// Codex CLI: `.codex/hooks.json`, whose shape is the same
+/// `{"hooks": {<Event>: [{matcher, hooks: [{type, command}]}]}}` object as
+/// Claude Code's settings.json (verified against Codex 0.154: a file with
+/// events at the top level is ignored without a warning), plus the same
+/// host-neutral cheatsheet block Codex reads from AGENTS.md. Codex asks the
+/// user to trust project hooks once (`/hooks` in the TUI) before they run.
+///
+/// TODO(desktop/IDE parity): OpenAI's own docs state that the ChatGPT
+/// desktop app, the Codex CLI, and Codex's IDE extension all read the same
+/// `~/.codex/config.toml` / `.codex/config.toml`. If that also means they
+/// share whatever fires `.codex/hooks.json`'s lifecycle events, this
+/// adapter may already cover the desktop app and IDE extension too, with no
+/// new code — verify that first. The MCP fallback is already known to
+/// work (docs/manual-testing.md): `[mcp_servers.<name>]` with `command`,
+/// `args` and `default_tools_approval_mode = "approve"` (without it a
+/// non-interactive session rejects every call). It is TOML, so a writer
+/// needs a `toml` dependency rather than `merge_mcp_server_json`.
 fn codex(repo: &Path) -> Result<(), String> {
     let codex_dir = repo.join(".codex");
     std::fs::create_dir_all(&codex_dir).map_err(stringify)?;
-    merge_codex_hooks(&codex_dir.join("hooks.json"))?;
+    merge_hooks(&codex_dir.join("hooks.json"), "codex")?;
     agents_md(repo)?;
 
     println!("codex adapter installed into {}", codex_dir.display());
     println!("  hooks: .codex/hooks.json (pre/post tool, prompt, session)");
     println!("  AGENTS.md carries the {NAME} cheatsheet");
     println!("check these files in so the whole team inherits checkpointing.");
-    Ok(())
-}
-
-fn merge_codex_hooks(hooks_path: &Path) -> Result<(), String> {
-    let mut hooks: Value = match std::fs::read_to_string(hooks_path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", hooks_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(error) => return Err(error.to_string()),
-    };
-    let events_map = hooks.as_object_mut().ok_or("hooks.json is not an object")?;
-    merge_event_hooks(events_map, "hooks.json", "codex")?;
-
-    let text = serde_json::to_string_pretty(&hooks).map_err(stringify)?;
-    std::fs::write(hooks_path, text + "\n").map_err(stringify)?;
+    println!("codex runs project hooks only after you trust them once: open `/hooks` in the TUI.");
     Ok(())
 }
 
@@ -229,8 +293,27 @@ fn cursor(repo: &Path) -> Result<(), String> {
     )
     .map_err(stringify)?;
 
+    // Cursor also speaks MCP directly, project-scoped and checked in
+    // (unlike Claude Desktop's global-only config) — see
+    // `merge_mcp_server_json`'s doc comment for the verified schema. Hooks
+    // above already checkpoint automatically; this additionally exposes
+    // named verbs (`checkpoint`, `rewind`, `timeline`, ...) as tools, the
+    // same surface Claude Desktop and VS Code get.
+    // TODO(verify): confirm in a real Cursor session that a hooks.json
+    // adapter and an mcp.json server for the same product coexist cleanly
+    // (expected: yes, they're independent request paths — a hook fires
+    // automatically per tool call, an MCP tool call is model-initiated) and
+    // that Cursor's desktop app fires the same hooks.json events its CLI
+    // does before calling either path "supported" for the desktop app.
+    merge_mcp_server_json(
+        &cursor_dir.join("mcp.json"),
+        &MCP_SERVERS_SHAPE,
+        &McpEntry::portable(),
+    )?;
+
     println!("cursor adapter installed into {}", cursor_dir.display());
     println!("  hooks: .cursor/hooks.json (shell + file-edit + prompt + session)");
+    println!("  mcp:   .cursor/mcp.json ({NAME} tools, project-scoped)");
     println!("  rule:  .cursor/rules/{NAME}.mdc");
     println!("check these files in so the whole team inherits checkpointing.");
     Ok(())
@@ -252,15 +335,16 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
 
     // Cursor entries carry `command`/`type` directly (no nested `hooks`
     // array), so its own merge loop rather than `merge_event_hooks`.
-    let events: [(&str, &str); 6] = [
-        ("sessionStart", "session-start"),
-        ("sessionEnd", "session-end"),
-        ("beforeShellExecution", "pre-tool"),
-        ("afterShellExecution", "post-tool"),
-        ("afterFileEdit", "post-tool"),
-        ("beforeSubmitPrompt", "user-prompt"),
+    let events: [(&str, HookEvent); 6] = [
+        ("sessionStart", HookEvent::SessionStart),
+        ("sessionEnd", HookEvent::SessionEnd),
+        ("beforeShellExecution", HookEvent::PreTool),
+        ("afterShellExecution", HookEvent::PostTool),
+        ("afterFileEdit", HookEvent::PostTool),
+        ("beforeSubmitPrompt", HookEvent::UserPrompt),
     ];
-    for (event, verb) in events {
+    for (event, hook_event) in events {
+        let verb = hook_event.as_arg();
         let entries = hooks.entry(event).or_insert(json!([]));
         let entries = entries
             .as_array_mut()
@@ -273,12 +357,307 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
     }
 
     let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
-    std::fs::write(hooks_path, text + "\n").map_err(stringify)?;
+    write_atomic(hooks_path, &(text + "\n"))?;
     Ok(())
 }
 
 fn is_our_cursor_entry(entry: &Value) -> bool {
     entry["command"].as_str().is_some_and(is_our_command)
+}
+
+/// Every JSON-based MCP host acyclic knows how to register `acyclic mcp`
+/// with, verified against each host's own current docs (2026):
+///
+/// - Claude Desktop and Cursor: `{"mcpServers": {"<name>": {command, args}}}`
+///   — identical shape, `stdio` inferred from the presence of `command`.
+/// - VS Code (Copilot agent mode): `{"servers": {"<name>": {type, command,
+///   args}}}` — different top-level key, and `type` must be explicit
+///   (`"stdio"`); VS Code does not infer it the way the other two do.
+///
+/// Codex is deliberately absent: its MCP config is TOML
+/// (`[mcp_servers.<name>]` in `config.toml`), not JSON, so it needs its own
+/// writer — see `TODO(desktop/IDE parity)` on `codex()` before adding one.
+struct McpConfigShape {
+    /// "mcpServers" (Claude Desktop, Cursor) or "servers" (VS Code).
+    servers_key: &'static str,
+    /// VS Code requires this; Claude Desktop and Cursor don't accept or need it.
+    explicit_stdio_type: bool,
+    /// VS Code documents a `cwd` field and substitutes `${workspaceFolder}`
+    /// in it; Cursor's stdio schema has no `cwd`, and cursor-agent starts
+    /// the server in the shell's cwd (verified: a subdirectory stays a
+    /// subdirectory), so the server locates the root itself either way.
+    workspace_cwd: bool,
+}
+
+/// The `mcpServers` family: Claude Desktop and Cursor read the same shape.
+const MCP_SERVERS_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "mcpServers",
+    explicit_stdio_type: false,
+    workspace_cwd: false,
+};
+const VSCODE_MCP_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "servers",
+    explicit_stdio_type: true,
+    workspace_cwd: true,
+};
+
+/// One `acyclic mcp` registration: the key it lives under and how the host
+/// should launch it. Two flavours, because the two kinds of config file
+/// have different readers:
+///
+/// - **Checked-in, per-project** (Cursor's `.cursor/mcp.json`, VS Code's
+///   `.vscode/mcp.json`): every teammate's clone reads the same file, so it
+///   must not carry this machine's paths. The command is the bare product
+///   name, resolved on `PATH` exactly like the hook commands, and there is
+///   no `--repo`: `acyclic mcp` walks up from its working directory to the
+///   nearest initialized repo (`mcp::find_repo_root`), the way git finds
+///   `.git`. `${workspaceFolder}` in `args` was tried first and rejected:
+///   cursor-agent passes it through literally.
+/// - **Per-machine, global** (Claude Desktop): the file is this user's own,
+///   there is no workspace to start in, and one file serves every repo
+///   this user registers, so the key carries the repo name and the args
+///   carry the absolute paths.
+struct McpEntry {
+    key: String,
+    command: String,
+    /// `Some(path)` pins the server to one repo; `None` lets it find the
+    /// root from its working directory.
+    repo: Option<String>,
+}
+
+impl McpEntry {
+    fn portable() -> Self {
+        Self {
+            key: NAME.to_owned(),
+            command: NAME.to_owned(),
+            repo: None,
+        }
+    }
+
+    /// Keyed by the repo's directory name, which is what a user recognises
+    /// in Desktop's server list; two registered repos that share a name get
+    /// a short path-derived suffix so neither replaces the other.
+    fn per_machine(exe: &Path, repo: &Path, taken: &serde_json::Map<String, Value>) -> Self {
+        let basename = repo.file_name().map_or_else(
+            || "repo".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let repo_arg = repo.display().to_string();
+        let plain = format!("{NAME}-{basename}");
+        // A key is free when absent, or already ours for this very repo
+        // (args are exactly `mcp --repo <this path>`; the command may have
+        // moved). Anything else there (another repo, a hand-written server,
+        // an entry with other args) is somebody's and must not be replaced,
+        // so keep extending the candidate until one is free.
+        let ours = json!(["mcp", "--repo", repo_arg]);
+        let occupied = |key: &str| {
+            taken
+                .get(key)
+                .is_some_and(|entry| entry.get("args") != Some(&ours))
+        };
+        let hashed = format!("{plain}-{:08x}", fnv1a(repo_arg.as_bytes()));
+        let key = std::iter::once(plain)
+            .chain(std::iter::once(hashed.clone()))
+            .chain((2u32..).map(|n| format!("{hashed}-{n}")))
+            .find(|candidate| !occupied(candidate))
+            .unwrap_or(hashed);
+        Self {
+            key,
+            command: exe.display().to_string(),
+            repo: Some(repo_arg),
+        }
+    }
+
+    fn args(&self) -> Value {
+        match &self.repo {
+            Some(repo) => json!(["mcp", "--repo", repo]),
+            None => json!(["mcp"]),
+        }
+    }
+}
+
+/// FNV-1a over `bytes`: a stable, dependency-free short id for a path.
+/// Not a security boundary, only a disambiguator for same-named repos.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// The servers map a host config currently holds (empty when the file or
+/// the key is absent), so a new entry can be keyed against what is there.
+fn existing_servers(config_path: &Path, shape: &McpConfigShape) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|mut config| config.get_mut(shape.servers_key).map(Value::take))
+        .and_then(|servers| servers.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Merges one `McpEntry` into any JSON-based MCP host's config, preserving
+/// everything else — same read-modify-write contract as `merge_hooks`:
+/// idempotent, keyed on the entry's key rather than string-matching the
+/// whole file, so re-running `install` replaces only that one entry.
+fn merge_mcp_server_json(
+    config_path: &Path,
+    shape: &McpConfigShape,
+    entry: &McpEntry,
+) -> Result<(), String> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(stringify)?;
+    }
+    let mut config: Value = match std::fs::read_to_string(config_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", config_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.to_string()),
+    };
+    let servers = config
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not an object", config_path.display()))?
+        .entry(shape.servers_key)
+        .or_insert(json!({}));
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not an object", shape.servers_key))?;
+    // Re-install overwrites only the fields we own; anything the user added
+    // to our entry (`env`, `envFile`, ...) survives.
+    let existing = servers.remove(&entry.key);
+    let mut value = existing
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert("command".to_owned(), json!(entry.command));
+        fields.insert("args".to_owned(), entry.args());
+        if shape.explicit_stdio_type {
+            fields.insert("type".to_owned(), json!("stdio"));
+        }
+        if shape.workspace_cwd && entry.repo.is_none() {
+            fields.insert("cwd".to_owned(), json!("${workspaceFolder}"));
+        }
+    }
+    servers.insert(entry.key.clone(), value);
+
+    let text = serde_json::to_string_pretty(&config).map_err(stringify)?;
+    write_atomic(config_path, &(text + "\n"))
+}
+
+/// Write via a sibling temp file and rename, so a crash mid-write can never
+/// leave a half-written config (Claude Desktop's is the user's whole MCP
+/// server list, not just ours). The temp file is created exclusively, so a
+/// planted symlink at the predictable name fails instead of being followed,
+/// and it inherits the existing file's mode (a `0600` config with secrets
+/// in `env` stays `0600`).
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    // A stale temp file from an interrupted earlier run is ours to replace;
+    // `remove_file` on a symlink removes the link, never the target.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: {error}", tmp.display())),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|error| format!("{}: {error}", tmp.display()))?;
+    if let Ok(existing) = std::fs::metadata(path) {
+        file.set_permissions(existing.permissions())
+            .map_err(|error| format!("{}: {error}", tmp.display()))?;
+    }
+    file.write_all(text.as_bytes()).map_err(stringify)?;
+    file.sync_all().map_err(stringify)?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(stringify)
+}
+
+/// Claude Desktop: unlike the repo-local adapters, there is no hook config
+/// to drop — Desktop has no lifecycle-hook API, so `acyclic mcp` (an MCP
+/// stdio server) is registered instead, in the user's *global*
+/// `claude_desktop_config.json`. That file is per-machine, not something a
+/// team can check in: each teammate who wants Desktop support runs this
+/// locally once.
+fn claude_desktop(repo: &Path) -> Result<(), String> {
+    let config_path = claude_desktop_config_path()?;
+    let exe = std::env::current_exe().map_err(stringify)?;
+    let repo = repo.canonicalize().map_err(stringify)?;
+    let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+    let entry = McpEntry::per_machine(&exe, &repo, &taken);
+    merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry)?;
+
+    println!(
+        "claude-desktop adapter registered in {}",
+        config_path.display()
+    );
+    println!(
+        "  server: {} = {NAME} mcp --repo {}",
+        entry.key,
+        repo.display()
+    );
+    println!("  one entry per repo, keyed by directory name (a second repo with the same name");
+    println!("  gets a short suffix): re-run this in another repo to add it alongside.");
+    println!("per-machine, not checked into the repo: each teammate who wants");
+    println!("Desktop support runs `{NAME} install claude-desktop` locally once.");
+    println!("restart Claude Desktop for it to pick up the new server.");
+    Ok(())
+}
+
+/// macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`.
+/// Windows: `%APPDATA%\Claude\claude_desktop_config.json`. Linux:
+/// `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json`, falling back to
+/// `~/.config/Claude/...`.
+fn claude_desktop_config_path() -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned())?;
+        Ok(PathBuf::from(home)
+            .join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_owned())?;
+        Ok(PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| PathBuf::from(home).join(".config"))
+            });
+        base.map(|base| base.join("Claude/claude_desktop_config.json"))
+            .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set".to_owned())
+    }
+}
+
+/// VS Code (GitHub Copilot's agent mode): like Claude Desktop, there is no
+/// lifecycle-hook API to drop repo-local config into — MCP is the only
+/// extension point. Unlike Desktop, VS Code supports a workspace-local
+/// config file (`.vscode/mcp.json`), so this one *is* checked-in, team-
+/// shared config, same as the hook-based adapters.
+///
+/// TODO(verify): the schema below (`servers` key, explicit `"type":
+/// "stdio"`) is confirmed against VS Code's current MCP docs but has not
+/// been exercised against a real VS Code + Copilot agent-mode session. Test
+/// that before calling this adapter "supported" rather than "built."
+fn vscode(repo: &Path) -> Result<(), String> {
+    let vscode_dir = repo.join(".vscode");
+    merge_mcp_server_json(
+        &vscode_dir.join("mcp.json"),
+        &VSCODE_MCP_SHAPE,
+        &McpEntry::portable(),
+    )?;
+
+    println!("vscode adapter installed into {}", vscode_dir.display());
+    println!("  mcp: .vscode/mcp.json ({NAME} tools, project-scoped)");
+    println!("check this file in so the whole team inherits it.");
+    Ok(())
 }
 
 fn agents_md(repo: &Path) -> Result<(), String> {
@@ -658,8 +1037,8 @@ mod tests {
         )
         .expect("seed");
 
-        merge_hooks(&settings).expect("first merge");
-        merge_hooks(&settings).expect("second merge");
+        merge_hooks(&settings, "claude-code").expect("first merge");
+        merge_hooks(&settings, "claude-code").expect("second merge");
 
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
@@ -694,17 +1073,14 @@ mod tests {
     fn merge_creates_settings_from_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
-        merge_hooks(&settings).expect("merge");
+        merge_hooks(&settings, "claude-code").expect("merge");
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("json");
         assert_eq!(
             value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             format!("{NAME} hook post-tool")
         );
-        assert_eq!(
-            value["hooks"]["PreToolUse"][0]["matcher"],
-            "Edit|Write|MultiEdit|NotebookEdit|Bash"
-        );
+        assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], MUTATING_TOOLS);
     }
 
     #[test]
@@ -735,11 +1111,12 @@ mod tests {
             "SessionStart",
             "SessionEnd",
         ] {
-            let entries = value[event].as_array().expect("array");
+            let entries = value["hooks"][event].as_array().expect("array");
             assert_eq!(entries.iter().filter(|e| is_ours(e)).count(), 1, "{event}");
+            assert!(value.get(event).is_none(), "{event} must not be top-level");
         }
         assert_eq!(
-            value["SessionStart"][0]["hooks"][0]["command"],
+            value["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             format!("ACYCLIC_HOST=codex {NAME} hook session-start")
         );
 
@@ -747,6 +1124,44 @@ mod tests {
         assert_eq!(
             agents_md.matches(&format!("## {NAME} checkpoints")).count(),
             1
+        );
+    }
+
+    #[test]
+    fn codex_reinstall_migrates_the_legacy_flat_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join(".codex/hooks.json");
+        std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir");
+        let legacy = json!({
+            "PreToolUse": [
+                { "hooks": [{ "type": "command", "command": "echo user-hook" }] },
+                { "hooks": [{ "type": "command",
+                              "command": format!("ACYCLIC_HOST=codex {NAME} hook pre-tool") }] }
+            ],
+            "SessionEnd": [
+                { "hooks": [{ "type": "command",
+                              "command": format!("ACYCLIC_HOST=codex {NAME} hook session-end") }] }
+            ]
+        });
+        std::fs::write(&hooks_path, legacy.to_string()).expect("seed");
+
+        codex(dir.path()).expect("install");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read"))
+                .expect("json");
+        assert_eq!(
+            value["PreToolUse"].as_array().map(Vec::len),
+            Some(1),
+            "user hook kept"
+        );
+        assert!(
+            value.get("SessionEnd").is_none(),
+            "emptied legacy key removed"
+        );
+        assert_eq!(
+            value["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(1),
+            "ours lives under hooks now"
         );
     }
 
@@ -784,6 +1199,210 @@ mod tests {
         let rule = std::fs::read_to_string(dir.path().join(format!(".cursor/rules/{NAME}.mdc")))
             .expect("read");
         assert!(rule.contains(&format!("## {NAME} checkpoints")));
+
+        // Cursor also gets a project-scoped MCP server registration,
+        // alongside its hooks — same verified schema as Claude Desktop.
+        let mcp: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".cursor/mcp.json")).expect("read"),
+        )
+        .expect("json");
+        // Checked in, so portable: no machine paths, the binary comes from
+        // PATH and the server finds the repo from its working directory.
+        assert_eq!(mcp["mcpServers"][NAME]["command"], NAME);
+        assert_eq!(mcp["mcpServers"][NAME]["args"], json!(["mcp"]));
+        assert!(mcp["mcpServers"][NAME].get("cwd").is_none());
+    }
+
+    #[test]
+    fn vscode_install_writes_project_scoped_mcp_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        vscode(dir.path()).expect("first install");
+        vscode(dir.path()).expect("second install (idempotent)");
+
+        let value: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".vscode/mcp.json")).expect("read"),
+        )
+        .expect("json");
+        // VS Code's schema differs from Claude Desktop/Cursor on both the
+        // top-level key ("servers", not "mcpServers") and requiring an
+        // explicit "type" — see `merge_mcp_server_json`'s doc comment.
+        assert_eq!(value["servers"][NAME]["type"], "stdio");
+        assert_eq!(value["servers"][NAME]["command"], NAME);
+        assert_eq!(value["servers"][NAME]["args"], json!(["mcp"]));
+        assert_eq!(value["servers"][NAME]["cwd"], "${workspaceFolder}");
+        assert!(value.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn reinstall_keeps_user_added_fields_on_our_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        vscode(dir.path()).expect("first install");
+        let path = dir.path().join(".vscode/mcp.json");
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        value["servers"][NAME]["env"] = json!({ "ACYCLIC_TRACE": "1" });
+        std::fs::write(&path, value.to_string()).expect("seed user field");
+
+        vscode(dir.path()).expect("second install");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(value["servers"][NAME]["env"]["ACYCLIC_TRACE"], "1");
+        assert_eq!(value["servers"][NAME]["args"], json!(["mcp"]));
+    }
+
+    #[test]
+    fn every_host_installs_into_a_fresh_repo() {
+        use clap::ValueEnum;
+        // claude-desktop is exercised separately (below): its install writes
+        // to a global, per-machine config path, not anything under `repo`.
+        for host in Host::value_variants()
+            .iter()
+            .copied()
+            .filter(|host| *host != Host::ClaudeDesktop)
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            run(dir.path(), host).unwrap_or_else(|error| panic!("{host:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn host_names_are_the_documented_kebab_case_ids() {
+        use clap::ValueEnum;
+        let names: Vec<String> = Host::value_variants()
+            .iter()
+            .map(|host| {
+                host.to_possible_value()
+                    .expect("named")
+                    .get_name()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "claude-code",
+                "codex",
+                "cursor",
+                "agents-md",
+                "claude-desktop",
+                "vscode"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_desktop_config_merge_is_idempotent_and_preserves_other_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("claude_desktop_config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+              "mcpServers": {
+                "other-tool": {"command": "/usr/bin/other", "args": []}
+              }
+            }"#,
+        )
+        .expect("seed");
+
+        let exe_path = format!("/usr/local/bin/{NAME}");
+        let exe = std::path::Path::new(&exe_path);
+        let repo = std::path::Path::new("/Users/dev/my-repo");
+        let register = |repo: &Path| {
+            let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+            let entry = McpEntry::per_machine(exe, repo, &taken);
+            merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("merge");
+            entry.key
+        };
+        // Twice: the second install must be idempotent.
+        register(repo);
+        register(repo);
+        // A second repo lands alongside, not on top of, the first.
+        let other_repo = std::path::Path::new("/Users/dev/other-repo");
+        register(other_repo);
+        // A third repo with the same directory name as the first gets a
+        // path-derived suffix instead of retargeting the first entry.
+        let twin_repo = std::path::Path::new("/Users/dev/elsewhere/my-repo");
+        let twin_key = register(twin_repo);
+        assert_ne!(twin_key, format!("{NAME}-my-repo"));
+        assert!(
+            twin_key.starts_with(&format!("{NAME}-my-repo-")),
+            "{twin_key}"
+        );
+        assert_eq!(register(twin_repo), twin_key, "the suffixed key is stable");
+        // Even the suffixed key is checked: a hand-written server sitting on
+        // it is left alone and the next candidate is used.
+        let planted = {
+            let mut config: Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
+                    .expect("json");
+            let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+            let fourth = std::path::Path::new("/Users/dev/again/my-repo");
+            let would_be = McpEntry::per_machine(exe, fourth, &taken).key;
+            config["mcpServers"][&would_be] = json!({ "command": "/usr/bin/theirs", "args": [] });
+            std::fs::write(&config_path, config.to_string()).expect("plant");
+            let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
+            let entry = McpEntry::per_machine(exe, fourth, &taken);
+            merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("merge");
+            (would_be, entry.key)
+        };
+        assert_ne!(planted.0, planted.1, "occupied suffix skipped");
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
+                .expect("json");
+        // The pre-existing server survives.
+        assert_eq!(
+            value["mcpServers"]["other-tool"]["command"],
+            "/usr/bin/other"
+        );
+        // Exactly one entry per repo, keyed by repo name, pointing at this
+        // exe and that repo's absolute path.
+        let key = format!("{NAME}-my-repo");
+        assert_eq!(
+            value["mcpServers"][&key]["command"],
+            exe.display().to_string()
+        );
+        assert_eq!(
+            value["mcpServers"][&key]["args"],
+            json!(["mcp", "--repo", repo.display().to_string()])
+        );
+        assert_eq!(
+            value["mcpServers"][format!("{NAME}-other-repo")]["args"][2],
+            other_repo.display().to_string()
+        );
+        assert_eq!(
+            value["mcpServers"][&twin_key]["args"][2],
+            twin_repo.display().to_string()
+        );
+        assert_eq!(
+            value["mcpServers"][&planted.0]["command"], "/usr/bin/theirs",
+            "planted server untouched"
+        );
+        assert_eq!(
+            value["mcpServers"][&planted.1]["args"][2],
+            "/Users/dev/again/my-repo"
+        );
+        // other-tool, my-repo, other-repo, twin, planted, fourth.
+        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(6));
+    }
+
+    #[test]
+    fn write_atomic_refuses_a_planted_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        // A symlink at the predictable temp name must not be followed.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep me\n").expect("victim");
+        std::os::unix::fs::symlink(&victim, path.with_extension("json.tmp")).expect("plant");
+        write_atomic(&path, "{\"a\":1}\n").expect("write");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep me\n");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{\"a\":1}\n");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing mode preserved");
     }
 
     #[test]
@@ -793,6 +1412,7 @@ mod tests {
         )));
         assert!(is_our_command(&format!("{NAME} hook pre-tool")));
         assert!(!is_our_command("echo not ours"));
+        assert!(!is_our_command(&format!("{NAME} hookery --flag")));
         // A user command mentioning our phrase as an argument, not invoking
         // it, is left alone.
         assert!(!is_our_command(&format!("echo {NAME} hook mention")));

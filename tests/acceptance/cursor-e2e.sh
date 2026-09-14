@@ -64,7 +64,7 @@ OUT="$(cd "$R" && PATH="$BIN_DIR:$PATH" with_timeout 180 cursor-agent -p "$PROMP
   || skip "cursor-agent session failed or timed out: $(tail -c 300 "$WORK/cursor.stderr")"
 
 SID="$(printf '%s' "$OUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' \
-  | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
 [ -n "$SID" ] || skip "no session_id in cursor-agent output: $(printf '%s' "$OUT" | head -c 300)"
 
 # The agent actually did the work.
@@ -75,9 +75,12 @@ SID="$(printf '%s' "$OUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*
 settle 1
 
 # Hooks fired and attributed: the timeline for THIS session has pre and post
-# rows carrying the tool names the host reported.
+# rows carrying the tool names the host reported. A pre row lands as `noop`
+# when the tree is already captured (the idle-timer auto checkpoint usually
+# has it by the time the first tool runs); the hook still fired and is
+# attributed, which is what this asserts.
 TL="$(acy timeline --session "$SID" --limit 100)"
-echo "$TL" | grep -q " pre " || fail "no pre checkpoint for session: $TL"
+echo "$TL" | grep -Eq " (pre|noop) +t[0-9]+ " || fail "no pre checkpoint for session: $TL"
 echo "$TL" | grep -q " post " || fail "no post checkpoint for session: $TL"
 echo "$TL" | grep -q "Bash" || fail "no Bash attribution: $TL"
 

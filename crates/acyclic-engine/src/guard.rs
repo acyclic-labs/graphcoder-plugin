@@ -74,7 +74,7 @@ impl GuardedMountFilesystem {
     }
 
     /// Whether wrapping a projection in the guard adds anything. Always true:
-    /// even with no configured prefixes the guard drops macOS AppleDouble
+    /// even with no configured prefixes the guard drops macOS `AppleDouble`
     /// sidecars, which every mount over the NFS transport would otherwise
     /// capture. Kept as a predicate so the wrap sites read intently and a
     /// future zero-cost fast path has a single place to live.
@@ -89,7 +89,7 @@ impl GuardedMountFilesystem {
     }
 
     /// Whether a mutating call to `path` must be refused: either it falls
-    /// under a configured guarded prefix, or its leaf is a macOS AppleDouble
+    /// under a configured guarded prefix, or its leaf is a macOS `AppleDouble`
     /// sidecar (`._X`). Sidecars are written by the macOS client over the
     /// mount to carry a file's xattrs / resource fork; in a Safe Mode or fork
     /// projection they are pure transport noise that would otherwise pollute
@@ -109,7 +109,7 @@ impl GuardedMountFilesystem {
     }
 }
 
-/// A path whose final component is a macOS AppleDouble sidecar (`._name`).
+/// A path whose final component is a macOS `AppleDouble` sidecar (`._name`).
 fn is_appledouble(path: &MountPath) -> bool {
     path.components()
         .last()

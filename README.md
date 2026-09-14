@@ -2,23 +2,41 @@
 
 Checkpoint every agent action, rewind exactly, see the blast radius. The store captures what git can't give back: untracked files, gitignored artifacts, and what a `bash` step wrote. History survives across sessions and is linked to the conversation turn that caused it.
 
-**A local product with plugin distribution.** The product is an agent-native state engine that runs on your machine — snapshots, forks, and indexing over your working tree. The plugins are thin adapters that deliver it through Claude Code, Codex, OpenCode, and any agent that can run a shell command. The engine is the moat; the plugins are the channel.
+**A local product with plugin distribution.** The product is an agent-native state engine that runs on your machine — snapshots, forks, and indexing over your working tree. The plugins are thin adapters that deliver it through Claude Code, Codex, OpenCode, any agent that can run a shell command, and Claude Desktop over MCP. The engine is the moat; the plugins are the channel.
 
 > Status: Launches 1–4 built (Rewind, Timeline, Forks, Safe Mode), acceptance suites green on macOS and Linux, published to npm as `@acyclic-labs/plugin`. Launch 1's release gate is met: snapshot exclusions, a store-growth proof, license scanning, an attested SBOM per binary, `scripts/install.sh`, and a clean-machine install test. What v1 deliberately does not do is prune or purge history; see [Retention and purge](#retention-and-purge). Launch 5 (Monorepo) is spec. The spec lives on the [Acyclic plugins docs page](https://acyclic.dev/docs/plugins).
 
 ## Install
+
+Get the binary, start the daemon in your repo, then wire in each coding tool you use:
 
 ```sh
 npm i -g @acyclic-labs/plugin                                                       # prebuilt binary, macOS + Linux
 curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh   # or: verified download into ~/.local/bin
 cd your-repo
 acyclic init                       # starts the daemon, builds the first snapshot
-acyclic install claude-code        # hooks, /rewind /timeline /fork, two skills; checked in
-acyclic install codex               # .codex/hooks.json + AGENTS.md cheatsheet; checked in
-acyclic install cursor              # .cursor/hooks.json + always-applied rule; checked in
+acyclic install <host>             # one of the hosts below; repeat per tool you use
 ```
 
-Any shell-capable agent can use the CLI directly; `acyclic install agents-md` teaches it the verbs. Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
+Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
+
+### Per host
+
+Two adapter shapes exist. **Hook-based** hosts expose a lifecycle-hook API, so a checkpoint is taken automatically around every edit and command; the adapter is checked-in config the whole team inherits. **MCP-based** hosts have no such API; the adapter registers `acyclic mcp`, an MCP server that exposes `checkpoint`/`timeline`/`rewind`/`diff`/`restore`/`turns`/`brief` as tools the model calls explicitly, and the daemon's idle timer (`auto_checkpoint_idle_ms`) catches edits nothing asked to checkpoint.
+
+| Host | Surface | Shape | Command | What it writes | Verified |
+|---|---|---|---|---|---|
+| Claude Code | CLI | hooks | `acyclic install claude-code` | `.claude/settings.json` hooks, `/rewind` `/timeline` `/fork` commands, two skills — checked in | live session: `tests/acceptance/claude-e2e.sh` (2.1.270). Also drives `acyclic mcp` as an MCP client: `mcp-clients-e2e.sh` |
+| Codex | CLI | hooks | `acyclic install codex` | `.codex/hooks.json` + AGENTS.md cheatsheet — checked in; trust the hooks once via `/hooks` | live session: `codex-e2e.sh` (0.154.0). MCP client path via `config.toml` overrides: `mcp-clients-e2e.sh` |
+| Cursor | desktop app + CLI | hooks + MCP | `acyclic install cursor` | `.cursor/hooks.json`, `.cursor/rules/acyclic.mdc`, `.cursor/mcp.json` — checked in and portable: bare `acyclic` from `PATH`, and the server finds the repo from its working directory | hooks, live session: `cursor-e2e.sh`. MCP: `cursor-agent` lists the tools and calls them, `mcp-clients-e2e.sh` (after `cursor-agent mcp enable acyclic`) |
+| Any shell-capable agent | CLI | cheatsheet | `acyclic install agents-md` | AGENTS.md block — checked in | n/a: no host to drive. Checkpoints come from the idle timer, not hooks |
+| Claude Desktop | desktop app | MCP | `acyclic install claude-desktop` | `mcpServers.acyclic-<repo name>` in your global `claude_desktop_config.json`, one entry per repo — **per machine, not checked in**; restart Desktop afterwards | the real app launches the server and completes `initialize` + `tools/list` (checked in its MCP log); server side: `mcp-e2e.sh` on every CI run. A tool call from inside a chat: manual only, see the guide |
+| VS Code (Copilot agent mode) | IDE | MCP | `acyclic install vscode` | `.vscode/mcp.json` — checked in and portable: bare `acyclic` from `PATH`, and the server finds the repo from its working directory | server side: `mcp-e2e.sh`; config shape from VS Code's docs, unit-tested. VS Code reading it: not yet |
+| OpenCode | CLI | MCP | none yet (hand-written `opencode.json`, see the guide) | — | `opencode mcp list` reports the server connected (`mcp-clients-e2e.sh`); no tool call yet |
+
+"Verified" means what CI or a person has actually run, not what should work. The `*-e2e.sh` live sessions need the host CLI and credentials and run behind `ACYCLIC_E2E=1`; `mcp-e2e.sh` drives `acyclic mcp` with a scripted client and needs only the binary, so it runs on every CI pass. The install-side config merges are unit-tested in `crates/acyclic/src/install.rs`. [`docs/manual-testing.md`](docs/manual-testing.md) is the step-by-step checklist for re-verifying every host by hand after a host upgrade, with the results of the last pass.
+
+Not yet covered: an `install` writer for Codex's MCP config (TOML) and for OpenCode's `opencode.json`, Kimi Code CLI, Windsurf, Zed, JetBrains AI assistants, Gemini CLI, Amazon Q Developer. The `TODO(more hosts)` block above `run()` in `install.rs` is the checklist for adding one: find the host's hook or MCP config from its own docs, reuse `merge_mcp_server_json` when the shape fits, add a unit test that proves other entries survive, then verify against the real app.
 
 ## The public name
 
@@ -33,6 +51,7 @@ Any shell-capable agent can use the CLI directly; `acyclic install agents-md` te
 | `exclude` | `[]` | Repo-relative paths (a file, or a directory and everything under it) that never enter a checkpoint: secrets, bulky generated state. A rewind leaves the live copies untouched; `acyclic restore` refuses them. |
 | `trash_ttl_days` | `7` | How long a rewound-away tree stays in the store's trash. |
 | `commit_every` / `commit_idle_ms` | `25` / `60000` | How often per-tool-call checkpoints are published to the durable store. |
+| `auto_checkpoint_idle_ms` | `5000` | Idle-timer safety net: checkpoints changes on its own once the watcher has been quiet this long, for hosts with no lifecycle-hook API (Claude Desktop). `0` disables it. Cheap no-op for hooked hosts, which already drain the watcher themselves. |
 | `quiesce_ms` / `quiesce_cap_ms` | `50` / `500` | Watcher quiet window before a capture. |
 | `dry_run` / `guarded_paths` | `false` / `[]` | Safe Mode (Launch 4). |
 | `[decompose]` / `[merge]` | | Fork decomposition policy and merge limits (Launch 3). |
@@ -57,7 +76,7 @@ V1 is entirely local: no sandboxes, no managed sessions, no cloud sync. It ships
 One engine, thin adapters:
 
 - **`acyclic` CLI + daemon** — watcher, Merkle-DAG snapshot store, index. Host-agnostic.
-- **Per-host adapters** — Claude Code (built: hooks, `/rewind` `/timeline` `/fork`, two skills; `acyclic install claude-code`), Codex (built: `.codex/hooks.json` + AGENTS.md; `acyclic install codex`), Cursor (built: `.cursor/hooks.json` + an always-applied rule; `acyclic install cursor`), anything shell-capable (built: `acyclic install agents-md`), OpenCode (planned).
+- **Per-host adapters** — hook-based for CLIs with a lifecycle-hook API (Claude Code, Codex, Cursor), MCP-based for desktop apps and IDEs without one (Claude Desktop, VS Code; Cursor gets both). Every adapter is a `HostAdapter` in `crates/acyclic/src/install.rs`; the MCP server itself is `crates/acyclic/src/mcp.rs`, a thin translation of each tool call into the same `acyclic-proto::Op` the hooks send. The table under [Install](#per-host) says what each one writes and how far it has been verified; `docs/design/06-installation.md` has the design and the ship decision for the MCP path.
 
 ## Launch plan
 

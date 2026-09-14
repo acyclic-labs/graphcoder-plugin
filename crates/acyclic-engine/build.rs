@@ -1,5 +1,9 @@
 //! Reads the repo-level `product.toml` and exposes its keys to the crate as
 //! compile-time environment variables (see `src/product.rs`).
+#![allow(
+    clippy::panic,
+    reason = "a build script reports a broken product.toml by failing the build"
+)]
 
 use std::path::Path;
 
@@ -25,7 +29,8 @@ fn main() {
             && name
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-        "product.toml: `name` must be lowercase ASCII letters, digits, or '-' (it becomes a command, a dotfile, and an env-var prefix)"
+        "product.toml: `name` must be lowercase ASCII letters, digits, or '-' \
+         (it becomes a command, a dotfile, and an env-var prefix)"
     );
     println!("cargo:rustc-env=PRODUCT_NAME={name}");
     println!(

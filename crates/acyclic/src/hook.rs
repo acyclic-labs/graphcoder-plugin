@@ -52,7 +52,7 @@ impl Payload {
     fn tool(&mut self) -> Option<String> {
         self.tool_name
             .take()
-            .or_else(|| self.command.take().map(|_| "Bash".to_string()))
+            .or_else(|| self.command.take().map(|_| "Bash".to_owned()))
     }
 }
 
@@ -61,21 +61,67 @@ impl Payload {
 /// just labeled by enqueue order rather than a strict barrier.
 const PRE_TOOL_WAIT: Duration = Duration::from_millis(2_000);
 
+/// The lifecycle events a host adapter wires `acyclic hook <event>` to.
+/// The CLI argument form (`pre-tool`, ...) is what the adapters write into
+/// hook config, so it is derived here rather than spelled in `install.rs`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookEvent {
+    PreTool,
+    PostTool,
+    UserPrompt,
+    SessionStart,
+    SessionEnd,
+}
+
+impl HookEvent {
+    pub const ALL: [Self; 5] = [
+        Self::PreTool,
+        Self::PostTool,
+        Self::UserPrompt,
+        Self::SessionStart,
+        Self::SessionEnd,
+    ];
+
+    /// The argument as `acyclic hook` accepts it.
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::PreTool => "pre-tool",
+            Self::PostTool => "post-tool",
+            Self::UserPrompt => "user-prompt",
+            Self::SessionStart => "session-start",
+            Self::SessionEnd => "session-end",
+        }
+    }
+
+    /// Parsed here, not by clap: a config written by a newer or older
+    /// release may name an event this binary does not know, and clap's
+    /// usage error exits 2 — which Claude Code reads as "block the tool".
+    /// Unknown events must stay a silent exit 0 like every other hook path.
+    pub fn parse(arg: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|event| event.as_arg() == arg)
+    }
+}
+
 pub fn run(repo: &Path, event: &str) -> i32 {
+    let Some(event) = HookEvent::parse(event) else {
+        acyclic_engine::trace!("hook", "unknown event {event:?}: ignored");
+        return 0;
+    };
     // Reading stdin can't hang the agent: hosts close it after writing.
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let mut payload = parse_payload(&raw);
     let host = std::env::var("ACYCLIC_HOST").unwrap_or_else(|_| "claude-code".into());
 
-    let spawn = if event == "session-start" {
+    let spawn = if event == HookEvent::SessionStart {
         Spawn::Allowed
     } else {
         Spawn::Never
     };
     acyclic_engine::trace!(
         "hook",
-        "event {event}: daemon spawn {}; pre-tool waits (bounded), post-tool enqueues (ack before capture)",
+        "event {}: daemon spawn {}; pre-tool waits (bounded), post-tool enqueues (ack before capture)",
+        event.as_arg(),
         if matches!(spawn, Spawn::Allowed) { "allowed" } else { "never" }
     );
     let Ok(mut client) = connect(repo, spawn) else {
@@ -85,8 +131,8 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     };
 
     let op = match event {
-        "pre-tool" => proto::Op::Checkpoint {
-            kind: "pre".into(),
+        HookEvent::PreTool => proto::Op::Checkpoint {
+            kind: proto::CheckpointRequestKind::Pre,
             session_id: payload.session(),
             tool_call_id: payload.tool_use_id.take(),
             tool_name: payload.tool(),
@@ -94,8 +140,8 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             wait: true,
             durable: false,
         },
-        "post-tool" => proto::Op::Checkpoint {
-            kind: "post".into(),
+        HookEvent::PostTool => proto::Op::Checkpoint {
+            kind: proto::CheckpointRequestKind::Post,
             session_id: payload.session(),
             tool_call_id: payload.tool_use_id.take(),
             tool_name: payload.tool(),
@@ -103,11 +149,11 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             wait: false,
             durable: false,
         },
-        "user-prompt" => proto::Op::TurnStart {
+        HookEvent::UserPrompt => proto::Op::TurnStart {
             session_id: payload.session().unwrap_or_default(),
             prompt: payload.prompt.unwrap_or_default(),
         },
-        "session-start" => {
+        HookEvent::SessionStart => {
             let session_id = payload.session().unwrap_or_default();
             let registered = client.call(proto::Op::SessionStart {
                 session_id: session_id.clone(),
@@ -131,28 +177,23 @@ pub fn run(repo: &Path, event: &str) -> i32 {
             }
             return 0;
         }
-        "session-end" => proto::Op::SessionEnd {
+        HookEvent::SessionEnd => proto::Op::SessionEnd {
             session_id: payload.session().unwrap_or_default(),
         },
-        other => {
-            eprintln!("{NAME} hook: unknown event {other:?}");
-            return 0;
-        }
     };
 
-    let bounded = matches!(event, "pre-tool");
-    if bounded {
+    if event == HookEvent::PreTool {
         client.set_deadline(PRE_TOOL_WAIT);
     }
     if let Err(message) = client.call(op) {
         // Deadline overruns and daemon hiccups are advisory only.
-        eprintln!("{NAME} hook ({event}): {message}");
+        eprintln!("{NAME} hook ({}): {message}", event.as_arg());
     }
     // Cursor's permission-controlled hooks (beforeShellExecution,
     // beforeSubmitPrompt) require a JSON response on stdout. Claude Code
     // injects UserPromptSubmit stdout into the conversation as context, so
     // this must stay Cursor-only rather than firing for every host.
-    if host == "cursor" && (event == "pre-tool" || event == "user-prompt") {
+    if host == "cursor" && matches!(event, HookEvent::PreTool | HookEvent::UserPrompt) {
         println!("{{\"permission\":\"allow\"}}");
     }
     0
@@ -205,14 +246,14 @@ mod tests {
                 "hook_event_name":"beforeShellExecution"}"#,
         );
         assert_eq!(payload.session_id, None);
-        assert_eq!(payload.session(), Some("c1".to_string()));
-        assert_eq!(payload.tool(), Some("Bash".to_string()));
+        assert_eq!(payload.session(), Some("c1".to_owned()));
+        assert_eq!(payload.tool(), Some("Bash".to_owned()));
     }
 
     #[test]
     fn session_prefers_session_id_over_conversation_id() {
         let mut payload = parse_payload(r#"{"session_id":"s1","conversation_id":"c1"}"#);
-        assert_eq!(payload.session(), Some("s1".to_string()));
+        assert_eq!(payload.session(), Some("s1".to_owned()));
     }
 
     #[test]

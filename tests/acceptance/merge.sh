@@ -304,7 +304,8 @@ promote_ok "$A" G19 >/dev/null
 OUT="$(promote_refused "$B" G19)"
 echo "$OUT" | grep -q 'new.txt: 1 conflicting hunk(s)' || fail "G19: add/add must conflict: $OUT"
 [ "$(cat "$R/new.txt")" = "A made it" ] || fail "G19: mainline touched"
-[ "$(cat "$(fork_path "$B")/new.txt")" = "$(printf '<<<<<<< fork %s\nB made it\n||||||| original\n=======\nA made it\n>>>>>>> mainline' "$B")" ] || fail "G19: empty original block expected: $(cat "$(fork_path "$B")/new.txt")"
+[ "$(cat "$(fork_path "$B")/new.txt")" = "$(printf '<<<<<<< fork %s\nB made it\n||||||| original\n=======\nA made it\n>>>>>>> mainline' "$B")" ] \
+  || fail "G19: empty original block expected: $(cat "$(fork_path "$B")/new.txt")"
 acy fork-drop "$B" >/dev/null
 
 # --- G20: both sides add different files under one NEW directory: lands -----
@@ -426,7 +427,8 @@ acy forks | grep -q 'no live forks' || fail "G27: fork consumed"
 GEN="$(echo "$OUT" | sed -n 's/.*tree now at \([0-9a-f]*\).*/\1/p')"
 [ -n "$GEN" ] || fail "G27: no generation in promote output: $OUT"
 BASE_ROW="$(acy timeline | awk '/G27 base/{print $1; exit}' | tr -d '#')"
-D="$(acy diff "$BASE_ROW" "$GEN")" || fail "G27: diff must accept a generation hex prefix: $D"
+D="$(acy diff "$BASE_ROW" "$GEN" 2>&1)" || fail "G27: diff must accept a generation hex prefix (base #$BASE_ROW, gen $GEN): $D
+$(acy timeline --limit 8 2>&1)"
 echo "$D" | grep -q '^M src/nine.js$' || fail "G27: diff content: $D"
 echo "$D" | grep -q '^M src/__pycache__/m.pyc  (gitignored)$' || fail "G27: ignored paths must be marked: $D"
 echo "$D" | grep -q '^M .env  (gitignored)$' || fail "G27: .env must be marked: $D"
@@ -452,4 +454,7 @@ echo "$OUT" | grep -q 'kept the mainline.s copy of 1 gitignored path(s)' || fail
 cmp -s "$(fork_path "$B")/src/__pycache__/m.pyc" <(printf 'PYC-AA\000\n') || fail "G27: rebase must give the fork the mainline's artifact"
 acy fork-drop "$B" >/dev/null
 
-pass "merge ($MODE mode): disjoint forks replay, same-file edits merge by line, same-line/modify-delete/add-add conflicts rebase the fork with diff3 markers and resolve-then-promote lands, binary/kind/ancestry overlaps are refused leaving the fork untouched, merges are undoable, CRLF survives, all-or-nothing holds, gitignored artifacts never block"
+pass "merge ($MODE mode): disjoint forks replay, same-file edits merge by line," \
+  "same-line/modify-delete/add-add conflicts rebase the fork with diff3 markers and resolve-then-promote lands," \
+  "binary/kind/ancestry overlaps are refused leaving the fork untouched, merges are undoable, CRLF survives," \
+  "all-or-nothing holds, gitignored artifacts never block"

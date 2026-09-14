@@ -110,7 +110,10 @@ seed_project
 acy init >/dev/null || fail "S1: init"
 acy install claude-code >/dev/null || fail "S1: install"
 
-S1_PROMPT='/fork fan_out=3 test_command="python3 -m unittest discover -s tests" Implement slugify, word_count, and truncate in src/textkit.py so tests/test_textkit.py passes, and replace each function'"'"'s TODO bullet in README.md with a one-line description of what it does. Treat the three functions as independent parts.'
+S1_PROMPT='/fork fan_out=3 test_command="python3 -m unittest discover -s tests" '
+S1_PROMPT+='Implement slugify, word_count, and truncate in src/textkit.py so tests/test_textkit.py passes, '
+S1_PROMPT+='and replace each function'"'"'s TODO bullet in README.md with a one-line description of what it does. '
+S1_PROMPT+='Treat the three functions as independent parts.'
 SID="$(run_claude "$S1_PROMPT")"
 [ -n "$SID" ] || fail "S1: no session id"
 
@@ -160,7 +163,12 @@ echo "$OUT" | grep -q 'src/textkit.py: 1 conflicting hunk(s)' || fail "S2: confl
 BP="$(fork_path "$B")"
 grep -q '^<<<<<<< fork ' "$BP/src/textkit.py" || fail "S2: markers not in the fork"
 
-S2_PROMPT="Fork $B of this repository lives at $BP. Its last \`acyclic promote $B\` reported a merge conflict and wrote diff3 conflict markers into $BP/src/textkit.py. Resolve that conflict in the fork so the module docstring reads exactly: \"\"\"textkit: tiny text utilities (slug support, count support).\"\"\" and no <<<<<<<, |||||||, ======= or >>>>>>> lines remain. Edit only that file inside the fork directory, do not touch the real repository files, then run exactly: acyclic promote $B. Report the promote command's output verbatim."
+S2_PROMPT="Fork $B of this repository lives at $BP. Its last \`acyclic promote $B\` reported a merge conflict "
+S2_PROMPT+="and wrote diff3 conflict markers into $BP/src/textkit.py. Resolve that conflict in the fork so the module "
+S2_PROMPT+="docstring reads exactly: \"\"\"textkit: tiny text utilities (slug support, count support).\"\"\" "
+S2_PROMPT+="and no <<<<<<<, |||||||, ======= or >>>>>>> lines remain. Edit only that file inside the fork directory, "
+S2_PROMPT+="do not touch the real repository files, then run exactly: acyclic promote $B. "
+S2_PROMPT+="Report the promote command's output verbatim."
 SID2="$(run_claude "$S2_PROMPT")"
 [ -n "$SID2" ] || fail "S2: no session id"
 

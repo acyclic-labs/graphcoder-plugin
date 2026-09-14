@@ -1,4 +1,4 @@
-//! Checkpoint metadata index: SQLite, WAL, owned by the daemon.
+//! Checkpoint metadata index: `SQLite`, WAL, owned by the daemon.
 //!
 //! This is plugin-domain data (sessions, tool calls, labels) — never derived
 //! from fs authority replay. The `published` flag records whether an authority
@@ -84,6 +84,9 @@ pub enum CheckpointKind {
     Recovered,
     Failed,
     Noop,
+    /// Taken by the idle timer, not any request: the safety net for hosts
+    /// with no lifecycle-hook API (see `Pipeline::auto_checkpoint`).
+    Auto,
 }
 
 impl CheckpointKind {
@@ -97,6 +100,7 @@ impl CheckpointKind {
             Self::Recovered => "recovered",
             Self::Failed => "failed",
             Self::Noop => "noop",
+            Self::Auto => "auto",
         }
     }
 
@@ -110,6 +114,7 @@ impl CheckpointKind {
             "recovered" => Self::Recovered,
             "failed" => Self::Failed,
             "noop" => Self::Noop,
+            "auto" => Self::Auto,
             other => {
                 return Err(EngineError::Store(format!(
                     "unknown checkpoint kind {other}"
@@ -159,7 +164,7 @@ impl Index {
                 generation BLOB NOT NULL,
                 created_at INTEGER NOT NULL,
                 kind TEXT NOT NULL CHECK(kind IN
-                  ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop')),
+                  ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop','auto')),
                 published INTEGER NOT NULL DEFAULT 0,
                 session_id TEXT,
                 tool_call_id TEXT,
@@ -180,6 +185,9 @@ impl Index {
         // Launch 2 columns on a Launch 1 database: additive migration.
         add_column_if_missing(&connection, "checkpoints", "turn", "INTEGER")?;
         add_column_if_missing(&connection, "checkpoints", "rewind_target", "INTEGER")?;
+        // `auto` checkpoints (idle-timer safety net) on a database created
+        // before that kind existed: its CHECK constraint predates 'auto'.
+        ensure_auto_kind_allowed(&connection)?;
         Ok(Self { connection })
     }
 
@@ -275,7 +283,7 @@ impl Index {
             [],
             |row| row.get(0),
         )?;
-        Ok(count as u64)
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     pub fn by_id(&self, id: i64) -> Result<Option<CheckpointRow>> {
@@ -293,13 +301,13 @@ impl Index {
     }
 
     /// Most recent checkpoint a user would rewind to: real snapshots only,
-    /// skipping bookkeeping rows (noop, pre_rewind, recovered, failed).
+    /// skipping bookkeeping rows (noop, `pre_rewind`, recovered, failed).
     pub fn latest_target(&self) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS}
-                 FROM checkpoints WHERE kind IN ('baseline','pre','post','manual')
+                 FROM checkpoints WHERE kind IN ('baseline','pre','post','manual','auto')
                  ORDER BY id DESC LIMIT 1"
                 ),
                 [],
@@ -316,7 +324,7 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                     WHERE id < ?1 AND kind IN ('baseline','pre','post','manual')
+                     WHERE id < ?1 AND kind IN ('baseline','pre','post','manual','auto')
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![id],
@@ -419,7 +427,7 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                     WHERE session_id = ?1 AND kind IN ('baseline','pre','post','manual')
+                     WHERE session_id = ?1 AND kind IN ('baseline','pre','post','manual','auto')
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![session_id],
@@ -448,7 +456,7 @@ impl Index {
     pub fn between(&self, after_id: i64, before_id: i64) -> Result<Vec<CheckpointRow>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-             WHERE id > ?1 AND id < ?2 AND kind IN ('baseline','pre','post','manual')
+             WHERE id > ?1 AND id < ?2 AND kind IN ('baseline','pre','post','manual','auto')
              ORDER BY id ASC"
         ))?;
         let rows = statement.query_map(params![after_id, before_id], row_to_checkpoint)?;
@@ -559,7 +567,7 @@ impl Index {
     }
 
     /// A turn or checkpoint for a session the daemon never saw start (its
-    /// SessionStart hook fired while the daemon was down) still gets a
+    /// `SessionStart` hook fired while the daemon was down) still gets a
     /// session row, so `sessions`, `diff --turn`, and `brief` can find it.
     /// The host is unknown at this point; a later `session_started` is
     /// ignored by the primary key, so the row keeps its earliest start.
@@ -585,7 +593,7 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow>
         rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Blob,
-            message.to_string().into(),
+            message.to_owned().into(),
         )
     };
     let generation_bytes: Vec<u8> = row.get(1)?;
@@ -668,6 +676,56 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// A database created before `auto` checkpoints existed has a `kind` CHECK
+/// constraint that predates that variant; `SQLite` has no `ALTER TABLE ...
+/// DROP/ADD CONSTRAINT`, so widening it means rebuilding the table. Detected
+/// via the stored `CREATE TABLE` text (idempotent: a no-op once rebuilt, and
+/// a no-op on a fresh database, whose `CREATE TABLE` already carries 'auto').
+fn ensure_auto_kind_allowed(connection: &Connection) -> Result<()> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("'auto'") {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE checkpoints RENAME TO checkpoints_pre_auto;
+         CREATE TABLE checkpoints(
+            id INTEGER PRIMARY KEY,
+            generation BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN
+              ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop','auto')),
+            published INTEGER NOT NULL DEFAULT 0,
+            session_id TEXT,
+            tool_call_id TEXT,
+            tool_name TEXT,
+            label TEXT,
+            error TEXT,
+            turn INTEGER,
+            rewind_target INTEGER);
+         INSERT INTO checkpoints
+           (id, generation, created_at, kind, published, session_id, tool_call_id,
+            tool_name, label, error, turn, rewind_target)
+         SELECT id, generation, created_at, kind, published, session_id, tool_call_id,
+                tool_name, label, error, turn, rewind_target
+         FROM checkpoints_pre_auto;
+         DROP TABLE checkpoints_pre_auto;
+         CREATE INDEX IF NOT EXISTS checkpoints_by_generation ON checkpoints(generation);
+         CREATE INDEX IF NOT EXISTS checkpoints_by_session ON checkpoints(session_id, id);
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 /// Bounded, single-line prompt excerpt: whitespace runs collapsed, cut on a
 /// char boundary at [`PROMPT_EXCERPT_BYTES`] with an ellipsis.
 pub fn excerpt(prompt: &str) -> String {
@@ -679,14 +737,11 @@ pub fn excerpt(prompt: &str) -> String {
     while !collapsed.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}…", &collapsed[..cut])
+    format!("{}…", collapsed.get(..cut).unwrap_or(&collapsed))
 }
 
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    crate::unix_now()
 }
 
 #[cfg(test)]
@@ -812,7 +867,7 @@ mod tests {
             .into_iter()
             .map(|s| s.session_id)
             .collect();
-        assert!(ids.contains(&"orphan".to_string()));
+        assert!(ids.contains(&"orphan".to_owned()));
 
         // A late session-start fills in the host without resetting the row.
         let started = index.sessions(10).expect("s")[0].started_at;
@@ -984,5 +1039,44 @@ mod tests {
         let row = index.latest().expect("q").expect("row");
         assert_eq!(row.turn, None);
         assert_eq!(row.rewind_target, None);
+    }
+
+    /// A database from before `auto` checkpoints existed has a `kind` CHECK
+    /// constraint that predates that variant. `Index::open` must widen it
+    /// (`SQLite` can't `ALTER ... DROP CONSTRAINT`, so this is a table
+    /// rebuild) without losing any existing row.
+    #[test]
+    fn pre_auto_kind_database_is_rebuilt_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE checkpoints(
+                        id INTEGER PRIMARY KEY, generation BLOB NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        kind TEXT NOT NULL CHECK(kind IN
+                          ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop')),
+                        published INTEGER NOT NULL DEFAULT 0, session_id TEXT,
+                        tool_call_id TEXT, tool_name TEXT, label TEXT, error TEXT,
+                        turn INTEGER, rewind_target INTEGER);
+                     INSERT INTO checkpoints(generation, created_at, kind)
+                        VALUES (zeroblob(32), 1, 'post');",
+                )
+                .expect("seed");
+        }
+        let mut index = Index::open(&path).expect("migrate");
+
+        // The pre-existing row survived the rebuild untouched.
+        let existing = index.latest().expect("q").expect("row");
+        assert_eq!(existing.kind, CheckpointKind::Post);
+
+        // The widened constraint now accepts 'auto'.
+        let row_id = index
+            .record(generation(1), CheckpointKind::Auto, &Attribution::default())
+            .expect("auto checkpoint should now be a valid kind");
+        let row = index.by_id(row_id).expect("q").expect("row");
+        assert_eq!(row.kind, CheckpointKind::Auto);
     }
 }

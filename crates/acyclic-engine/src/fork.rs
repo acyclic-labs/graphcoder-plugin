@@ -1,7 +1,7 @@
 //! Fork engine primitives (Launch 3).
 //!
 //! A fork is a writable overlay mount of a Head checkout: reads hydrate
-//! lazily from the store (O(1) creation, node_modules included), writes
+//! lazily from the store (O(1) creation, `node_modules` included), writes
 //! accumulate in that checkout's private overlay — invisible to the real
 //! tree and to every other fork. The pipeline mints fork checkouts (it owns
 //! the volume); the daemon owns the mount sessions (they must live in the
@@ -103,7 +103,8 @@ pub fn mount_setup_hint() -> &'static str {
             "Safe Mode (dry_run) needs mounts and refuses to start without them.",
         )
     } else {
-        "native mounts are not supported on this platform; forks use full copies and Safe Mode (dry_run) is unavailable."
+        "native mounts are not supported on this platform; forks use full copies \
+         and Safe Mode (dry_run) is unavailable."
     }
 }
 

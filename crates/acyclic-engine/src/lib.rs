@@ -10,6 +10,36 @@
 //! 2. All engine state (store, socket, index) lives outside the working tree.
 //! 3. Volume limits are raised at creation and the `VolumeId` is persisted.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )
+)]
+
+/// Seconds since the Unix epoch as the index stores them. Saturates rather
+/// than wrapping if the clock is somehow past `i64::MAX` seconds.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The first 12 hex digits of a generation id, as every listing prints it.
+/// A shorter (malformed) string is returned whole rather than panicking.
+pub fn short_hex(hex: &str) -> &str {
+    hex.get(..12).unwrap_or(hex)
+}
+
 pub mod config;
 pub mod diff;
 pub mod exclude;

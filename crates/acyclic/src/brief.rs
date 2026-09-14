@@ -1,6 +1,6 @@
 //! Renders the previous-session brief as agent-readable text.
 //!
-//! Budget: under 1KB, always. The SessionStart hook prints this into the
+//! Budget: under 1KB, always. The `SessionStart` hook prints this into the
 //! agent's context on every session start, so it must earn its bytes: where
 //! the last session ended, what it changed, which branches it abandoned, and
 //! the verbs that reach the rest.
@@ -13,12 +13,12 @@ pub const BUDGET_BYTES: usize = 1000;
 
 pub fn render(info: &proto::BriefInfo) -> String {
     let Some(session) = &info.session else {
-        return "{NAME}: no previous session on record for this repo.\n".to_string();
+        return format!("{NAME}: no previous session on record for this repo.\n");
     };
     let mut lines = Vec::new();
     let ended = match session.ended_at {
         Some(at) => format!("ended {}", age(at)),
-        None => "did not end cleanly".to_string(),
+        None => "did not end cleanly".to_owned(),
     };
     let end = match session.end_checkpoint {
         Some(id) => format!(" at checkpoint #{id}"),
@@ -41,7 +41,8 @@ pub fn render(info: &proto::BriefInfo) -> String {
     let sample = if session.sample_paths.is_empty() {
         String::new()
     } else {
-        let more = session.files_changed as usize > session.sample_paths.len();
+        let listed = u64::try_from(session.sample_paths.len()).unwrap_or(u64::MAX);
+        let more = session.files_changed > listed;
         format!(
             " ({}{})",
             session.sample_paths.join(", "),
@@ -53,7 +54,7 @@ pub fn render(info: &proto::BriefInfo) -> String {
         session.turns, session.checkpoints, session.files_changed
     ));
     if session.abandoned.is_empty() {
-        lines.push("  no abandoned branches.".to_string());
+        lines.push("  no abandoned branches.".to_owned());
     } else {
         lines.push(format!(
             "  {} abandoned branch(es):",
@@ -84,13 +85,12 @@ pub fn render(info: &proto::BriefInfo) -> String {
             info.drift_files
         ));
     } else {
-        lines.push("  tree unchanged since then.".to_string());
+        lines.push("  tree unchanged since then.".to_owned());
     }
-    lines.push(
+    lines.push(format!(
         "  verbs: {NAME} turns · timeline · diff --turn N · show <id> · \
          restore <id> <path> · rewind <id>"
-            .to_string(),
-    );
+    ));
     fit(lines)
 }
 
@@ -101,8 +101,11 @@ fn fit(mut lines: Vec<String>) -> String {
     let total = |lines: &[String]| lines.iter().map(|line| line.len() + 1).sum::<usize>();
     while total(&lines) > BUDGET_BYTES && lines.len() > 4 {
         // Remove the last branch line (index len-3: before drift and verbs).
-        let branch_index = lines.len() - 3;
-        if lines[branch_index].starts_with("    #") {
+        let branch_index = lines.len().saturating_sub(3);
+        if lines
+            .get(branch_index)
+            .is_some_and(|line| line.starts_with("    #"))
+        {
             lines.remove(branch_index);
             let listed = lines
                 .iter()
@@ -141,7 +144,7 @@ pub fn quote(prompt: &str, max: usize) -> String {
     while cut > 0 && !collapsed.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("\"{}…\"", &collapsed[..cut])
+    format!("\"{}…\"", collapsed.get(..cut).unwrap_or(&collapsed))
 }
 
 fn short(session_id: &str) -> String {
@@ -153,11 +156,7 @@ fn short(session_id: &str) -> String {
 }
 
 fn age(at: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    let delta = (now - at).max(0);
+    let delta = (acyclic_engine::unix_now() - at).max(0);
     if delta < 60 {
         format!("{delta}s ago")
     } else if delta < 3600 {
