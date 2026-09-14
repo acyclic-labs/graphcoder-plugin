@@ -7,6 +7,18 @@
 //!
 //! Exit code 0 = round-trip verified identical; 1 = mismatches or engine failure.
 
+#![allow(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::panic,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "qualification harness, not shipped: a bad invocation or a broken \
+              invariant should crash with its message rather than be handled"
+)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;

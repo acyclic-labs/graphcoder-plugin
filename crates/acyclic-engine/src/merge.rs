@@ -142,7 +142,9 @@ pub fn conflict_hunks(content: &str) -> u32 {
     content
         .lines()
         .filter(|line| line.starts_with("<<<<<<< "))
-        .count() as u32
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +241,7 @@ fn text_gate<'a>(bytes: &'a [u8], limits: &MergeLimits) -> std::result::Result<&
     if bytes.len() as u64 > limits.max_file_bytes {
         return Err(Reason::TooLarge);
     }
-    if bytes[..bytes.len().min(BINARY_PROBE_BYTES)].contains(&0) {
+    if bytes.iter().take(BINARY_PROBE_BYTES).any(|byte| *byte == 0) {
         return Err(Reason::Binary);
     }
     std::str::from_utf8(bytes).map_err(|_| Reason::Binary)
@@ -696,7 +698,7 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
     };
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
-    let mut out = Vec::with_capacity(length as usize);
+    let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
     let mut offset = 0;
     while offset < length {
         let take = chunk.min(length - offset);
@@ -849,7 +851,7 @@ async fn ensure_parents(
     let limits = dst.volume_config().limits;
     let components = namespace.components();
     for depth in 1..components.len() {
-        let parent = NamespacePath::new(components[..depth].to_vec(), limits)
+        let parent = NamespacePath::new(components.iter().take(depth).cloned().collect(), limits)
             .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?;
         let lookup = dst
             .lookup_no_follow(&parent, WorkCounters::UNBOUNDED, cancel)
@@ -1038,7 +1040,7 @@ async fn read_regular_ns(
     };
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
-    let mut out = Vec::with_capacity(length as usize);
+    let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
     let mut offset = 0;
     while offset < length {
         let take = chunk.min(length - offset);

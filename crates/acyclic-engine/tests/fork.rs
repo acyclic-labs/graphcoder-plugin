@@ -1,6 +1,14 @@
 //! P-series fork tests (spec: docs/design/spec-forks.md) — promote logic proven
 //! WITHOUT mounts: fork overlays are written through the SDK directly, so
 //! these run even while the native mount layer is being reworked.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "test code: a failed expectation should panic with its message"
+)]
 
 use std::path::Path;
 use std::sync::Arc;

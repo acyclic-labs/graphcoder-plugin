@@ -130,7 +130,7 @@ impl McpServer {
         let reply = call(
             &mut client,
             proto::Op::Checkpoint {
-                kind: "manual".into(),
+                kind: proto::CheckpointRequestKind::Manual,
                 session_id: None,
                 tool_call_id: None,
                 tool_name: None,
@@ -295,8 +295,8 @@ impl McpServer {
             let proto::Reply::Restore(info) = reply else {
                 return Err(internal_error("unexpected reply".into()));
             };
-            match info.action.as_str() {
-                "removed" => lines.push(format!(
+            match info.action {
+                proto::RestoreAction::Removed => lines.push(format!(
                     "{}: absent at #{}, removed",
                     info.path, info.checkpoint
                 )),

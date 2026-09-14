@@ -616,6 +616,10 @@ fn strip_root_hints(batch: WatchBatch) -> (WatchBatch, RootHint) {
 ///
 /// If the OS refuses to create the thread or tokio its runtime: nothing
 /// else in the daemon can run without the pipeline, so this is fatal.
+#[allow(
+    clippy::expect_used,
+    reason = "documented above: a daemon without its pipeline thread cannot serve anything"
+)]
 pub fn spawn(
     store: Store,
     index: Index,

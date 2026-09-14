@@ -1,4 +1,12 @@
 //! End-to-end pipeline test: init → checkpoints → diff → rewind → verify.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "test code: a failed expectation should panic with its message"
+)]
 
 use std::path::Path;
 use std::time::Duration;

@@ -663,6 +663,10 @@ fn prune_trash(trash_root: &Path, ttl_days: u32) {
 
 /// Atomically exchanges two directories on the same filesystem.
 #[cfg(target_os = "macos")]
+#[allow(
+    unsafe_code,
+    reason = "renamex_np over two live NUL-terminated paths; RENAME_SWAP is atomic on APFS"
+)]
 fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
@@ -683,6 +687,10 @@ fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(
+    unsafe_code,
+    reason = "renameat2 over two live NUL-terminated paths; RENAME_EXCHANGE is atomic where supported"
+)]
 fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())

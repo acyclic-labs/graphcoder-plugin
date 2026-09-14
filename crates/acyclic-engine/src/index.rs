@@ -283,7 +283,7 @@ impl Index {
             [],
             |row| row.get(0),
         )?;
-        Ok(count as u64)
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     pub fn by_id(&self, id: i64) -> Result<Option<CheckpointRow>> {
@@ -737,13 +737,11 @@ pub fn excerpt(prompt: &str) -> String {
     while !collapsed.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}…", &collapsed[..cut])
+    format!("{}…", collapsed.get(..cut).unwrap_or(&collapsed))
 }
 
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    crate::unix_now()
 }
 
 #[cfg(test)]

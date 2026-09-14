@@ -63,6 +63,23 @@ guards what those can't express. The rules, and why each exists:
   matches.** Copy-pasted arms were the recurring review finding — the lints catch the next one.
 - **No `todo!`, `unimplemented!`, or `dbg!` in committed code.** Open work is a `TODO(topic):`
   comment (the script rejects a bare `TODO`), so it names who or what it is waiting on.
+- **No hidden panics in non-test code.** `unwrap`, `expect`, `panic!`, `slice[i]`, and
+  `&text[a..b]` are lint errors outside tests (`clippy::unwrap_used`, `expect_used`, `panic`,
+  `indexing_slicing`, `string_slice`). Reach for `?`, `get`, `let ... else`, `starts_with`,
+  `saturating_sub`. The few documented exceptions (a build script failing the build, the
+  pipeline thread that nothing can run without) carry `#[allow(..., reason = "...")]`.
+- **No lossy `as` casts** between integer widths or signs (`cast_possible_truncation`,
+  `cast_sign_loss`, `cast_possible_wrap`, `cast_precision_loss`, `cast_lossless`). Use
+  `u64::from`, `i64::try_from(x).unwrap_or(i64::MAX)`, or an `allow` that says why the value
+  is in range. `acyclic_engine::unix_now()` and `short_hex()` exist so the two most common
+  cases are written once.
+- **Closed sets are enums, not strings.** Anything the CLI parses or the wire carries with a
+  fixed vocabulary — checkpoint kinds, hook events, host names, restore actions, diff change
+  kinds — is an enum (`clap::ValueEnum` on the CLI side, serde `rename_all = "snake_case"` on
+  the wire), so an unknown value is rejected at the boundary and a `match` on it is exhaustive.
+- **`unsafe` is opt-in per function.** `unsafe_code` is a warning; each block sits in a function
+  carrying `#[allow(unsafe_code, reason = "...")]` that names the invariant, so `grep allow(unsafe`
+  lists every one.
 - **Lines: 120 columns in Rust, 200 in shell.** rustfmt wraps code at 100 but leaves strings
   and comments alone; split long format strings with `\` continuations.
 - **Comment blocks under 30 lines.** A longer one is a design note (`docs/design/`) or a sign

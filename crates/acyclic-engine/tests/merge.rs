@@ -2,6 +2,14 @@
 //! the merge generation M, the rebase generation R, and writing R into a
 //! fork overlay. Nothing here touches the working tree except to move the
 //! mainline; the daemon owns landing.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "test code: a failed expectation should panic with its message"
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

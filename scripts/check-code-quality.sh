@@ -47,6 +47,7 @@ check_width 200 "shell" "$SHELL_FILES"
 #    carry a `TODO(topic)` somewhere on it, whether it opens one or refers
 #    to one.
 todo_hits="$(echo "$RUST_FILES $SHELL_FILES" | xargs grep -nE '^[[:space:]]*(//|#)' 2>/dev/null \
+  | grep -vE '^scripts/check-code-quality\.sh:' \
   | grep -E '\b(TODO|FIXME|XXX)\b' \
   | grep -vE '\b(TODO|FIXME)\([A-Za-z0-9/ -]+\)' || true)"
 if [ -n "$todo_hits" ]; then

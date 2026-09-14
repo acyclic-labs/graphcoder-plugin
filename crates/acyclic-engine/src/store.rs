@@ -48,7 +48,8 @@ impl StorePaths {
             .canonicalize()
             .map_err(|error| EngineError::Store(format!("canonicalize repo root: {error}")))?;
         let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
-        let short = &digest.to_hex()[..16];
+        let hex = digest.to_hex();
+        let short = hex.get(..16).unwrap_or(&hex);
         Ok(Self {
             root: base.join(short),
         })
@@ -263,6 +264,7 @@ impl Store {
 /// Deliberately NOT `std::env::temp_dir()`: that honors `TMPDIR`, which can
 /// be arbitrarily deep, and `sun_path` is capped (~104 bytes on macOS). The
 /// path must be short and identical across every process of this user.
+#[allow(unsafe_code, reason = "getuid() has no preconditions and cannot fail")]
 pub fn runtime_dir() -> PathBuf {
     #[cfg(unix)]
     let dir = {

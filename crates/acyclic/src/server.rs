@@ -269,7 +269,7 @@ impl Server {
                 wait,
                 durable,
             } => {
-                let kind = parse_kind(&kind)?;
+                let kind = engine_kind(kind);
                 let attribution = Attribution {
                     session_id,
                     tool_call_id,
@@ -294,7 +294,7 @@ impl Server {
                     Ok(proto::Reply::Checkpoint(proto::CheckpointInfo {
                         row_id: outcome.row_id,
                         generation: hex_generation(outcome.generation),
-                        kind: outcome.kind.as_str().to_owned(),
+                        kind: wire_kind(outcome.kind),
                     }))
                 } else {
                     // Enqueue-ack: the hook path. Admission into the FIFO
@@ -394,7 +394,7 @@ impl Server {
                     id: row.id,
                     generation: hex_generation(row.generation),
                     created_at: row.created_at,
-                    kind: row.kind.as_str().to_owned(),
+                    kind: wire_kind(row.kind),
                     published: row.published,
                     session_id: row.session_id,
                     host,
@@ -453,10 +453,9 @@ impl Server {
                     checkpoint: row_id,
                     path: outcome.path.display().to_string(),
                     action: match outcome.action {
-                        rewind::RestoreAction::Restored => "restored",
-                        rewind::RestoreAction::Removed => "removed",
-                    }
-                    .to_owned(),
+                        rewind::RestoreAction::Restored => proto::RestoreAction::Restored,
+                        rewind::RestoreAction::Removed => proto::RestoreAction::Removed,
+                    },
                     recorded_checkpoint,
                 }))
             }
@@ -1346,7 +1345,7 @@ impl Server {
                     rebased,
                     format!(
                         "fork {id} rebased onto {} ({} conflict(s))",
-                        &acyclic_engine::generation_hex(head)[..12],
+                        acyclic_engine::short_hex(&acyclic_engine::generation_hex(head)),
                         plan.conflicted.len()
                     ),
                 )
@@ -1448,7 +1447,7 @@ impl Server {
         Ok(Landed::Replayed {
             generation: landed.generation,
             paths: written,
-            merged: plan.merged.len() as u32,
+            merged: u32::try_from(plan.merged.len()).unwrap_or(u32::MAX),
             kept,
             moved,
         })
@@ -1671,7 +1670,7 @@ impl Server {
                     rewound_to: target,
                     turn,
                     prompt,
-                    checkpoints: branch.len() as i64,
+                    checkpoints: i64::try_from(branch.len()).unwrap_or(i64::MAX),
                     files_changed: files,
                 });
             }
@@ -1747,9 +1746,7 @@ fn short_id() -> String {
 }
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    acyclic_engine::unix_now()
 }
 
 /// How a fork ended up in the real tree.
@@ -1831,13 +1828,28 @@ fn stringify(error: EngineError) -> String {
     error.to_string()
 }
 
-fn parse_kind(kind: &str) -> Result<CheckpointKind, String> {
-    Ok(match kind {
-        "pre" => CheckpointKind::Pre,
-        "post" => CheckpointKind::Post,
-        "manual" => CheckpointKind::Manual,
-        other => return Err(format!("unknown checkpoint kind {other:?}")),
-    })
+/// A request kind is a strict subset of the engine's kinds: the wire type
+/// can't name `baseline`, `noop`, or the other daemon-decided ones.
+fn engine_kind(kind: proto::CheckpointRequestKind) -> CheckpointKind {
+    match kind {
+        proto::CheckpointRequestKind::Pre => CheckpointKind::Pre,
+        proto::CheckpointRequestKind::Post => CheckpointKind::Post,
+        proto::CheckpointRequestKind::Manual => CheckpointKind::Manual,
+    }
+}
+
+fn wire_kind(kind: CheckpointKind) -> proto::CheckpointKind {
+    match kind {
+        CheckpointKind::Baseline => proto::CheckpointKind::Baseline,
+        CheckpointKind::Pre => proto::CheckpointKind::Pre,
+        CheckpointKind::Post => proto::CheckpointKind::Post,
+        CheckpointKind::Manual => proto::CheckpointKind::Manual,
+        CheckpointKind::PreRewind => proto::CheckpointKind::PreRewind,
+        CheckpointKind::Recovered => proto::CheckpointKind::Recovered,
+        CheckpointKind::Failed => proto::CheckpointKind::Failed,
+        CheckpointKind::Noop => proto::CheckpointKind::Noop,
+        CheckpointKind::Auto => proto::CheckpointKind::Auto,
+    }
 }
 
 #[allow(
@@ -1848,12 +1860,11 @@ fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
     proto::DiffEntry {
         path: change.path.display().to_string(),
         change: match change.change {
-            acyclic_engine::diff::ChangeKind::Added => "added",
-            acyclic_engine::diff::ChangeKind::Removed => "removed",
-            acyclic_engine::diff::ChangeKind::Modified => "modified",
-            acyclic_engine::diff::ChangeKind::MetadataOnly => "metadata",
-        }
-        .to_owned(),
+            acyclic_engine::diff::ChangeKind::Added => proto::ChangeKind::Added,
+            acyclic_engine::diff::ChangeKind::Removed => proto::ChangeKind::Removed,
+            acyclic_engine::diff::ChangeKind::Modified => proto::ChangeKind::Modified,
+            acyclic_engine::diff::ChangeKind::MetadataOnly => proto::ChangeKind::Metadata,
+        },
         file_kind: format!("{:?}", change.file_kind).to_lowercase(),
         ignored: false,
     }
@@ -1863,7 +1874,7 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     proto::TimelineEntry {
         id: row.id,
         created_at: row.created_at,
-        kind: row.kind.as_str().to_owned(),
+        kind: wire_kind(row.kind),
         published: row.published,
         session_id: row.session_id,
         tool_name: row.tool_name,

@@ -20,78 +20,27 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-trait HostAdapter {
-    fn id(&self) -> &'static str;
-    fn install(&self, repo: &Path) -> Result<(), String>;
-}
+use crate::hook::HookEvent;
 
-struct ClaudeCode;
-struct Codex;
-struct Cursor;
-struct AgentsMd;
-
-impl HostAdapter for ClaudeCode {
-    fn id(&self) -> &'static str {
-        "claude-code"
-    }
-    fn install(&self, repo: &Path) -> Result<(), String> {
-        claude_code(repo)
-    }
-}
-
-impl HostAdapter for Codex {
-    fn id(&self) -> &'static str {
-        "codex"
-    }
-    fn install(&self, repo: &Path) -> Result<(), String> {
-        codex(repo)
-    }
-}
-
-impl HostAdapter for Cursor {
-    fn id(&self) -> &'static str {
-        "cursor"
-    }
-    fn install(&self, repo: &Path) -> Result<(), String> {
-        cursor(repo)
-    }
-}
-
-impl HostAdapter for AgentsMd {
-    fn id(&self) -> &'static str {
-        "agents-md"
-    }
-    fn install(&self, repo: &Path) -> Result<(), String> {
-        agents_md(repo)
-    }
-}
-
-struct ClaudeDesktop;
-
-impl HostAdapter for ClaudeDesktop {
-    fn id(&self) -> &'static str {
-        "claude-desktop"
-    }
-    fn install(&self, repo: &Path) -> Result<(), String> {
-        claude_desktop(repo)
-    }
-}
-
-struct VsCode;
-
-impl HostAdapter for VsCode {
-    fn id(&self) -> &'static str {
-        "vscode"
-    }
-    fn install(&self, repo: &Path) -> Result<(), String> {
-        vscode(repo)
-    }
+/// Every host `acyclic install` knows. The CLI parses the kebab-case name
+/// (`claude-code`, `agents-md`, ...) and rejects anything else before this
+/// module sees it; the match in `run` is exhaustive, so adding a variant
+/// without an installer is a compile error, not a runtime "unknown host".
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum Host {
+    ClaudeCode,
+    Codex,
+    Cursor,
+    AgentsMd,
+    ClaudeDesktop,
+    #[value(name = "vscode")]
+    VsCode,
 }
 
 // TODO(more hosts): the two shapes this file already covers — lifecycle
 // hooks (claude_code/codex/cursor) and MCP registration
 // (claude_desktop/cursor/vscode) — generalize to most other coding-agent
-// CLIs and desktop apps, not just the five above. Before adding one:
+// CLIs and desktop apps, not just the ones below. Before adding one:
 // 1. Find its hook config (file, event names, payload shape) and/or its MCP
 //    config (file location, JSON vs TOML, top-level key, whether `type` is
 //    explicit) from its own current docs — don't assume it matches an
@@ -99,7 +48,8 @@ impl HostAdapter for VsCode {
 //    both the key name and the explicit-type requirement.
 // 2. Prefer the MCP path when the config is JSON-shaped and matches (or is
 //    close to) `McpConfigShape` — reuse `merge_mcp_server_json`, add a
-//    shape constant and a `HostAdapter` impl, the same pattern as `vscode`.
+//    shape constant, a `Host` variant, and its arm in `run`, the same
+//    pattern as `vscode`.
 // 3. Write the merge, add a unit test seeding an existing config to prove
 //    other entries survive and a second install is idempotent (see
 //    `vscode_install_writes_project_scoped_mcp_config`), then verify against
@@ -113,31 +63,15 @@ impl HostAdapter for VsCode {
 //   unresearched. Likely MCP-capable (most 2026-era agent tools are) but
 //   config location/shape unverified — do not assume any of them match
 //   Claude Desktop/Cursor's shape without checking.
-fn adapters() -> Vec<Box<dyn HostAdapter>> {
-    vec![
-        Box::new(ClaudeCode),
-        Box::new(Codex),
-        Box::new(Cursor),
-        Box::new(AgentsMd),
-        Box::new(ClaudeDesktop),
-        Box::new(VsCode),
-    ]
-}
-
-pub fn run(repo: &Path, host: &str) -> Result<(), String> {
-    let host = if host == "--agents-md" {
-        "agents-md"
-    } else {
-        host
-    };
-    adapters()
-        .into_iter()
-        .find(|adapter| adapter.id() == host)
-        .ok_or_else(|| {
-            let known: Vec<_> = adapters().iter().map(|adapter| adapter.id()).collect();
-            format!("unknown host {host:?} (expected {})", known.join(" | "))
-        })?
-        .install(repo)
+pub fn run(repo: &Path, host: Host) -> Result<(), String> {
+    match host {
+        Host::ClaudeCode => claude_code(repo),
+        Host::Codex => codex(repo),
+        Host::Cursor => cursor(repo),
+        Host::AgentsMd => agents_md(repo),
+        Host::ClaudeDesktop => claude_desktop(repo),
+        Host::VsCode => vscode(repo),
+    }
 }
 
 fn claude_code(repo: &Path) -> Result<(), String> {
@@ -194,7 +128,8 @@ fn claude_code(repo: &Path) -> Result<(), String> {
 /// through `ACYCLIC_HOST` so `session-start` records the right adapter and
 /// Cursor's permission-controlled hooks get their required JSON reply.
 fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] {
-    let cmd = |verb: &str| {
+    let cmd = |event: HookEvent| {
+        let verb = event.as_arg();
         if host == "claude-code" {
             format!("{NAME} hook {verb}")
         } else {
@@ -205,16 +140,16 @@ fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] 
         (
             "PreToolUse",
             Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            cmd("pre-tool"),
+            cmd(HookEvent::PreTool),
         ),
         (
             "PostToolUse",
             Some("Edit|Write|MultiEdit|NotebookEdit|Bash"),
-            cmd("post-tool"),
+            cmd(HookEvent::PostTool),
         ),
-        ("UserPromptSubmit", None, cmd("user-prompt")),
-        ("SessionStart", None, cmd("session-start")),
-        ("SessionEnd", None, cmd("session-end")),
+        ("UserPromptSubmit", None, cmd(HookEvent::UserPrompt)),
+        ("SessionStart", None, cmd(HookEvent::SessionStart)),
+        ("SessionEnd", None, cmd(HookEvent::SessionEnd)),
     ]
 }
 
@@ -259,8 +194,8 @@ fn merge_event_hooks(
         let mut entry = json!({
             "hooks": [{ "type": "command", "command": command }]
         });
-        if let Some(matcher) = matcher {
-            entry["matcher"] = json!(matcher);
+        if let (Some(matcher), Some(fields)) = (matcher, entry.as_object_mut()) {
+            fields.insert("matcher".to_owned(), json!(matcher));
         }
         entries.push(entry);
     }
@@ -387,15 +322,16 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
 
     // Cursor entries carry `command`/`type` directly (no nested `hooks`
     // array), so its own merge loop rather than `merge_event_hooks`.
-    let events: [(&str, &str); 6] = [
-        ("sessionStart", "session-start"),
-        ("sessionEnd", "session-end"),
-        ("beforeShellExecution", "pre-tool"),
-        ("afterShellExecution", "post-tool"),
-        ("afterFileEdit", "post-tool"),
-        ("beforeSubmitPrompt", "user-prompt"),
+    let events: [(&str, HookEvent); 6] = [
+        ("sessionStart", HookEvent::SessionStart),
+        ("sessionEnd", HookEvent::SessionEnd),
+        ("beforeShellExecution", HookEvent::PreTool),
+        ("afterShellExecution", HookEvent::PostTool),
+        ("afterFileEdit", HookEvent::PostTool),
+        ("beforeSubmitPrompt", HookEvent::UserPrompt),
     ];
-    for (event, verb) in events {
+    for (event, hook_event) in events {
+        let verb = hook_event.as_arg();
         let entries = hooks.entry(event).or_insert(json!([]));
         let entries = entries
             .as_array_mut()
@@ -477,8 +413,8 @@ fn merge_mcp_server_json(
         "command": exe.display().to_string(),
         "args": ["mcp", "--repo", repo.display().to_string()],
     });
-    if shape.explicit_stdio_type {
-        entry["type"] = json!("stdio");
+    if let (true, Some(fields)) = (shape.explicit_stdio_type, entry.as_object_mut()) {
+        fields.insert("type".to_owned(), json!("stdio"));
     }
     servers.insert(NAME.to_owned(), entry);
 
@@ -1097,18 +1033,42 @@ mod tests {
     }
 
     #[test]
-    fn run_dispatches_known_hosts_and_rejects_unknown() {
+    fn every_host_installs_into_a_fresh_repo() {
+        use clap::ValueEnum;
         // claude-desktop is exercised separately (below): its install writes
         // to a global, per-machine config path, not anything under `repo`.
-        for host in ["claude-code", "codex", "cursor", "agents-md", "vscode"] {
+        for host in Host::value_variants()
+            .iter()
+            .copied()
+            .filter(|host| *host != Host::ClaudeDesktop)
+        {
             let dir = tempfile::tempdir().expect("tempdir");
-            run(dir.path(), host).unwrap_or_else(|error| panic!("{host}: {error}"));
+            run(dir.path(), host).unwrap_or_else(|error| panic!("{host:?}: {error}"));
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = run(dir.path(), "jetbrains").expect_err("unknown host");
+    }
+
+    #[test]
+    fn host_names_are_the_documented_kebab_case_ids() {
+        use clap::ValueEnum;
+        let names: Vec<String> = Host::value_variants()
+            .iter()
+            .map(|host| {
+                host.to_possible_value()
+                    .expect("named")
+                    .get_name()
+                    .to_owned()
+            })
+            .collect();
         assert_eq!(
-            error,
-            "unknown host \"jetbrains\" (expected claude-code | codex | cursor | agents-md | claude-desktop | vscode)"
+            names,
+            [
+                "claude-code",
+                "codex",
+                "cursor",
+                "agents-md",
+                "claude-desktop",
+                "vscode"
+            ]
         );
     }
 

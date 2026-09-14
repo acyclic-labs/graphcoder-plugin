@@ -1,5 +1,9 @@
 //! Reads the repo-level `product.toml` and exposes its keys to the crate as
 //! compile-time environment variables (see `src/product.rs`).
+#![allow(
+    clippy::panic,
+    reason = "a build script reports a broken product.toml by failing the build"
+)]
 
 use std::path::Path;
 

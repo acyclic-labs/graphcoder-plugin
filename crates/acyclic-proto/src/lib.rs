@@ -3,9 +3,140 @@
 //! Transport: newline-delimited JSON over the store's unix socket. One
 //! request line yields exactly one response line with the same `id`.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The kinds a client may ask for. Bookkeeping kinds (`baseline`,
+/// `noop`, `auto`, ...) exist only on replies: the daemon decides those.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointRequestKind {
+    Pre,
+    Post,
+    Manual,
+}
+
+impl CheckpointRequestKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pre => "pre",
+            Self::Post => "post",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl FromStr for CheckpointRequestKind {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "pre" => Ok(Self::Pre),
+            "post" => Ok(Self::Post),
+            "manual" => Ok(Self::Manual),
+            other => Err(format!(
+                "unknown checkpoint kind {other:?} (pre | post | manual)"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for CheckpointRequestKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// Why a checkpoint row exists, as the timeline reports it. Mirrors the
+/// engine's `index::CheckpointKind`; the daemon converts between them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointKind {
+    Baseline,
+    Pre,
+    Post,
+    Manual,
+    PreRewind,
+    Recovered,
+    Failed,
+    Noop,
+    Auto,
+}
+
+impl CheckpointKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Pre => "pre",
+            Self::Post => "post",
+            Self::Manual => "manual",
+            Self::PreRewind => "pre_rewind",
+            Self::Recovered => "recovered",
+            Self::Failed => "failed",
+            Self::Noop => "noop",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for CheckpointKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// What a single-path restore did to the path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreAction {
+    /// The path now has the checkpoint's contents.
+    Restored,
+    /// The path was absent at the checkpoint, so it was removed.
+    Removed,
+}
+
+/// How a path differs between two checkpoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Modified,
+    /// Mode or other metadata only; contents are identical.
+    Metadata,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Modified => "modified",
+            Self::Metadata => "metadata",
+        }
+    }
+
+    /// The one-letter tag `diff` listings use: A / D / M, and `m` for
+    /// metadata-only, so real blast radius stands out from noise.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Removed => "D",
+            Self::Modified => "M",
+            Self::Metadata => "m",
+        }
+    }
+}
+
+impl fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -23,8 +154,7 @@ pub enum Op {
     Ping,
     Status,
     Checkpoint {
-        /// "pre" | "post" | "manual"
-        kind: String,
+        kind: CheckpointRequestKind,
         #[serde(default)]
         session_id: Option<String>,
         #[serde(default)]
@@ -304,14 +434,14 @@ pub struct StatusInfo {
 pub struct CheckpointInfo {
     pub row_id: i64,
     pub generation: String,
-    pub kind: String,
+    pub kind: CheckpointKind,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TimelineEntry {
     pub id: i64,
     pub created_at: i64,
-    pub kind: String,
+    pub kind: CheckpointKind,
     pub published: bool,
     pub session_id: Option<String>,
     pub tool_name: Option<String>,
@@ -347,7 +477,7 @@ pub struct InspectInfo {
     pub id: i64,
     pub generation: String,
     pub created_at: i64,
-    pub kind: String,
+    pub kind: CheckpointKind,
     pub published: bool,
     pub session_id: Option<String>,
     pub host: Option<String>,
@@ -375,8 +505,7 @@ pub struct SessionEntry {
 pub struct RestoreInfo {
     pub checkpoint: i64,
     pub path: String,
-    /// "restored" | "removed"
-    pub action: String,
+    pub action: RestoreAction,
     /// The `manual` checkpoint recording the tree after the restore.
     pub recorded_checkpoint: Option<i64>,
 }
@@ -433,8 +562,7 @@ pub struct RewindInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DiffEntry {
     pub path: String,
-    /// "added" | "removed" | "modified" | "metadata"
-    pub change: String,
+    pub change: ChangeKind,
     pub file_kind: String,
     /// Matched by the repo's `.gitignore` (caches, build output, secrets):
     /// shown, since rewind restores it, but not blast radius.

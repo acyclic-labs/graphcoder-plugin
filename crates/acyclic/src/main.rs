@@ -1,4 +1,17 @@
 //! `acyclic` — checkpoints, rewind, and blast-radius diff for agent sessions.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )
+)]
 
 mod brief;
 mod client;
@@ -10,6 +23,7 @@ mod server;
 use std::path::{Path, PathBuf};
 
 use acyclic_engine::product::{self, NAME};
+use acyclic_engine::short_hex;
 use acyclic_proto as proto;
 use clap::{Parser, Subcommand};
 
@@ -50,9 +64,9 @@ enum Command {
         /// Also publish to the durable authority (coarse boundary).
         #[arg(long)]
         durable: bool,
-        /// Checkpoint kind recorded in the timeline.
+        /// Checkpoint kind recorded in the timeline: pre | post | manual.
         #[arg(long, default_value = "manual")]
-        kind: String,
+        kind: proto::CheckpointRequestKind,
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long)]
@@ -155,13 +169,13 @@ enum Command {
     /// performs the matching engine action. Always exits 0 (never blocks the
     /// agent); a missing daemon is a silent no-op.
     Hook {
-        /// pre-tool | post-tool | user-prompt | session-start | session-end
-        event: String,
+        #[arg(value_enum)]
+        event: hook::HookEvent,
     },
     /// Wire a host's adapter into the current repo.
     Install {
-        /// claude-code | codex | cursor | agents-md | claude-desktop | vscode
-        host: String,
+        #[arg(value_enum)]
+        host: install::Host,
     },
     /// MCP stdio server: exposes checkpoint/timeline/rewind/diff/restore/
     /// turns/brief as tools for hosts that speak MCP (Claude Desktop, VS
@@ -193,6 +207,10 @@ enum Command {
     Daemon { repo_root: PathBuf },
 }
 
+#[allow(
+    unsafe_code,
+    reason = "restores SIGPIPE's default disposition; no handler runs, nothing is aliased"
+)]
 fn main() {
     let cli = Cli::parse();
     // CLI verbs behave like Unix tools when a pager/grep closes the pipe
@@ -261,7 +279,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         },
         Command::Init => init(repo),
         Command::Policy => policy(repo),
-        Command::Hook { event } => hook::run(repo, &event),
+        Command::Hook { event } => hook::run(repo, event),
         Command::Mcp => match mcp::run(repo.to_path_buf()) {
             Ok(()) => 0,
             Err(message) => {
@@ -269,7 +287,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                 1
             }
         },
-        Command::Install { host } => match install::run(repo, &host) {
+        Command::Install { host } => match install::run(repo, host) {
             Ok(()) => {
                 print_mount_capability();
                 0
@@ -417,10 +435,6 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             tool_call_id,
             tool_name,
         } => {
-            let kind = match kind.as_str() {
-                "pre" | "post" | "manual" => kind,
-                other => return Err(format!("unknown kind {other:?}")),
-            };
             let reply = client.call(proto::Op::Checkpoint {
                 kind,
                 session_id,
@@ -616,9 +630,13 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 let proto::Reply::Restore(info) = reply else {
                     return Err("unexpected reply".into());
                 };
-                match info.action.as_str() {
-                    "removed" => println!("{}: absent at #{}, removed", info.path, info.checkpoint),
-                    _ => println!("{}: restored from #{}", info.path, info.checkpoint),
+                match info.action {
+                    proto::RestoreAction::Removed => {
+                        println!("{}: absent at #{}, removed", info.path, info.checkpoint);
+                    }
+                    proto::RestoreAction::Restored => {
+                        println!("{}: restored from #{}", info.path, info.checkpoint);
+                    }
                 }
                 if let Some(recorded) = info.recorded_checkpoint {
                     println!("  recorded as checkpoint #{recorded}");
@@ -732,7 +750,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     entry.mode,
                     age(entry.created_at),
                     entry.path,
-                    &entry.base[..12]
+                    short_hex(&entry.base)
                 );
             }
             Ok(())
@@ -767,7 +785,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 report.push_str(&format!(
                     "Resolve the markers in {} and run `{NAME} promote {id}` again (the fork now sits on {})",
                     info.fork_path.as_deref().unwrap_or("the fork"),
-                    &info.generation[..12]
+                    short_hex(&info.generation)
                 ));
                 if !kept_note.is_empty() {
                     report.push('\n');
@@ -778,28 +796,31 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             print!("{kept_note}");
             match (info.old_tree, info.replayed_paths, info.merged_files) {
                 (Some(old_tree), _, _) => {
-                    println!("promoted: working tree now at {}", &info.generation[..12]);
+                    println!(
+                        "promoted: working tree now at {}",
+                        short_hex(&info.generation)
+                    );
                     println!("old tree kept at {old_tree}");
                     println!("note: {}", info.warning);
                 }
                 (None, paths, merged) if merged > 0 => {
                     println!(
                         "promoted by merge: {merged} file(s) merged, {paths} path(s) written in place, tree now at {}",
-                        &info.generation[..12]
+                        short_hex(&info.generation)
                     );
                     println!("note: {}", info.warning);
                 }
                 (None, paths, _) if paths > 0 && info.mainline_moved => {
                     println!(
                         "promoted by replay: {paths} path(s) written in place, tree now at {}",
-                        &info.generation[..12]
+                        short_hex(&info.generation)
                     );
                     println!("note: {}", info.warning);
                 }
                 (None, paths, _) if paths > 0 => {
                     println!(
                         "promoted: {paths} path(s) written in place, tree now at {}",
-                        &info.generation[..12]
+                        short_hex(&info.generation)
                     );
                 }
                 (None, _, _) => println!("fork had no changes; nothing to land"),
@@ -869,13 +890,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 return Ok(());
             }
             for entry in &info.diff {
-                let tag = match entry.change.as_str() {
-                    "added" => "A",
-                    "removed" => "D",
-                    "modified" => "M",
-                    _ => "m",
-                };
-                println!("{tag} {}", entry.path);
+                println!("{} {}", entry.change.tag(), entry.path);
             }
             println!(
                 "{} paths changed; run `{NAME} session-apply {}` to land them or \
@@ -893,7 +908,10 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             };
             match info.old_tree {
                 Some(old_tree) => {
-                    println!("applied: working tree now at {}", &info.generation[..12]);
+                    println!(
+                        "applied: working tree now at {}",
+                        short_hex(&info.generation)
+                    );
                     println!("old tree kept at {old_tree}");
                     println!("note: {}", info.warning);
                 }
@@ -927,12 +945,7 @@ fn print_diff(entries: &[proto::DiffEntry]) {
     }
     let mut ignored = 0usize;
     for entry in entries {
-        let tag = match entry.change.as_str() {
-            "added" => "A",
-            "removed" => "D",
-            "modified" => "M",
-            _ => "m",
-        };
+        let tag = entry.change.tag();
         if entry.ignored {
             ignored += 1;
             println!("{tag} {}  (gitignored)", entry.path);
@@ -1009,10 +1022,7 @@ fn short_session(session_id: &str) -> String {
 }
 
 fn age(created_at: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64);
-    let delta = (now - created_at).max(0);
+    let delta = (acyclic_engine::unix_now() - created_at).max(0);
     if delta < 60 {
         format!("{delta}s ago")
     } else if delta < 3600 {
@@ -1024,15 +1034,22 @@ fn age(created_at: i64) -> String {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display only: one decimal of a size, not arithmetic"
+)]
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    let mut unit = "B";
+    for next in UNITS.into_iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
         value /= 1024.0;
-        unit += 1;
+        unit = next;
     }
-    format!("{value:.1} {}", UNITS[unit])
+    format!("{value:.1} {unit}")
 }
 
 #[cfg(test)]

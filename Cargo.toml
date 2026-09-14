@@ -46,4 +46,25 @@ doc_markdown = "warn"
 missing_panics_doc = "warn"
 semicolon_if_nothing_returned = "warn"
 uninlined_format_args = "warn"
+# Type safety: no hidden panics on Option/Result or out-of-range indexes in
+# non-test code (tests opt back in per crate with cfg_attr), and no lossy
+# numeric casts without a `try_from` or an `allow` that says why it's safe.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unwrap_in_result = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+fallible_impl_from = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+cast_lossless = "warn"
+
+[workspace.lints.rust]
+# Every `unsafe` block carries an `allow(unsafe_code, reason = ...)` on its
+# function naming the invariant, so a reviewer can find them all.
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "warn"
 
