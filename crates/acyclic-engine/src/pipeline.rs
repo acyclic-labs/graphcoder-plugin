@@ -663,12 +663,24 @@ async fn run(store: Store, index: Index, config: Config, mut receiver: mpsc::Rec
     };
 
     loop {
-        let idle = Duration::from_millis(pipeline.config.commit_idle_ms);
+        // Wake for whichever idle check is due sooner: the coarse authority
+        // commit, or the auto-checkpoint safety net (disabled: `commit_idle_ms`
+        // alone paces the loop, same as before this existed).
+        let idle_ms = if pipeline.config.auto_checkpoint_idle_ms == 0 {
+            pipeline.config.commit_idle_ms
+        } else {
+            pipeline
+                .config
+                .commit_idle_ms
+                .min(pipeline.config.auto_checkpoint_idle_ms)
+        };
+        let idle = Duration::from_millis(idle_ms);
         let request = match tokio::time::timeout(idle, receiver.recv()).await {
             Ok(Some(request)) => request,
             Ok(None) => break, // all handles dropped
             Err(_) => {
                 pipeline.idle_commit().await;
+                pipeline.auto_checkpoint().await;
                 continue;
             }
         };
@@ -1329,6 +1341,59 @@ impl Pipeline {
             && self.checkpoints_since_commit > 0
             && self.last_activity.elapsed() >= Duration::from_millis(self.config.commit_idle_ms)
         {
+            let _ = self.commit_engine().await;
+        }
+    }
+
+    /// The safety net for hosts with no lifecycle-hook API (Claude Desktop
+    /// over MCP): a checkpoint no request asked for, taken once the watcher
+    /// has been quiet for `auto_checkpoint_idle_ms`. Every hook-driven host
+    /// already drains the watcher on its own pre/post-tool checkpoints, so
+    /// `drain_watcher` here almost always finds nothing and this is a noop —
+    /// cheap (bounded by `quiesce_ms`), and unlike `checkpoint()` it never
+    /// records a row when nothing changed, so it can run on every idle tick
+    /// without spamming the timeline.
+    async fn auto_checkpoint(&mut self) {
+        if self.config.auto_checkpoint_idle_ms == 0 || self.shadowed || self.state != State::Ready
+        {
+            return;
+        }
+        if self.last_activity.elapsed() < Duration::from_millis(self.config.auto_checkpoint_idle_ms)
+        {
+            return;
+        }
+        let changed = match self.drain_watcher().await {
+            Ok(changed) => changed,
+            Err(error) => {
+                crate::trace!("pipeline", "auto-checkpoint: drain failed: {error}");
+                return;
+            }
+        };
+        if !changed {
+            return;
+        }
+        let generation = match self.checkpoint_engine().await {
+            Ok(generation) => generation,
+            Err(error) => {
+                crate::trace!("pipeline", "auto-checkpoint: capture failed: {error}");
+                return;
+            }
+        };
+        let row = match self
+            .index
+            .record(generation, CheckpointKind::Auto, &Attribution::default())
+        {
+            Ok(row) => row,
+            Err(error) => {
+                crate::trace!("pipeline", "auto-checkpoint: record failed: {error}");
+                return;
+            }
+        };
+        crate::trace!("pipeline", "auto-checkpoint row #{row}: idle timer, watcher had pending changes");
+        self.last_generation = generation;
+        self.last_checkpoint_row = Some(row);
+        self.checkpoints_since_commit += 1;
+        if self.checkpoints_since_commit >= self.config.commit_every {
             let _ = self.commit_engine().await;
         }
     }

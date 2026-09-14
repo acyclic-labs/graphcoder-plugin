@@ -84,6 +84,9 @@ pub enum CheckpointKind {
     Recovered,
     Failed,
     Noop,
+    /// Taken by the idle timer, not any request: the safety net for hosts
+    /// with no lifecycle-hook API (see `Pipeline::auto_checkpoint`).
+    Auto,
 }
 
 impl CheckpointKind {
@@ -97,6 +100,7 @@ impl CheckpointKind {
             Self::Recovered => "recovered",
             Self::Failed => "failed",
             Self::Noop => "noop",
+            Self::Auto => "auto",
         }
     }
 
@@ -110,6 +114,7 @@ impl CheckpointKind {
             "recovered" => Self::Recovered,
             "failed" => Self::Failed,
             "noop" => Self::Noop,
+            "auto" => Self::Auto,
             other => {
                 return Err(EngineError::Store(format!(
                     "unknown checkpoint kind {other}"
@@ -159,7 +164,7 @@ impl Index {
                 generation BLOB NOT NULL,
                 created_at INTEGER NOT NULL,
                 kind TEXT NOT NULL CHECK(kind IN
-                  ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop')),
+                  ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop','auto')),
                 published INTEGER NOT NULL DEFAULT 0,
                 session_id TEXT,
                 tool_call_id TEXT,
@@ -180,6 +185,9 @@ impl Index {
         // Launch 2 columns on a Launch 1 database: additive migration.
         add_column_if_missing(&connection, "checkpoints", "turn", "INTEGER")?;
         add_column_if_missing(&connection, "checkpoints", "rewind_target", "INTEGER")?;
+        // `auto` checkpoints (idle-timer safety net) on a database created
+        // before that kind existed: its CHECK constraint predates 'auto'.
+        ensure_auto_kind_allowed(&connection)?;
         Ok(Self { connection })
     }
 
@@ -296,7 +304,7 @@ impl Index {
         self.connection
             .query_row(
                 &format!("SELECT {CHECKPOINT_COLUMNS}
-                 FROM checkpoints WHERE kind IN ('baseline','pre','post','manual')
+                 FROM checkpoints WHERE kind IN ('baseline','pre','post','manual','auto')
                  ORDER BY id DESC LIMIT 1"),
                 [],
                 row_to_checkpoint,
@@ -312,7 +320,7 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                     WHERE id < ?1 AND kind IN ('baseline','pre','post','manual')
+                     WHERE id < ?1 AND kind IN ('baseline','pre','post','manual','auto')
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![id],
@@ -412,7 +420,7 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                     WHERE session_id = ?1 AND kind IN ('baseline','pre','post','manual')
+                     WHERE session_id = ?1 AND kind IN ('baseline','pre','post','manual','auto')
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![session_id],
@@ -441,7 +449,7 @@ impl Index {
     pub fn between(&self, after_id: i64, before_id: i64) -> Result<Vec<CheckpointRow>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-             WHERE id > ?1 AND id < ?2 AND kind IN ('baseline','pre','post','manual')
+             WHERE id > ?1 AND id < ?2 AND kind IN ('baseline','pre','post','manual','auto')
              ORDER BY id ASC"
         ))?;
         let rows = statement.query_map(params![after_id, before_id], row_to_checkpoint)?;
@@ -657,6 +665,56 @@ fn add_column_if_missing(
     connection.execute(
         &format!("ALTER TABLE {table} ADD COLUMN {column} {declared_type}"),
         [],
+    )?;
+    Ok(())
+}
+
+/// A database created before `auto` checkpoints existed has a `kind` CHECK
+/// constraint that predates that variant; SQLite has no `ALTER TABLE ...
+/// DROP/ADD CONSTRAINT`, so widening it means rebuilding the table. Detected
+/// via the stored `CREATE TABLE` text (idempotent: a no-op once rebuilt, and
+/// a no-op on a fresh database, whose `CREATE TABLE` already carries 'auto').
+fn ensure_auto_kind_allowed(connection: &Connection) -> Result<()> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("'auto'") {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE checkpoints RENAME TO checkpoints_pre_auto;
+         CREATE TABLE checkpoints(
+            id INTEGER PRIMARY KEY,
+            generation BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN
+              ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop','auto')),
+            published INTEGER NOT NULL DEFAULT 0,
+            session_id TEXT,
+            tool_call_id TEXT,
+            tool_name TEXT,
+            label TEXT,
+            error TEXT,
+            turn INTEGER,
+            rewind_target INTEGER);
+         INSERT INTO checkpoints
+           (id, generation, created_at, kind, published, session_id, tool_call_id,
+            tool_name, label, error, turn, rewind_target)
+         SELECT id, generation, created_at, kind, published, session_id, tool_call_id,
+                tool_name, label, error, turn, rewind_target
+         FROM checkpoints_pre_auto;
+         DROP TABLE checkpoints_pre_auto;
+         CREATE INDEX IF NOT EXISTS checkpoints_by_generation ON checkpoints(generation);
+         CREATE INDEX IF NOT EXISTS checkpoints_by_session ON checkpoints(session_id, id);
+         COMMIT;",
     )?;
     Ok(())
 }
@@ -963,5 +1021,44 @@ mod tests {
         let row = index.latest().expect("q").expect("row");
         assert_eq!(row.turn, None);
         assert_eq!(row.rewind_target, None);
+    }
+
+    /// A database from before `auto` checkpoints existed has a `kind` CHECK
+    /// constraint that predates that variant. `Index::open` must widen it
+    /// (SQLite can't `ALTER ... DROP CONSTRAINT`, so this is a table
+    /// rebuild) without losing any existing row.
+    #[test]
+    fn pre_auto_kind_database_is_rebuilt_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.db");
+        {
+            let connection = Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE checkpoints(
+                        id INTEGER PRIMARY KEY, generation BLOB NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        kind TEXT NOT NULL CHECK(kind IN
+                          ('baseline','pre','post','manual','pre_rewind','recovered','failed','noop')),
+                        published INTEGER NOT NULL DEFAULT 0, session_id TEXT,
+                        tool_call_id TEXT, tool_name TEXT, label TEXT, error TEXT,
+                        turn INTEGER, rewind_target INTEGER);
+                     INSERT INTO checkpoints(generation, created_at, kind)
+                        VALUES (zeroblob(32), 1, 'post');",
+                )
+                .expect("seed");
+        }
+        let mut index = Index::open(&path).expect("migrate");
+
+        // The pre-existing row survived the rebuild untouched.
+        let existing = index.latest().expect("q").expect("row");
+        assert_eq!(existing.kind, CheckpointKind::Post);
+
+        // The widened constraint now accepts 'auto'.
+        let row_id = index
+            .record(generation(1), CheckpointKind::Auto, &Attribution::default())
+            .expect("auto checkpoint should now be a valid kind");
+        let row = index.by_id(row_id).expect("q").expect("row");
+        assert_eq!(row.kind, CheckpointKind::Auto);
     }
 }

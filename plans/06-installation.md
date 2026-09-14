@@ -7,7 +7,7 @@ One engine, thin adapters. Every capability lives in a single local engine — t
 ```sh
 curl -fsSL https://acyclic.dev/install.sh | sh   # or: brew install acyclic
 acyclic init                                     # in your repo: starts the daemon, builds the first snapshot
-acyclic install claude-code                      # or: codex · cursor · opencode · --agents-md
+acyclic install claude-code                      # or: codex · cursor · opencode · --agents-md · claude-desktop
 ```
 
 `acyclic install` detects the host and configures its adapter. From then on, the dev starts their agent as usual — checkpointing is on.
@@ -21,6 +21,7 @@ acyclic install claude-code                      # or: codex · cursor · openco
 | **Cursor** | `.cursor/hooks.json` agent hooks (`beforeShellExecution`/`afterShellExecution`/`afterFileEdit`/`beforeSubmitPrompt`/`sessionStart`/`sessionEnd`); Cursor's payload uses `conversation_id` and a bare `command` string rather than Claude/Codex's `session_id`/`tool_name`, so `acyclic hook` falls back to those fields when present. An always-applied `.cursor/rules/acyclic.mdc` teaches the engine's verbs. |
 | **OpenCode** | Plugin using its hook and command systems; same shape as the Claude Code adapter. Not started. |
 | **Anything else** | `acyclic install --agents-md` drops an instructions block teaching any shell-capable agent the CLI. Degraded gracefully: no hook-triggered checkpoints, but watcher-driven ones still work. |
+| **Claude Desktop** | No lifecycle-hook API exists, so there is nothing to hook into — `acyclic install claude-desktop` instead registers `acyclic mcp` (an MCP stdio server) as an `mcpServers` entry in the user's global `claude_desktop_config.json`; per-machine and per-repo, not checked into the repo. The server exposes `checkpoint`/`timeline`/`rewind`/`diff`/`restore`/`turns`/`brief` as MCP tools, each translating directly into the engine's existing wire protocol. Checkpointing is not automatic on every tool call the way it is for a hooked host: it happens when the model calls `checkpoint`, or via the engine's `auto_checkpoint_idle_ms` idle timer once the watcher has pending changes — a real capability gap, not hidden by the tool descriptions that steer the model toward calling it. Shipped after the evaluation below; `.mcpb` packaging and a possibly-shared server are the next things to revisit, not blockers on today's flow. |
 
 ## Configuration
 
@@ -49,6 +50,16 @@ acyclic purge <pattern>          # remove content from ALL checkpoints  (complia
 
 In hosts with an adapter these surface natively — `/rewind` in Claude Code rather than a shell command — and the agent reaches them as tools, so "try that again a different way" becomes a rollback plus a fresh attempt without the dev naming a checkpoint.
 
+## Claude Desktop: ship decision
+
+The release blocker on the Claude Desktop adapter (above) asked three questions before promoting it from "built, testable" to "documented, supported." Answered:
+
+1. **Is there a non-MCP local-tool mechanism for Claude Desktop?** No. As of the current MCP spec (2026-07-28) and Anthropic's own Desktop Extensions docs, MCP — local (stdio) servers, optionally packaged as a one-click `.mcpb` bundle — is the only third-party extension point Desktop exposes for local tools; there is no separate lifecycle-hook API comparable to Claude Code's, and none is announced. This was true when the plan was drafted and is still true now.
+2. **Can one server serve every repo, instead of one registration per repo?** Not with the current design: `acyclic mcp --repo <path>` binds one server process to one repo root at registration time (Desktop starts the subprocess with fixed `args`), so a dev working across N repos needs N `acyclic install claude-desktop` runs and N `mcpServers` entries. A single global server that resolves "which repo" from conversation context isn't possible today — MCP tool calls carry no notion of "the workspace the user has open" the way an IDE extension would. This is real friction versus the CLI adapters (one `acyclic install` per repo, but that's a one-time file the team already checks in) and versus IDE-integrated hosts. Accepted for v1: most users work from a small number of repos, and re-running one install command per repo is annoying, not broken.
+3. **What does `.mcpb` packaging buy over the hand-merged config?** Removes the need to hand-edit `claude_desktop_config.json` (Desktop's installer merges it), and is Anthropic's own supported distribution format — but doesn't change the per-repo registration friction from (2), and adds a build/sign step to the release pipeline. Worth doing before broad distribution; not worth blocking on for the current per-machine, per-repo `acyclic install claude-desktop` flow this plan ships.
+
+**Decision: ship the MCP adapter as designed**, with the per-repo registration friction called out in the README/install docs (already done, above) rather than hidden. Revisit `.mcpb` packaging and a possibly-shared server before actively promoting Claude Desktop as a first-class, equally-easy host alongside Claude Code/Codex/Cursor.
+
 ## Design commitment
 
-This resolves the mechanism question in favor of **CLI-as-core with host adapters** (not MCP-as-core, not per-host deep builds). That choice is what makes OpenCode and future hosts nearly free. MCP can wrap the CLI later where a host prefers it.
+This resolves the mechanism question in favor of **CLI-as-core with host adapters** (not MCP-as-core, not per-host deep builds). That choice is what makes OpenCode and future hosts nearly free. MCP wraps the CLI where a host has no other extension point — Claude Desktop's `acyclic mcp` adapter is exactly that: every MCP tool is a thin translation into the same `acyclic-proto::Op` the CLI and hooks already send the daemon, no engine logic lives in the MCP layer itself. See the Claude Desktop row above for why it's marked experimental rather than promoted to a supported host yet.
