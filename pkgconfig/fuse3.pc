@@ -1,0 +1,10 @@
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include/fuse3
+
+Name: fuse3
+Description: FUSE-T libfuse3 compatibility surface (local shim; some FUSE-T installs omit this .pc)
+Version: 1.2.7
+Libs: -L${libdir} -lfuse3
+Cflags: -I${includedir}

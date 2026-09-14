@@ -1,0 +1,12 @@
+[package]
+name = "acyclic-qual"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Phase 0 qualification harness: proves acyclic-fs capture/restore against the Rewind acceptance criteria"
+
+[dependencies]
+acyclic-fs.workspace = true
+acyclic-fs-mount.workspace = true
+tokio.workspace = true
