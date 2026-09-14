@@ -201,6 +201,10 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
+        // Baseline done first, so the edit is guaranteed to be pending
+        // rather than absorbed into the baseline (which would pass this
+        // test for the wrong reason).
+        handle.status().await.expect("status");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         tokio::time::sleep(Duration::from_millis(500)).await;
         handle.shutdown().await.expect("shutdown");
@@ -211,6 +215,50 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     // Only the baseline row from init: the idle timer never ran.
     let latest = index.latest().expect("query").expect("a row exists");
     assert_eq!(latest.kind, CheckpointKind::Baseline);
+}
+
+/// The idle tick is a fixed deadline, not a timeout restarted per request:
+/// a host polling `status` must not be able to postpone the auto checkpoint
+/// forever.
+#[test]
+fn periodic_requests_do_not_postpone_the_auto_checkpoint() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("a.txt"), b"one\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let config = Config {
+        quiesce_ms: 20,
+        quiesce_cap_ms: 200,
+        auto_checkpoint_idle_ms: 50,
+        commit_every: 100,
+        commit_idle_ms: 60_000,
+        trash_ttl_days: 1,
+        store_dir: None,
+        ..Config::default()
+    };
+    let (handle, thread) = pipeline::spawn(store, index, config);
+
+    runtime.block_on(async {
+        handle.status().await.expect("status");
+        std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
+        // Poll far more often than the idle interval, for far longer.
+        for _ in 0..40 {
+            handle.status().await.expect("status");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        handle.shutdown().await.expect("shutdown");
+    });
+    thread.join().expect("pipeline thread");
+
+    let index = read_only_index(&paths.index_db());
+    let latest = index.latest().expect("query").expect("a row exists");
+    assert_eq!(latest.kind, CheckpointKind::Auto);
 }
 
 /// The hook contract: an acknowledged enqueue is admitted to the FIFO before

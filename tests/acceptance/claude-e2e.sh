@@ -61,7 +61,7 @@ settle 1
 # has it by the time the first tool runs); the hook still fired and is
 # attributed, which is what this asserts.
 TL="$(acy timeline --session "$SID" --limit 100)"
-echo "$TL" | grep -Eq " (pre|noop) " || fail "no pre checkpoint for session: $TL"
+echo "$TL" | grep -Eq " (pre|noop) +t[0-9]+ " || fail "no pre checkpoint for session: $TL"
 echo "$TL" | grep -q " post " || fail "no post checkpoint for session: $TL"
 echo "$TL" | grep -Eq "Write|Edit" || fail "no Write/Edit attribution: $TL"
 echo "$TL" | grep -q "Bash" || fail "no Bash attribution: $TL"

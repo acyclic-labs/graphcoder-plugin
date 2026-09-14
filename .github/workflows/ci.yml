@@ -45,6 +45,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # On a push to main the filter diffs against the pre-push commit,
+          # which a depth-1 checkout does not have.
+          fetch-depth: 0
       - id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
@@ -149,7 +152,16 @@ jobs:
 
   test:
     needs: [changes, deny, lint]
-    if: needs.changes.outputs.code == 'true'
+    # Fail closed: run when the change filter says code moved, and also
+    # when the filter job itself failed (an empty output must not read as
+    # "nothing to test", since a skipped required check counts as passing).
+    # deny and lint failing still skip this job; those are required checks
+    # in their own right, so the PR stays red.
+    if: >-
+      always()
+      && needs.deny.result == 'success'
+      && needs.lint.result == 'success'
+      && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true')
     strategy:
       fail-fast: false
       matrix:

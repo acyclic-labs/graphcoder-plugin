@@ -18,11 +18,14 @@ pub struct Config {
     pub commit_every: u32,
     /// Authority commit after this much idle time (ms).
     pub commit_idle_ms: u64,
-    /// Auto-checkpoint after this much idle time (ms), if the watcher has
-    /// pending changes. The safety net for hosts with no lifecycle-hook API
-    /// (e.g. Claude Desktop over MCP): a checkpoint no host asked for, taken
-    /// once things go quiet, so `acyclic mcp`'s tools aren't the only path
-    /// to a checkpoint. Zero disables it (hook-driven hosts don't need it).
+    /// Auto-checkpoint once the watcher has been quiet this long (ms) with
+    /// changes no checkpoint has recorded. The safety net for hosts with no
+    /// lifecycle-hook API (Claude Desktop over MCP, a plain AGENTS.md
+    /// agent): a checkpoint no host asked for, so `acyclic mcp`'s tools are
+    /// not the only path to one. On by default for every daemon because the
+    /// daemon cannot know which host is driving it; on a hook-driven host
+    /// the hooks drain the watcher first, so the tick finds nothing and
+    /// records nothing. Zero disables it.
     pub auto_checkpoint_idle_ms: u64,
     /// Days a rewound-away tree is kept in the store's trash.
     pub trash_ttl_days: u32,

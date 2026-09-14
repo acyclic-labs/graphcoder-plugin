@@ -35,11 +35,11 @@ The live suites do the hook-host checks unattended and are the fastest way
 to re-verify after a host upgrade:
 
 ```sh
-ACYCLIC_E2E=1 ACYCLIC_E2E_REQUIRED=1 ACYCLIC_BIN=$ACYCLIC_BIN \
-  tests/acceptance/claude-e2e.sh      # Claude Code hooks
-  tests/acceptance/codex-e2e.sh       # Codex hooks
-  tests/acceptance/cursor-e2e.sh      # cursor-agent hooks
-  tests/acceptance/mcp-clients-e2e.sh # MCP server driven by claude, codex, cursor-agent, opencode
+export ACYCLIC_E2E=1 ACYCLIC_E2E_REQUIRED=1 ACYCLIC_BIN   # ACYCLIC_BIN from Setup above
+tests/acceptance/claude-e2e.sh        # Claude Code hooks
+tests/acceptance/codex-e2e.sh         # Codex hooks
+tests/acceptance/cursor-e2e.sh        # cursor-agent hooks
+tests/acceptance/mcp-clients-e2e.sh   # MCP server driven by claude, codex, cursor-agent, opencode
 ```
 
 Each one installs the adapter into a throwaway repo, runs one short model
@@ -170,14 +170,14 @@ opencode run "<the prompt above>"       # needs a configured model/provider
 ### Claude Desktop
 
 ```sh
-acyclic install claude-desktop          # merges mcpServers.acyclic into the global config
+acyclic install claude-desktop          # adds mcpServers.acyclic-<repo name> to the global config
 ```
 
-Quit and relaunch Claude Desktop. `~/Library/Logs/Claude/mcp-server-acyclic.log`
+Quit and relaunch Claude Desktop. `~/Library/Logs/Claude/mcp-server-acyclic-<repo name>.log`
 (macOS) should show `Server started and connected successfully`, then
 `initialize` and `tools/list` exchanges. In a new chat, send the prompt above
 and confirm the checkpoint in a terminal. The entry is per machine and binds
-one repo; re-run the install for another repo, and remove the entry from
+one repo under its own key; re-run the install in another repo to add a second entry, and remove the entry from
 `claude_desktop_config.json` when the scratch repo is gone.
 
 ### VS Code (Copilot agent mode)

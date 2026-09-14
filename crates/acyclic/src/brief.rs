@@ -87,11 +87,10 @@ pub fn render(info: &proto::BriefInfo) -> String {
     } else {
         lines.push("  tree unchanged since then.".to_owned());
     }
-    lines.push(
+    lines.push(format!(
         "  verbs: {NAME} turns · timeline · diff --turn N · show <id> · \
          restore <id> <path> · rewind <id>"
-            .to_owned(),
-    );
+    ));
     fit(lines)
 }
 

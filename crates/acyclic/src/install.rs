@@ -177,7 +177,7 @@ fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
     merge_event_hooks(hooks, "hooks", host)?;
 
     let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
-    std::fs::write(path, text + "\n").map_err(stringify)?;
+    write_atomic(path, &(text + "\n"))?;
     Ok(())
 }
 
@@ -239,7 +239,10 @@ fn is_our_command(command: &str) -> bool {
         .strip_prefix("ACYCLIC_HOST=")
         .and_then(|rest| rest.split_once(' '))
         .map_or(command, |(_, rest)| rest);
-    command == NAME || command.starts_with(&format!("{NAME} hook"))
+    // Word boundary after `hook`: `acyclic hookery ...` is somebody else's.
+    command == NAME
+        || command.starts_with(&format!("{NAME} hook "))
+        || command == format!("{NAME} hook")
 }
 
 /// Codex CLI: `.codex/hooks.json`, whose shape is the same
@@ -302,8 +305,11 @@ fn cursor(repo: &Path) -> Result<(), String> {
     // automatically per tool call, an MCP tool call is model-initiated) and
     // that Cursor's desktop app fires the same hooks.json events its CLI
     // does before calling either path "supported" for the desktop app.
-    let exe = std::env::current_exe().map_err(stringify)?;
-    merge_mcp_server_json(&cursor_dir.join("mcp.json"), &MCP_SERVERS_SHAPE, &exe, repo)?;
+    merge_mcp_server_json(
+        &cursor_dir.join("mcp.json"),
+        &MCP_SERVERS_SHAPE,
+        &McpEntry::portable(),
+    )?;
 
     println!("cursor adapter installed into {}", cursor_dir.display());
     println!("  hooks: .cursor/hooks.json (shell + file-edit + prompt + session)");
@@ -351,7 +357,7 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
     }
 
     let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
-    std::fs::write(hooks_path, text + "\n").map_err(stringify)?;
+    write_atomic(hooks_path, &(text + "\n"))?;
     Ok(())
 }
 
@@ -376,28 +382,86 @@ struct McpConfigShape {
     servers_key: &'static str,
     /// VS Code requires this; Claude Desktop and Cursor don't accept or need it.
     explicit_stdio_type: bool,
+    /// VS Code documents a `cwd` field and substitutes `${workspaceFolder}`
+    /// in it; Cursor's stdio schema has no `cwd`, and cursor-agent starts
+    /// the server in the shell's cwd (verified: a subdirectory stays a
+    /// subdirectory), so the server locates the root itself either way.
+    workspace_cwd: bool,
 }
 
 /// The `mcpServers` family: Claude Desktop and Cursor read the same shape.
 const MCP_SERVERS_SHAPE: McpConfigShape = McpConfigShape {
     servers_key: "mcpServers",
     explicit_stdio_type: false,
+    workspace_cwd: false,
 };
 const VSCODE_MCP_SHAPE: McpConfigShape = McpConfigShape {
     servers_key: "servers",
     explicit_stdio_type: true,
+    workspace_cwd: true,
 };
 
-/// Merges an `acyclic mcp --repo <repo>` entry into any JSON-based MCP
-/// host's config, preserving everything else — same read-modify-write
-/// contract as `merge_hooks`: idempotent, keyed on the product name rather
-/// than string-matching the whole file, so re-running `install` replaces
-/// only this one entry.
+/// One `acyclic mcp` registration: the key it lives under and how the host
+/// should launch it. Two flavours, because the two kinds of config file
+/// have different readers:
+///
+/// - **Checked-in, per-project** (Cursor's `.cursor/mcp.json`, VS Code's
+///   `.vscode/mcp.json`): every teammate's clone reads the same file, so it
+///   must not carry this machine's paths. The command is the bare product
+///   name, resolved on `PATH` exactly like the hook commands, and there is
+///   no `--repo`: `acyclic mcp` walks up from its working directory to the
+///   nearest initialized repo (`mcp::find_repo_root`), the way git finds
+///   `.git`. `${workspaceFolder}` in `args` was tried first and rejected:
+///   cursor-agent passes it through literally.
+/// - **Per-machine, global** (Claude Desktop): the file is this user's own,
+///   there is no workspace to start in, and one file serves every repo
+///   this user registers, so the key carries the repo name and the args
+///   carry the absolute paths.
+struct McpEntry {
+    key: String,
+    command: String,
+    /// `Some(path)` pins the server to one repo; `None` lets it find the
+    /// root from its working directory.
+    repo: Option<String>,
+}
+
+impl McpEntry {
+    fn portable() -> Self {
+        Self {
+            key: NAME.to_owned(),
+            command: NAME.to_owned(),
+            repo: None,
+        }
+    }
+
+    fn per_machine(exe: &Path, repo: &Path) -> Self {
+        let basename = repo.file_name().map_or_else(
+            || "repo".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        Self {
+            key: format!("{NAME}-{basename}"),
+            command: exe.display().to_string(),
+            repo: Some(repo.display().to_string()),
+        }
+    }
+
+    fn args(&self) -> Value {
+        match &self.repo {
+            Some(repo) => json!(["mcp", "--repo", repo]),
+            None => json!(["mcp"]),
+        }
+    }
+}
+
+/// Merges one `McpEntry` into any JSON-based MCP host's config, preserving
+/// everything else — same read-modify-write contract as `merge_hooks`:
+/// idempotent, keyed on the entry's key rather than string-matching the
+/// whole file, so re-running `install` replaces only that one entry.
 fn merge_mcp_server_json(
     config_path: &Path,
     shape: &McpConfigShape,
-    exe: &Path,
-    repo: &Path,
+    entry: &McpEntry,
 ) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(stringify)?;
@@ -416,18 +480,35 @@ fn merge_mcp_server_json(
     let servers = servers
         .as_object_mut()
         .ok_or_else(|| format!("{} is not an object", shape.servers_key))?;
-    let mut entry = json!({
-        "command": exe.display().to_string(),
-        "args": ["mcp", "--repo", repo.display().to_string()],
-    });
-    if let (true, Some(fields)) = (shape.explicit_stdio_type, entry.as_object_mut()) {
-        fields.insert("type".to_owned(), json!("stdio"));
+    // Re-install overwrites only the fields we own; anything the user added
+    // to our entry (`env`, `envFile`, ...) survives.
+    let existing = servers.remove(&entry.key);
+    let mut value = existing
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert("command".to_owned(), json!(entry.command));
+        fields.insert("args".to_owned(), entry.args());
+        if shape.explicit_stdio_type {
+            fields.insert("type".to_owned(), json!("stdio"));
+        }
+        if shape.workspace_cwd && entry.repo.is_none() {
+            fields.insert("cwd".to_owned(), json!("${workspaceFolder}"));
+        }
     }
-    servers.insert(NAME.to_owned(), entry);
+    servers.insert(entry.key.clone(), value);
 
     let text = serde_json::to_string_pretty(&config).map_err(stringify)?;
-    std::fs::write(config_path, text + "\n").map_err(stringify)?;
-    Ok(())
+    write_atomic(config_path, &(text + "\n"))
+}
+
+/// Write via a sibling temp file and rename, so a crash mid-write can never
+/// leave a half-written config (Claude Desktop's is the user's whole MCP
+/// server list, not just ours).
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(stringify)?;
+    std::fs::rename(&tmp, path).map_err(stringify)
 }
 
 /// Claude Desktop: unlike the repo-local adapters, there is no hook config
@@ -439,13 +520,21 @@ fn merge_mcp_server_json(
 fn claude_desktop(repo: &Path) -> Result<(), String> {
     let config_path = claude_desktop_config_path()?;
     let exe = std::env::current_exe().map_err(stringify)?;
-    merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &exe, repo)?;
+    let repo = repo.canonicalize().map_err(stringify)?;
+    let entry = McpEntry::per_machine(&exe, &repo);
+    merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry)?;
 
     println!(
         "claude-desktop adapter registered in {}",
         config_path.display()
     );
-    println!("  server: {NAME} mcp --repo {}", repo.display());
+    println!(
+        "  server: {} = {NAME} mcp --repo {}",
+        entry.key,
+        repo.display()
+    );
+    println!("  one entry per repo, keyed by directory name: re-run this in another repo to add");
+    println!("  it alongside (two repos with the same directory name share the entry).");
     println!("per-machine, not checked into the repo: each teammate who wants");
     println!("Desktop support runs `{NAME} install claude-desktop` locally once.");
     println!("restart Claude Desktop for it to pick up the new server.");
@@ -495,8 +584,11 @@ fn claude_desktop_config_path() -> Result<PathBuf, String> {
 /// that before calling this adapter "supported" rather than "built."
 fn vscode(repo: &Path) -> Result<(), String> {
     let vscode_dir = repo.join(".vscode");
-    let exe = std::env::current_exe().map_err(stringify)?;
-    merge_mcp_server_json(&vscode_dir.join("mcp.json"), &VSCODE_MCP_SHAPE, &exe, repo)?;
+    merge_mcp_server_json(
+        &vscode_dir.join("mcp.json"),
+        &VSCODE_MCP_SHAPE,
+        &McpEntry::portable(),
+    )?;
 
     println!("vscode adapter installed into {}", vscode_dir.display());
     println!("  mcp: .vscode/mcp.json ({NAME} tools, project-scoped)");
@@ -1050,11 +1142,11 @@ mod tests {
             &std::fs::read_to_string(dir.path().join(".cursor/mcp.json")).expect("read"),
         )
         .expect("json");
-        assert_eq!(
-            mcp["mcpServers"][NAME]["command"],
-            std::env::current_exe().unwrap().display().to_string()
-        );
-        assert_eq!(mcp["mcpServers"][NAME]["args"][0], "mcp");
+        // Checked in, so portable: no machine paths, the binary comes from
+        // PATH and the server finds the repo from its working directory.
+        assert_eq!(mcp["mcpServers"][NAME]["command"], NAME);
+        assert_eq!(mcp["mcpServers"][NAME]["args"], json!(["mcp"]));
+        assert!(mcp["mcpServers"][NAME].get("cwd").is_none());
     }
 
     #[test]
@@ -1071,8 +1163,27 @@ mod tests {
         // top-level key ("servers", not "mcpServers") and requiring an
         // explicit "type" — see `merge_mcp_server_json`'s doc comment.
         assert_eq!(value["servers"][NAME]["type"], "stdio");
-        assert_eq!(value["servers"][NAME]["args"][0], "mcp");
+        assert_eq!(value["servers"][NAME]["command"], NAME);
+        assert_eq!(value["servers"][NAME]["args"], json!(["mcp"]));
+        assert_eq!(value["servers"][NAME]["cwd"], "${workspaceFolder}");
         assert!(value.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn reinstall_keeps_user_added_fields_on_our_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        vscode(dir.path()).expect("first install");
+        let path = dir.path().join(".vscode/mcp.json");
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        value["servers"][NAME]["env"] = json!({ "ACYCLIC_TRACE": "1" });
+        std::fs::write(&path, value.to_string()).expect("seed user field");
+
+        vscode(dir.path()).expect("second install");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(value["servers"][NAME]["env"]["ACYCLIC_TRACE"], "1");
+        assert_eq!(value["servers"][NAME]["args"], json!(["mcp"]));
     }
 
     #[test]
@@ -1132,9 +1243,18 @@ mod tests {
         let exe_path = format!("/usr/local/bin/{NAME}");
         let exe = std::path::Path::new(&exe_path);
         let repo = std::path::Path::new("/Users/dev/my-repo");
-        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, exe, repo).expect("first merge");
-        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, exe, repo)
+        let entry = McpEntry::per_machine(exe, repo);
+        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry).expect("first merge");
+        merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry)
             .expect("second merge (idempotent)");
+        // A second repo lands alongside, not on top of, the first.
+        let other_repo = std::path::Path::new("/Users/dev/other-repo");
+        merge_mcp_server_json(
+            &config_path,
+            &MCP_SERVERS_SHAPE,
+            &McpEntry::per_machine(exe, other_repo),
+        )
+        .expect("second repo");
 
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
@@ -1144,15 +1264,22 @@ mod tests {
             value["mcpServers"]["other-tool"]["command"],
             "/usr/bin/other"
         );
-        // Exactly one acyclic entry, pointing at this exe and repo.
+        // Exactly one entry per repo, keyed by repo name, pointing at this
+        // exe and that repo's absolute path.
+        let key = format!("{NAME}-my-repo");
         assert_eq!(
-            value["mcpServers"][NAME]["command"],
+            value["mcpServers"][&key]["command"],
             exe.display().to_string()
         );
         assert_eq!(
-            value["mcpServers"][NAME]["args"],
+            value["mcpServers"][&key]["args"],
             json!(["mcp", "--repo", repo.display().to_string()])
         );
+        assert_eq!(
+            value["mcpServers"][format!("{NAME}-other-repo")]["args"][2],
+            other_repo.display().to_string()
+        );
+        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(3));
     }
 
     #[test]
@@ -1162,6 +1289,7 @@ mod tests {
         )));
         assert!(is_our_command(&format!("{NAME} hook pre-tool")));
         assert!(!is_our_command("echo not ours"));
+        assert!(!is_our_command(&format!("{NAME} hookery --flag")));
         // A user command mentioning our phrase as an argument, not invoking
         // it, is left alone.
         assert!(!is_our_command(&format!("echo {NAME} hook mention")));

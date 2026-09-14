@@ -78,7 +78,7 @@ settle 1
 # has it by the time the first tool runs); the hook still fired and is
 # attributed, which is what this asserts.
 TL="$(acy timeline --session "$SID" --limit 100)"
-echo "$TL" | grep -Eq " (pre|noop) " \
+echo "$TL" | grep -Eq " (pre|noop) +t[0-9]+ " \
   || fail "no pre checkpoint for session $SID: $TL
 --- all checkpoints ---
 $(acy timeline --limit 30)
@@ -87,9 +87,10 @@ $(acy sessions)
 --- codex stderr (tail) ---
 $(tail -c 600 "$WORK/codex.stderr")"
 echo "$TL" | grep -q " post " || fail "no post checkpoint for session: $TL"
-# Codex's edit tool is `apply_patch`; a failed patch (it happens) makes the
-# model fall back to a shell redirect, which arrives as Bash.
-echo "$TL" | grep -Eq "Write|Edit|apply_patch|Bash" || fail "no edit attribution: $TL"
+# No edit-tool attribution check here: Codex's `apply_patch` sometimes
+# fails and the model falls back to a shell redirect (a Bash row), so a
+# Write/Edit/apply_patch row is not guaranteed. The `^M src/main.rs` diff
+# assertion below is what proves the edit itself was captured.
 echo "$TL" | grep -q "Bash" || fail "no Bash attribution: $TL"
 
 # Blast radius across the session (earliest -> latest checkpoint) names the

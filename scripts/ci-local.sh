@@ -14,6 +14,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# Same as CI: the pinned acyclic-fs git dependency needs the git CLI's
+# credentials and protocol support, not cargo's built-in fetcher.
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 run_acceptance=1
 run_coverage=1

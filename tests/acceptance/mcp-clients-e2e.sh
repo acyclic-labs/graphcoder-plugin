@@ -21,9 +21,36 @@ skip() {
   exit 0
 }
 
+# Host CLI flags move fast; check each one this script depends on against
+# the installed CLI's --help before spending a paid model session on it.
+if command -v claude >/dev/null 2>&1; then
+  CLAUDE_HELP="$(claude --help 2>&1 || true)"
+  for flag in --mcp-config --strict-mcp-config --allowedTools --output-format; do
+    require_flag "$CLAUDE_HELP" "$flag" claude
+  done
+fi
+if command -v codex >/dev/null 2>&1; then
+  CODEX_HELP="$(codex exec --help 2>&1 || true)"
+  for flag in --skip-git-repo-check --json --output-last-message --config; do
+    require_flag "$CODEX_HELP" "$flag" codex
+  done
+fi
+if command -v cursor-agent >/dev/null 2>&1; then
+  CURSOR_HELP="$(cursor-agent --help 2>&1 || true)"
+  for flag in --approve-mcps --force --trust --output-format; do
+    require_flag "$CURSOR_HELP" "$flag" cursor-agent
+  done
+  require_flag "$(cursor-agent mcp --help 2>&1 || true)" list-tools cursor-agent
+fi
+
 setup_repo
 acy init >/dev/null || fail "init"
 ran=0
+# The checked-in .cursor/mcp.json names the bare binary (resolved on PATH)
+# with no --repo; put the binary under test first on PATH so the host
+# launches exactly what we built, and it finds the repo from its cwd.
+BIN_DIR="$(cd "$(dirname "$BIN")" && pwd)"
+export PATH="$BIN_DIR:$PATH"
 
 prompt_for() {
   printf 'Use only the %s MCP tools, no shell and no file edits. 1) call %s brief. 2) call %s checkpoint with message "%s". 3) call %s timeline. ' \

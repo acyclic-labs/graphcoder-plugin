@@ -169,8 +169,10 @@ enum Command {
     /// performs the matching engine action. Always exits 0 (never blocks the
     /// agent); a missing daemon is a silent no-op.
     Hook {
-        #[arg(value_enum)]
-        event: hook::HookEvent,
+        /// One of pre-tool, post-tool, user-prompt, session-start,
+        /// session-end. Anything else is ignored (exit 0), never a usage
+        /// error: a hook must not block the agent.
+        event: String,
     },
     /// Wire a host's adapter into the current repo.
     Install {
@@ -279,8 +281,12 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         },
         Command::Init => init(repo),
         Command::Policy => policy(repo),
-        Command::Hook { event } => hook::run(repo, event),
-        Command::Mcp => match mcp::run(repo.to_path_buf()) {
+        Command::Hook { event } => hook::run(repo, &event),
+        Command::Mcp => match mcp::run(if cli.repo.is_none() {
+            mcp::find_repo_root(repo)
+        } else {
+            repo.to_path_buf()
+        }) {
             Ok(()) => 0,
             Err(message) => {
                 eprintln!("{} mcp: {message}", product::NAME);
