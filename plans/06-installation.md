@@ -7,7 +7,7 @@ One engine, thin adapters. Every capability lives in a single local engine — t
 ```sh
 curl -fsSL https://acyclic.dev/install.sh | sh   # or: brew install acyclic
 acyclic init                                     # in your repo: starts the daemon, builds the first snapshot
-acyclic install claude-code                      # or: codex · opencode · --agents-md
+acyclic install claude-code                      # or: codex · cursor · opencode · --agents-md
 ```
 
 `acyclic install` detects the host and configures its adapter. From then on, the dev starts their agent as usual — checkpointing is on.
@@ -17,8 +17,9 @@ acyclic install claude-code                      # or: codex · opencode · --ag
 | Host | Mechanism |
 |---|---|
 | **Claude Code** | Native plugin: PreToolUse/PostToolUse hooks trigger checkpoints around edits and commands; slash commands (`/rewind`, `/fork`, `/timeline`) surface the engine to the dev; a skill teaches the agent the engine's verbs (self-rollback, fork-and-try, blast-radius diff). |
-| **Codex** | Engine verbs taught via AGENTS.md and exposed over the CLI (or MCP); lifecycle hooks where the host provides them, timer/daemon-side checkpointing where it doesn't. |
-| **OpenCode** | Plugin using its hook and command systems; same shape as the Claude Code adapter. |
+| **Codex** | `.codex/hooks.json` lifecycle hooks (`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`) drive the same checkpointing as Claude Code — Codex's payload shape matches closely enough that `acyclic hook` needs no host-specific parsing; engine verbs are taught via the same AGENTS.md block `--agents-md` writes. |
+| **Cursor** | `.cursor/hooks.json` agent hooks (`beforeShellExecution`/`afterShellExecution`/`afterFileEdit`/`beforeSubmitPrompt`/`sessionStart`/`sessionEnd`); Cursor's payload uses `conversation_id` and a bare `command` string rather than Claude/Codex's `session_id`/`tool_name`, so `acyclic hook` falls back to those fields when present. An always-applied `.cursor/rules/acyclic.mdc` teaches the engine's verbs. |
+| **OpenCode** | Plugin using its hook and command systems; same shape as the Claude Code adapter. Not started. |
 | **Anything else** | `acyclic install --agents-md` drops an instructions block teaching any shell-capable agent the CLI. Degraded gracefully: no hook-triggered checkpoints, but watcher-driven ones still work. |
 
 ## Configuration

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+build = "build.rs"
 description = "Rewind engine: capture pipeline, checkpoint index, rewind, and diff over acyclic-fs"
 
 [dependencies]
@@ -17,9 +18,13 @@ thiserror = "2"
 hex = "0.4"
 blake3 = "1"
 bytes = "1"
+diffy = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[build-dependencies]
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

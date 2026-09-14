@@ -1,0 +1,16 @@
+# The public name, in one place. Everything user-facing derives from `name`
+# at build or packaging time: the CLI command, `.<name>/config.toml`,
+# `~/.config/<name>`, `~/.local/share/<name>`, the socket directory, hook
+# commands, skill names, error-message prefixes, the `<NAME>_TRACE` and
+# `<NAME>_HOOK` environment variables, release asset names, and the npm bin.
+#
+# Readers: crates/acyclic-engine/build.rs (Rust, via env!), scripts/product.sh
+# (shell), .github/workflows (awk). scripts/check-product-name.sh fails CI if
+# the one self-contained file (scripts/install.sh) drifts from this.
+#
+# Crate and Cargo target names stay `acyclic*`: they are internal and never
+# shown to a user. The GitHub repo and npm scope are organisation identity,
+# not derived from `name`.
+name = "acyclic"
+npm_package = "@acyclic-labs/plugin"
+github_repo = "acyclic-labs/graphcoder-plugin"

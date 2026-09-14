@@ -24,6 +24,7 @@ dependencies = [
  "acyclic-fs",
  "blake3",
  "bytes",
+ "diffy",
  "hex",
  "libc",
  "rusqlite",
@@ -38,7 +39,7 @@ dependencies = [
 [[package]]
 name = "acyclic-fs"
 version = "0.2.0-rc.1"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=bf1a8017b47a25d2e499aa74761b7fd5bfb3388a#bf1a8017b47a25d2e499aa74761b7fd5bfb3388a"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=8eced489729235929b769e831c1170c85aa1f7ba#8eced489729235929b769e831c1170c85aa1f7ba"
 dependencies = [
  "acyclic-objects",
  "acyclic-stream",
@@ -70,7 +71,7 @@ dependencies = [
 [[package]]
 name = "acyclic-objects"
 version = "1.0.0-rc.1"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=bf1a8017b47a25d2e499aa74761b7fd5bfb3388a#bf1a8017b47a25d2e499aa74761b7fd5bfb3388a"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=8eced489729235929b769e831c1170c85aa1f7ba#8eced489729235929b769e831c1170c85aa1f7ba"
 dependencies = [
  "async-trait",
  "blake3",
@@ -104,7 +105,7 @@ dependencies = [
 [[package]]
 name = "acyclic-stream"
 version = "1.0.0-rc.3"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=bf1a8017b47a25d2e499aa74761b7fd5bfb3388a#bf1a8017b47a25d2e499aa74761b7fd5bfb3388a"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=8eced489729235929b769e831c1170c85aa1f7ba#8eced489729235929b769e831c1170c85aa1f7ba"
 dependencies = [
  "async-trait",
  "bytes",
@@ -433,6 +434,15 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "diffy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+dependencies = [
+ "nu-ansi-term",
 ]
 
 [[package]]
@@ -1065,6 +1075,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

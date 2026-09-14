@@ -98,7 +98,7 @@ pub fn mount_setup_hint() -> &'static str {
     } else if cfg!(target_os = "macos") {
         concat!(
             "forks will use full copies: the built-in NFS mount tools (/sbin/mount_nfs, /sbin/umount)\n",
-            "are missing or blocked by policy. acyclic needs no extra software on macOS;\n",
+            "are missing or blocked by policy. No extra software is needed on macOS;\n",
             "ask your administrator to allow loopback NFS mounts.\n",
             "Safe Mode (dry_run) needs mounts and refuses to start without them.",
         )

@@ -12,7 +12,7 @@ use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
-    NativeWatchOptions, OperationId, WatchBatch, WorkCounters,
+    NativeWatchOptions, OperationId, WatchBatch, WatchChange, WorkCounters,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::diff::{self, FileChange};
+use crate::exclude::Exclusions;
 use crate::fork::{ForkSeed, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RestoreOutcome, RewindOutcome};
@@ -111,6 +112,51 @@ enum Request {
     SnapshotOverlay {
         shared: Arc<SharedLocalCheckout>,
         reply: oneshot::Sender<Result<GenerationId>>,
+    },
+    /// Merge v2: the three-way plan of fork `ours` onto mainline `theirs`.
+    MergePlan {
+        base: GenerationId,
+        theirs: GenerationId,
+        ours: GenerationId,
+        ours_name: String,
+        reply: oneshot::Sender<Result<crate::merge::MergePlan>>,
+    },
+    /// Merge v2: a new unpublished generation equal to `from` with
+    /// `entries` written over it (the merge generation M, the rebase R).
+    BuildGeneration {
+        from: GenerationId,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+        reply: oneshot::Sender<Result<GenerationId>>,
+    },
+    /// Merge v2: writes `entries` into a live fork overlay (a rebase of a
+    /// mounted fork).
+    ApplyToOverlay {
+        shared: Arc<SharedLocalCheckout>,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Regular-file contents at `paths` in `generation` (None when absent
+    /// or not a regular file): the conflict-marker scan before a re-promote.
+    ReadFiles {
+        generation: GenerationId,
+        paths: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<Vec<(PathBuf, Option<Vec<u8>>)>>>,
+    },
+    /// Plain writes of `paths` from `generation` into `root` (a mounted
+    /// fork's directory, written through the mount so its caches stay
+    /// coherent).
+    MaterializePaths {
+        generation: GenerationId,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Restores one path from `target` into `root` (a copy fork's directory).
+    RestorePathInto {
+        target: GenerationId,
+        root: PathBuf,
+        path: PathBuf,
+        reply: oneshot::Sender<Result<RestoreOutcome>>,
     },
     /// Copy-mode fork: write `generation` out to `destination`.
     Materialize {
@@ -292,6 +338,104 @@ impl PipelineHandle {
         request!(self, SnapshotOverlay { shared: shared })?
     }
 
+    /// Merge v2: plans fork `ours` onto mainline `theirs` from `base`.
+    pub async fn merge_plan(
+        &self,
+        base: GenerationId,
+        theirs: GenerationId,
+        ours: GenerationId,
+        ours_name: String,
+    ) -> Result<crate::merge::MergePlan> {
+        request!(
+            self,
+            MergePlan {
+                base: base,
+                theirs: theirs,
+                ours: ours,
+                ours_name: ours_name
+            }
+        )?
+    }
+
+    /// Merge v2: unpublished generation = `from` + `entries`.
+    pub async fn build_generation(
+        &self,
+        from: GenerationId,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+    ) -> Result<GenerationId> {
+        request!(
+            self,
+            BuildGeneration {
+                from: from,
+                entries: entries
+            }
+        )?
+    }
+
+    /// Merge v2: writes `entries` into a fork's overlay.
+    pub async fn apply_to_overlay(
+        &self,
+        shared: Arc<SharedLocalCheckout>,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+    ) -> Result<()> {
+        request!(
+            self,
+            ApplyToOverlay {
+                shared: shared,
+                entries: entries
+            }
+        )?
+    }
+
+    /// Regular-file contents at `paths` in `generation`.
+    pub async fn read_files(
+        &self,
+        generation: GenerationId,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+        request!(
+            self,
+            ReadFiles {
+                generation: generation,
+                paths: paths
+            }
+        )?
+    }
+
+    /// Plain writes of `paths` from `generation` into `root`.
+    pub async fn materialize_paths(
+        &self,
+        generation: GenerationId,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        request!(
+            self,
+            MaterializePaths {
+                generation: generation,
+                root: root,
+                paths: paths
+            }
+        )?
+    }
+
+    /// Restores one path from `target` into `root` rather than the working tree.
+    pub async fn restore_path_into(
+        &self,
+        target: GenerationId,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<RestoreOutcome> {
+        request!(
+            self,
+            RestorePathInto {
+                target: target,
+                root: root,
+                path: path
+            }
+        )?
+    }
+
     /// Copy-mode fork: materializes `generation` into `destination`.
     pub async fn materialize(&self, generation: GenerationId, destination: PathBuf) -> Result<()> {
         request!(
@@ -395,6 +539,73 @@ impl PipelineHandle {
 
 /// Spawns the pipeline thread. The returned join handle resolves when the
 /// pipeline has shut down (after a `shutdown` request or channel closure).
+/// What a watch batch said about the volume root itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootHint {
+    None,
+    /// Only the root's metadata: nothing to capture (the engine never
+    /// tracks root metadata), safe to drop.
+    MetadataOnly,
+    /// The root appeared, vanished, or was renamed: what a mount or unmount
+    /// over the repo directory looks like. The hints that follow may be
+    /// about a different tree; only a fresh watcher and a rescan are safe.
+    Structural,
+}
+
+/// Removes hints that target the volume root from a batch. The engine
+/// refuses any mutation of the root ("mutation cannot target the volume
+/// root"), and such hints only ever come from mount lifecycle events on the
+/// repo directory (Safe Mode shadowing it, or a fork session tearing down),
+/// never from the user's edits.
+fn strip_root_hints(batch: WatchBatch) -> (WatchBatch, RootHint) {
+    let WatchBatch::Changes {
+        epoch,
+        first_sequence,
+        next_sequence,
+        changes,
+    } = batch
+    else {
+        return (batch, RootHint::None);
+    };
+    let is_root = |path: &acyclic_fs::kernel::NamespacePath| path.components().is_empty();
+    let mut hint = RootHint::None;
+    let changes = changes
+        .into_iter()
+        .filter(|change| {
+            let root_hint = match change {
+                WatchChange::MetadataChanged(path) if is_root(path) => RootHint::MetadataOnly,
+                WatchChange::Created(path)
+                | WatchChange::Modified(path)
+                | WatchChange::Removed(path)
+                    if is_root(path) =>
+                {
+                    RootHint::Structural
+                }
+                WatchChange::Renamed { from, to } if is_root(from) || is_root(to) => {
+                    RootHint::Structural
+                }
+                _ => RootHint::None,
+            };
+            if root_hint == RootHint::None {
+                return true;
+            }
+            if root_hint == RootHint::Structural || hint == RootHint::None {
+                hint = root_hint;
+            }
+            false
+        })
+        .collect();
+    (
+        WatchBatch::Changes {
+            epoch,
+            first_sequence,
+            next_sequence,
+            changes,
+        },
+        hint,
+    )
+}
+
 pub fn spawn(
     store: Store,
     index: Index,
@@ -402,7 +613,12 @@ pub fn spawn(
 ) -> (PipelineHandle, std::thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(1024);
     let thread = std::thread::Builder::new()
-        .name("acyclic-pipeline".into())
+        .name(format!("{}-pipeline", crate::product::NAME))
+        // The fs facade's futures are large and a few of them nest per
+        // request (a subtree copy, a restore); the 2 MiB default is tight
+        // in debug builds. Virtual reservation only: untouched pages cost
+        // nothing.
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -420,6 +636,8 @@ struct Pipeline {
     config: Config,
     watch: NativeWatch,
     options: CaptureOptions,
+    /// Paths that never enter a checkpoint (`exclude` in the config).
+    exclusions: Exclusions,
     cancel: CancellationToken,
     state: State,
     last_generation: GenerationId,
@@ -472,6 +690,12 @@ fn fail_request(request: Request, message: &str) {
         Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
         Request::ScratchCheckout { reply, .. } => drop(reply.send(Err(error()))),
         Request::PublishHead { reply } => drop(reply.send(Err(error()))),
+        Request::MergePlan { reply, .. } => drop(reply.send(Err(error()))),
+        Request::BuildGeneration { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ApplyToOverlay { reply, .. } => drop(reply.send(Err(error()))),
+        Request::ReadFiles { reply, .. } => drop(reply.send(Err(error()))),
+        Request::RestorePathInto { reply, .. } => drop(reply.send(Err(error()))),
+        Request::MaterializePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
@@ -518,12 +742,14 @@ impl Pipeline {
             maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
         };
 
+        let exclusions = Exclusions::parse(&config.exclude)?;
         let mut pipeline = Self {
             store,
             index,
             config,
             watch,
             options,
+            exclusions,
             cancel,
             state: State::Baselining,
             last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
@@ -539,6 +765,11 @@ impl Pipeline {
     /// Full baseline: capture the whole tree, checkpoint, finish the watcher
     /// rescan, publish. Used at startup and after RescanRequired/rewind.
     async fn baseline(&mut self, kind: CheckpointKind) -> Result<()> {
+        crate::trace!(
+            "pipeline",
+            "baseline kind={kind:?}: full-tree rescan starting"
+        );
+        let baseline_started = Instant::now();
         self.state = State::Baselining;
         // A baseline requires a clean checkout. Mid-session (watcher
         // invalidation, rewind) the overlay holds uncommitted captures:
@@ -552,6 +783,7 @@ impl Pipeline {
         )
         .await
         .map_err(EngineError::fs("capture baseline"))?;
+        self.scrub_exclusions().await?;
         let generation = self.checkpoint_engine().await?;
         let row = self
             .index
@@ -565,6 +797,14 @@ impl Pipeline {
             .watch
             .finish_rescan()
             .map_err(EngineError::fs("finish rescan"))?;
+        // A root hint here is already covered by the rescan that just ran.
+        let (batch, root) = strip_root_hints(batch);
+        if root != RootHint::None {
+            crate::trace!(
+                "pipeline",
+                "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
+            );
+        }
         if let WatchBatch::Changes { ref changes, .. } = batch {
             if !changes.is_empty() {
                 capture_watch_batch(
@@ -576,10 +816,16 @@ impl Pipeline {
                 )
                 .await
                 .map_err(EngineError::fs("capture rescan tail"))?;
+                self.scrub_exclusions().await?;
             }
         }
         self.commit_engine().await?;
         self.state = State::Ready;
+        crate::trace!(
+            "pipeline",
+            "baseline done in {:.1}ms; state Ready",
+            crate::trace::ms(baseline_started)
+        );
         Ok(())
     }
 
@@ -592,6 +838,12 @@ impl Pipeline {
                 attribution,
                 reply,
             } => {
+                crate::trace!(
+                    "pipeline",
+                    "request Checkpoint kind={kind:?} session={:?} tool={:?} admitted (queue depth unknown to the hook: ack was sent on send)",
+                    attribution.session_id,
+                    attribution.tool_name
+                );
                 let result = self.checkpoint(kind, &attribution).await;
                 if let Err(error) = &result {
                     // Record the failure but keep the pipeline alive.
@@ -683,6 +935,95 @@ impl Pipeline {
                 let _ = reply.send(result);
                 false
             }
+            Request::MergePlan {
+                base,
+                theirs,
+                ours,
+                ours_name,
+                reply,
+            } => {
+                // Boxed: the fs facade's futures are large, and inlining
+                // them into the pipeline's main state machine overflows the
+                // thread stack.
+                let limits = self.config.merge.limits();
+                let result = Box::pin(crate::merge::plan(
+                    &self.store,
+                    base,
+                    theirs,
+                    ours,
+                    &ours_name,
+                    &limits,
+                ))
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::BuildGeneration {
+                from,
+                entries,
+                reply,
+            } => {
+                let result = Box::pin(self.build_generation(from, entries)).await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::ApplyToOverlay {
+                shared,
+                entries,
+                reply,
+            } => {
+                let result = Box::pin(async {
+                    let mut guard = shared.lock().await;
+                    crate::merge::apply_entries(&self.store, &mut guard, &entries).await
+                })
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::ReadFiles {
+                generation,
+                paths,
+                reply,
+            } => {
+                let result = Box::pin(async {
+                    let mut out = Vec::with_capacity(paths.len());
+                    for path in paths {
+                        let bytes = crate::merge::read_file(&self.store, generation, &path).await?;
+                        out.push((path, bytes));
+                    }
+                    Ok(out)
+                })
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::MaterializePaths {
+                generation,
+                root,
+                paths,
+                reply,
+            } => {
+                let result = Box::pin(crate::merge::materialize_paths(
+                    &self.store,
+                    generation,
+                    &root,
+                    &paths,
+                ))
+                .await;
+                let _ = reply.send(result);
+                false
+            }
+            Request::RestorePathInto {
+                target,
+                root,
+                path,
+                reply,
+            } => {
+                let result =
+                    Box::pin(rewind::restore_path_into(&self.store, target, &root, &path)).await;
+                let _ = reply.send(result);
+                false
+            }
             Request::Materialize {
                 generation,
                 destination,
@@ -770,11 +1111,17 @@ impl Pipeline {
         kind: CheckpointKind,
         attribution: &Attribution,
     ) -> Result<CheckpointOutcome> {
+        let started = Instant::now();
         if self.shadowed {
             // A Safe Mode session's fork is mounted over the repo root; the
             // real tree is frozen and the watcher sees only fork/mount noise.
             // Record a noop so the hook gets a clean reply, but never drain
             // the watcher or snapshot the mainline mid-session.
+            crate::trace!(
+                "pipeline",
+                "checkpoint kind={:?}: shadowed -> noop row, watcher untouched",
+                kind
+            );
             let row = self
                 .index
                 .record(self.last_generation, CheckpointKind::Noop, attribution)?;
@@ -788,22 +1135,45 @@ impl Pipeline {
         if self.state != State::Ready {
             // A failed recovery leaves state at Baselining; a request is the
             // natural moment to retry rather than staying down forever.
+            crate::trace!(
+                "pipeline",
+                "checkpoint kind={:?}: state {:?} -> reset watch + recovery baseline first",
+                kind,
+                self.state
+            );
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
+        let drain_started = Instant::now();
         let changed = self.drain_watcher().await?;
+        let drain_ms = crate::trace::ms(drain_started);
+        let capture_started = Instant::now();
         let (generation, kind) = if changed {
             (self.checkpoint_engine().await?, kind)
         } else {
             (self.last_generation, CheckpointKind::Noop)
         };
+        let capture_ms = crate::trace::ms(capture_started);
+        let record_started = Instant::now();
         let row = self.index.record(generation, kind, attribution)?;
+        let record_ms = crate::trace::ms(record_started);
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
         self.checkpoints_since_commit += 1;
+        let mut commit_ms = 0.0;
         if self.checkpoints_since_commit >= self.config.commit_every {
+            let commit_started = Instant::now();
             self.commit_engine().await?;
+            commit_ms = crate::trace::ms(commit_started);
         }
+        crate::trace!(
+            "pipeline",
+            "checkpoint row #{row} kind={:?}: drain {drain_ms:.1}ms ({}), {} {capture_ms:.1}ms, index {record_ms:.1}ms, publish {commit_ms:.1}ms, total {:.1}ms",
+            kind,
+            if changed { "changes captured" } else { "no changes" },
+            if changed { "snapshot" } else { "noop" },
+            crate::trace::ms(started)
+        );
         Ok(CheckpointOutcome {
             row_id: row,
             generation,
@@ -820,14 +1190,40 @@ impl Pipeline {
         let started = Instant::now();
         let mut last_change = Instant::now();
         let mut changed = false;
+        let mut polls = 0u32;
+        let mut batches = 0u32;
+        let mut hints = 0usize;
         loop {
+            polls += 1;
             let batch = self
                 .watch
                 .poll(POLL_CHANGES, WorkCounters::UNBOUNDED, &self.cancel)
                 .map_err(EngineError::fs("watch poll"))?
                 .value;
+            let (batch, root) = strip_root_hints(batch);
+            if root != RootHint::None {
+                crate::trace!(
+                    "pipeline",
+                    "drain: watcher hinted at the volume root ({root:?}); dropped"
+                );
+            }
+            let (batch, scrub) = self.exclusions.filter_batch(batch);
+            if root == RootHint::Structural {
+                // The repo directory itself changed identity (a mount came
+                // or went): re-baseline on a fresh watcher rather than apply
+                // hints that may describe another tree.
+                crate::trace!(
+                    "pipeline",
+                    "drain: structural root hint -> fresh watcher + recovery baseline"
+                );
+                self.reset_watch().await?;
+                self.baseline(CheckpointKind::Recovered).await?;
+                return Ok(true);
+            }
             match batch {
                 WatchBatch::Changes { ref changes, .. } if !changes.is_empty() => {
+                    batches += 1;
+                    hints += changes.len();
                     capture_watch_batch(
                         &mut self.store.checkout,
                         batch,
@@ -837,11 +1233,20 @@ impl Pipeline {
                     )
                     .await
                     .map_err(EngineError::fs("capture watch batch"))?;
+                    if scrub {
+                        self.scrub_exclusions().await?;
+                    }
                     changed = true;
                     last_change = Instant::now();
                 }
                 WatchBatch::Changes { .. } => {
                     if last_change.elapsed() >= quiesce || started.elapsed() >= cap {
+                        crate::trace!(
+                            "pipeline",
+                            "drain: done after {:.1}ms, {polls} polls, {batches} batch(es), {hints} hint(s); stopped by {}",
+                            crate::trace::ms(started),
+                            if started.elapsed() >= cap { "cap" } else { "quiesce window" }
+                        );
                         return Ok(changed);
                     }
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -857,6 +1262,19 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// Drops excluded paths a capture may have pulled into the checkout,
+    /// before the generation they would otherwise land in is checkpointed.
+    async fn scrub_exclusions(&mut self) -> Result<()> {
+        let removed = self.exclusions.scrub(&mut self.store.checkout).await?;
+        if removed > 0 {
+            crate::trace!(
+                "pipeline",
+                "exclusions: scrubbed {removed} excluded path(s) from the checkout"
+            );
+        }
+        Ok(())
     }
 
     /// `checkpoint()`: snapshot without authority publish. The fast path.
@@ -933,8 +1351,13 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
-        let outcome =
-            rewind::execute(&self.store, target.generation, self.config.trash_ttl_days).await;
+        let outcome = rewind::execute(
+            &self.store,
+            target.generation,
+            self.config.trash_ttl_days,
+            &self.exclusions,
+        )
+        .await;
 
         // The swap replaced the repo directory's inode: the pinned root
         // identity and the watcher both point at the old tree. Rebuild both,
@@ -961,6 +1384,13 @@ impl Pipeline {
                 "a Safe Mode session is shadowing the repo root; resolve it first".into(),
             ));
         }
+        if self.exclusions.covers_host(path) {
+            return Err(EngineError::Restore(format!(
+                "{} is excluded from snapshots (`exclude` in {}); no checkpoint holds it",
+                path.display(),
+                crate::product::repo_config_file()
+            )));
+        }
         if self.state != State::Ready {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
@@ -971,7 +1401,11 @@ impl Pipeline {
                 safety,
                 CheckpointKind::Manual,
                 &Attribution {
-                    label: Some(format!("before restore {} from #{}", path.display(), target.id)),
+                    label: Some(format!(
+                        "before restore {} from #{}",
+                        path.display(),
+                        target.id
+                    )),
                     ..Attribution::default()
                 },
             )?;
@@ -1043,6 +1477,26 @@ impl Pipeline {
             checkout,
             MountPublication::Manual,
         )))
+    }
+
+    /// Merge v2: a scratch overlay at `from`, `entries` written over it,
+    /// checkpointed as an unpublished generation. The head never moves.
+    async fn build_generation(
+        &mut self,
+        from: GenerationId,
+        entries: Vec<(PathBuf, crate::merge::Entry)>,
+    ) -> Result<GenerationId> {
+        let scratch = self.scratch_checkout(from).await?;
+        let mut guard = scratch.lock().await;
+        crate::merge::apply_entries(&self.store, &mut guard, &entries).await?;
+        if !guard.has_pending_mutations() {
+            return Ok(from);
+        }
+        Ok(guard
+            .checkpoint(WorkCounters::UNBOUNDED, &self.cancel)
+            .await
+            .map_err(EngineError::fs("build generation"))?
+            .value)
     }
 
     async fn fork(&mut self) -> Result<ForkSeed> {
@@ -1181,7 +1635,13 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(&self.store, generation, self.config.trash_ttl_days).await;
+        let swap = rewind::execute(
+            &self.store,
+            generation,
+            self.config.trash_ttl_days,
+            &self.exclusions,
+        )
+        .await;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         let swap = swap?;
@@ -1305,7 +1765,13 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(&self.store, generation, self.config.trash_ttl_days).await;
+        let swap = rewind::execute(
+            &self.store,
+            generation,
+            self.config.trash_ttl_days,
+            &self.exclusions,
+        )
+        .await;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         let swap = swap?;
@@ -1318,6 +1784,10 @@ impl Pipeline {
     /// Reopens the watcher and recomputes the capture root identity — needed
     /// whenever the repo directory inode may have changed (after a rewind).
     async fn reset_watch(&mut self) -> Result<()> {
+        crate::trace!(
+            "pipeline",
+            "reset_watch: reopening the native watcher (old queue discarded)"
+        );
         let repo_root = self.store.repo_root.clone();
         self.options.expected_root_identity =
             capture_root_identity(&repo_root).map_err(EngineError::fs("root identity"))?;
@@ -1334,5 +1804,96 @@ impl Pipeline {
             .begin_rescan()
             .map_err(EngineError::fs("begin rescan"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod root_hint_tests {
+    use super::*;
+    use acyclic_fs::kernel::{LogicalName, NameEncoding, NamespacePath};
+    use acyclic_fs::{WatchEpoch, WatchSequence};
+
+    fn root() -> NamespacePath {
+        NamespacePath::new(Vec::new(), VolumeLimits::default()).unwrap()
+    }
+
+    fn file(name: &str) -> NamespacePath {
+        let limits = VolumeLimits::default();
+        let name = LogicalName::new(
+            NameEncoding::PosixBytes,
+            name.as_bytes().to_vec(),
+            limits.maximum_component_bytes,
+        )
+        .unwrap();
+        NamespacePath::new(vec![name], limits).unwrap()
+    }
+
+    fn batch(changes: Vec<WatchChange>) -> WatchBatch {
+        WatchBatch::Changes {
+            epoch: WatchEpoch::from_u64(1),
+            first_sequence: WatchSequence::from_u64(1),
+            next_sequence: WatchSequence::from_u64(2),
+            changes,
+        }
+    }
+
+    fn changes_of(batch: &WatchBatch) -> Vec<WatchChange> {
+        match batch {
+            WatchBatch::Changes { changes, .. } => changes.clone(),
+            WatchBatch::RescanRequired { .. } => panic!("not a change batch"),
+        }
+    }
+
+    #[test]
+    fn ordinary_hints_pass_through_untouched() {
+        let (out, hint) = strip_root_hints(batch(vec![WatchChange::Modified(file("a.txt"))]));
+        assert_eq!(hint, RootHint::None);
+        assert_eq!(changes_of(&out), vec![WatchChange::Modified(file("a.txt"))]);
+    }
+
+    #[test]
+    fn root_metadata_hint_is_dropped_quietly() {
+        let (out, hint) = strip_root_hints(batch(vec![
+            WatchChange::MetadataChanged(root()),
+            WatchChange::Created(file("b.txt")),
+        ]));
+        assert_eq!(hint, RootHint::MetadataOnly);
+        assert_eq!(changes_of(&out), vec![WatchChange::Created(file("b.txt"))]);
+    }
+
+    #[test]
+    fn structural_root_hints_are_reported_and_dropped() {
+        for change in [
+            WatchChange::Removed(root()),
+            WatchChange::Created(root()),
+            WatchChange::Modified(root()),
+            WatchChange::Renamed {
+                from: root(),
+                to: file("x"),
+            },
+            WatchChange::Renamed {
+                from: file("x"),
+                to: root(),
+            },
+        ] {
+            let (out, hint) = strip_root_hints(batch(vec![
+                WatchChange::MetadataChanged(root()),
+                change,
+                WatchChange::Modified(file("c.txt")),
+            ]));
+            assert_eq!(hint, RootHint::Structural);
+            assert_eq!(changes_of(&out), vec![WatchChange::Modified(file("c.txt"))]);
+        }
+    }
+
+    #[test]
+    fn rescan_required_is_left_alone() {
+        let input = WatchBatch::RescanRequired {
+            epoch: WatchEpoch::from_u64(1),
+            reason: acyclic_fs::WatchInvalidationReason::InitialSnapshotRequired,
+        };
+        let (out, hint) = strip_root_hints(input);
+        assert_eq!(hint, RootHint::None);
+        assert!(matches!(out, WatchBatch::RescanRequired { .. }));
     }
 }

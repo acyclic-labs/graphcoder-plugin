@@ -12,12 +12,16 @@
 
 pub mod config;
 pub mod diff;
+pub mod exclude;
 pub mod fork;
 pub mod guard;
 pub mod index;
+pub mod merge;
 pub mod pipeline;
+pub mod product;
 pub mod rewind;
 pub mod store;
+pub mod trace;
 
 use thiserror::Error;
 

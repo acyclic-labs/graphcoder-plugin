@@ -28,8 +28,39 @@ pub struct Config {
     /// Safe Mode: path prefixes (relative to the repo root) no fork or
     /// scratch tree may write to, enforced at the native mount layer.
     pub guarded_paths: Vec<String>,
+    /// Snapshot exclusions: repo-relative paths (a file, or a directory and
+    /// everything under it) that never enter a checkpoint. For secrets and
+    /// bulky generated state the store must not shadow. A full rewind
+    /// carries the live copies over untouched. See `crate::exclude`.
+    pub exclude: Vec<String>,
     /// Parameters the fork-decomposition skill reads via `acyclic policy`.
     pub decompose: Decompose,
+    /// Content-merge knobs (`[merge]`).
+    pub merge: Merge,
+}
+
+/// `[merge]` table: limits for content-level merges at promote time.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Merge {
+    /// Largest file the three-way merge will read; bigger ones refuse.
+    pub max_file_bytes: u64,
+}
+
+impl Default for Merge {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: crate::merge::DEFAULT_MAX_FILE_BYTES,
+        }
+    }
+}
+
+impl Merge {
+    pub fn limits(&self) -> crate::merge::MergeLimits {
+        crate::merge::MergeLimits {
+            max_file_bytes: self.max_file_bytes,
+        }
+    }
 }
 
 /// Knobs for the `acyclic-fork-decompose` skill. The skill text is the
@@ -79,7 +110,9 @@ impl Default for Config {
             store_dir: None,
             dry_run: false,
             guarded_paths: Vec::new(),
+            exclude: Vec::new(),
             decompose: Decompose::default(),
+            merge: Merge::default(),
         }
     }
 }
@@ -89,7 +122,7 @@ impl Config {
     /// defaults from `~/.config/acyclic/config.toml`. Missing files are fine.
     pub fn load(repo_root: &Path) -> Result<Self> {
         let machine = std::env::var_os("HOME")
-            .map(|home| Path::new(&home).join(".config/acyclic/config.toml"));
+            .map(|home| Path::new(&home).join(format!(".config/{}/config.toml", crate::product::NAME)));
         Self::load_layered(machine.as_deref(), repo_root)
     }
 
@@ -100,7 +133,7 @@ impl Config {
         if let Some(machine) = machine {
             config = Self::merge_file(config, machine)?;
         }
-        Self::merge_file(config, &repo_root.join(".acyclic/config.toml"))
+        Self::merge_file(config, &repo_root.join(crate::product::repo_config_file()))
     }
 
     fn merge_file(base: Config, path: &Path) -> Result<Self> {
@@ -127,9 +160,9 @@ mod tests {
     #[test]
     fn repo_config_overrides_defaults() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "quiesce_ms = 10\ncommit_every = 5\n",
         )
         .expect("write");
@@ -143,9 +176,9 @@ mod tests {
     #[test]
     fn safe_mode_fields_parse_from_repo_config() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "dry_run = true\nguarded_paths = [\".env\", \"migrations/\"]\n",
         )
         .expect("write");
@@ -155,11 +188,25 @@ mod tests {
     }
 
     #[test]
+    fn exclude_list_parses_from_repo_config() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
+        std::fs::write(
+            repo.path().join(crate::product::repo_config_file()),
+            "exclude = [\".env\", \"secrets/\"]\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(None, repo.path()).expect("load");
+        assert_eq!(config.exclude, vec![".env", "secrets/"]);
+        assert!(Config::default().exclude.is_empty());
+    }
+
+    #[test]
     fn decompose_table_overrides_defaults_and_keeps_the_rest() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "[decompose]\nfan_out = 2\ntest_command = \"cargo test\"\n",
         )
         .expect("write");
@@ -171,11 +218,26 @@ mod tests {
     }
 
     #[test]
+    fn merge_table_overrides_the_size_cap() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
+        std::fs::write(
+            repo.path().join(crate::product::repo_config_file()),
+            "[merge]\nmax_file_bytes = 1024\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(None, repo.path()).expect("load");
+        assert_eq!(config.merge.max_file_bytes, 1024);
+        assert_eq!(config.merge.limits().max_file_bytes, 1024);
+        assert_eq!(Config::default().merge.max_file_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
     fn unknown_keys_are_rejected_loudly() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(repo.path().join(".acyclic")).expect("dir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
-            repo.path().join(".acyclic/config.toml"),
+            repo.path().join(crate::product::repo_config_file()),
             "quiesce_millis = 10\n",
         )
         .expect("write");
