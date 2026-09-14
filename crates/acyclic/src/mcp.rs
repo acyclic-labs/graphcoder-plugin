@@ -28,14 +28,19 @@ use serde::Deserialize;
 
 use crate::client::{Client, ConnectError, Spawn};
 
-pub async fn run(repo: PathBuf) -> Result<(), String> {
-    let server = McpServer { repo };
-    let service = server
-        .serve(stdio())
-        .await
-        .map_err(|error| error.to_string())?;
-    service.waiting().await.map_err(|error| error.to_string())?;
-    Ok(())
+/// Serves stdio until the host closes stdin. Owns its runtime: the CLI is
+/// otherwise synchronous, and this is the one command that lives as long
+/// as the host process.
+pub fn run(repo: PathBuf) -> Result<(), String> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let service = McpServer { repo }
+            .serve(stdio())
+            .await
+            .map_err(|error| error.to_string())?;
+        service.waiting().await.map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })
 }
 
 fn internal_error(message: String) -> McpError {

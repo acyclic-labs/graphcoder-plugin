@@ -263,22 +263,13 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         Command::Init => init(repo),
         Command::Policy => policy(repo),
         Command::Hook { event } => hook::run(repo, &event),
-        Command::Mcp => {
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    eprintln!("{}: {error}", product::NAME);
-                    return 1;
-                }
-            };
-            match runtime.block_on(mcp::run(repo.to_path_buf())) {
-                Ok(()) => 0,
-                Err(message) => {
-                    eprintln!("{}: {message}", product::NAME);
-                    1
-                }
+        Command::Mcp => match mcp::run(repo.to_path_buf()) {
+            Ok(()) => 0,
+            Err(message) => {
+                eprintln!("{} mcp: {message}", product::NAME);
+                1
             }
-        }
+        },
         Command::Install { host } => match install::run(repo, &host) {
             Ok(()) => {
                 print_mount_capability();
