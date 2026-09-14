@@ -5,3 +5,4 @@ dist/
 .acyclic/
 target/
 build/
+.infisical.json

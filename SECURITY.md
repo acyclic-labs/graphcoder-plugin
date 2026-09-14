@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please do not open public issues for security vulnerabilities. Email **security@acyclic.dev** (or var@acyclic.dev / ram@acyclic.dev until the alias is live) with a description and reproduction steps. We aim to acknowledge reports within 48 hours.
+Please do not open public issues for security vulnerabilities. Email **security@acyclic.dev** with a description and reproduction steps. We aim to acknowledge reports within 48 hours.
 
 ## Scope
 

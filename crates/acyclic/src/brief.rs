@@ -55,7 +55,10 @@ pub fn render(info: &proto::BriefInfo) -> String {
     if session.abandoned.is_empty() {
         lines.push("  no abandoned branches.".to_string());
     } else {
-        lines.push(format!("  {} abandoned branch(es):", session.abandoned.len()));
+        lines.push(format!(
+            "  {} abandoned branch(es):",
+            session.abandoned.len()
+        ));
         for branch in &session.abandoned {
             let turn = match (branch.turn, &branch.prompt) {
                 (Some(turn), Some(prompt)) => format!(" turn {turn} {}", quote(prompt, 60)),
@@ -101,8 +104,14 @@ fn fit(mut lines: Vec<String>) -> String {
         let branch_index = lines.len() - 3;
         if lines[branch_index].starts_with("    #") {
             lines.remove(branch_index);
-            let listed = lines.iter().filter(|line| line.starts_with("    #")).count();
-            if let Some(header) = lines.iter_mut().find(|line| line.contains("abandoned branch")) {
+            let listed = lines
+                .iter()
+                .filter(|line| line.starts_with("    #"))
+                .count();
+            if let Some(header) = lines
+                .iter_mut()
+                .find(|line| line.contains("abandoned branch"))
+            {
                 *header = format!("  {listed}+ abandoned branches (more not shown):");
             }
         } else {
@@ -198,7 +207,11 @@ mod tests {
     fn renders_under_budget_however_many_branches() {
         for abandoned in [0, 1, 3, 25] {
             let text = render(&session(abandoned));
-            assert!(text.len() <= BUDGET_BYTES, "{abandoned}: {} bytes", text.len());
+            assert!(
+                text.len() <= BUDGET_BYTES,
+                "{abandoned}: {} bytes",
+                text.len()
+            );
             assert!(text.contains("last session 01234567…"));
             assert!(text.contains("checkpoint #41"));
             assert!(text.contains("3 files differ"));

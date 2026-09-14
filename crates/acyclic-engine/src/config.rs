@@ -121,8 +121,9 @@ impl Config {
     /// Loads the repo's checked-in `.acyclic/config.toml` over machine
     /// defaults from `~/.config/acyclic/config.toml`. Missing files are fine.
     pub fn load(repo_root: &Path) -> Result<Self> {
-        let machine = std::env::var_os("HOME")
-            .map(|home| Path::new(&home).join(format!(".config/{}/config.toml", crate::product::NAME)));
+        let machine = std::env::var_os("HOME").map(|home| {
+            Path::new(&home).join(format!(".config/{}/config.toml", crate::product::NAME))
+        });
         Self::load_layered(machine.as_deref(), repo_root)
     }
 

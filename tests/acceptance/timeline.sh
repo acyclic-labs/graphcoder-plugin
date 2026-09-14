@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch 2 (plans/02-timeline.md) acceptance, scripted end to end through the
+# Launch 2 (docs/design/02-timeline.md) acceptance, scripted end to end through the
 # hook contract a host would use:
 #   1. any checkpoint resolves to (session, turn, prompt) and back;
 #   2. a new session's start brief names the last session's end state and

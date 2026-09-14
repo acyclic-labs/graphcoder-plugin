@@ -16,7 +16,7 @@
 //! Exclusion is not purge. A generation captured before a path was excluded
 //! still holds it, and at the pinned sdk revision the fs has no way to
 //! release a retained generation, so nothing can be physically removed from
-//! history. That gap is documented in plans/implementation-rewind.md.
+//! history. That gap is documented in docs/design/implementation-rewind.md.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};

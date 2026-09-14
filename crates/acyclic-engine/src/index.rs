@@ -281,8 +281,10 @@ impl Index {
     pub fn by_id(&self, id: i64) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(
-                &format!("SELECT {CHECKPOINT_COLUMNS}
-                 FROM checkpoints WHERE id = ?1"),
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS}
+                 FROM checkpoints WHERE id = ?1"
+                ),
                 params![id],
                 row_to_checkpoint,
             )
@@ -295,9 +297,11 @@ impl Index {
     pub fn latest_target(&self) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(
-                &format!("SELECT {CHECKPOINT_COLUMNS}
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS}
                  FROM checkpoints WHERE kind IN ('baseline','pre','post','manual')
-                 ORDER BY id DESC LIMIT 1"),
+                 ORDER BY id DESC LIMIT 1"
+                ),
                 [],
                 row_to_checkpoint,
             )
@@ -358,9 +362,11 @@ impl Index {
     pub fn latest(&self) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(
-                &format!("SELECT {CHECKPOINT_COLUMNS}
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS}
                  FROM checkpoints WHERE kind != 'failed'
-                 ORDER BY id DESC LIMIT 1"),
+                 ORDER BY id DESC LIMIT 1"
+                ),
                 [],
                 row_to_checkpoint,
             )
@@ -375,13 +381,13 @@ impl Index {
         turn: Option<i64>,
         limit: u32,
     ) -> Result<Vec<CheckpointRow>> {
-        let mut statement = self.connection.prepare(
-            &format!("SELECT {CHECKPOINT_COLUMNS}
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {CHECKPOINT_COLUMNS}
              FROM checkpoints
              WHERE (?1 IS NULL OR session_id = ?1)
                AND (?3 IS NULL OR turn = ?3)
-             ORDER BY id DESC LIMIT ?2"),
-        )?;
+             ORDER BY id DESC LIMIT ?2"
+        ))?;
         let rows = statement.query_map(params![session_id, limit, turn], row_to_checkpoint)?;
         let mut result = Vec::new();
         for row in rows {
@@ -394,16 +400,17 @@ impl Index {
     pub fn session_start(&self, session_id: &str) -> Result<Option<CheckpointRow>> {
         self.connection
             .query_row(
-                &format!("SELECT {CHECKPOINT_COLUMNS}
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS}
                  FROM checkpoints WHERE session_id = ?1 AND kind != 'failed'
-                 ORDER BY id ASC LIMIT 1"),
+                 ORDER BY id ASC LIMIT 1"
+                ),
                 params![session_id],
                 row_to_checkpoint,
             )
             .optional()
             .map_err(Into::into)
     }
-
 
     /// Last real (restorable, non-bookkeeping) checkpoint of one session:
     /// where the session ended up.
@@ -836,13 +843,21 @@ mod tests {
             .expect("row");
         assert_eq!(index.by_id(untethered).expect("q").expect("s").turn, None);
 
-        let t1 = index.turn_started("s1", "  fix   the\nJWT   refactor ").expect("turn");
+        let t1 = index
+            .turn_started("s1", "  fix   the\nJWT   refactor ")
+            .expect("turn");
         assert_eq!(t1, 1);
-        let a = index.record(generation(2), CheckpointKind::Pre, &session).expect("row");
-        let b = index.record(generation(3), CheckpointKind::Post, &session).expect("row");
+        let a = index
+            .record(generation(2), CheckpointKind::Pre, &session)
+            .expect("row");
+        let b = index
+            .record(generation(3), CheckpointKind::Post, &session)
+            .expect("row");
         let t2 = index.turn_started("s1", "now the tests").expect("turn");
         assert_eq!(t2, 2);
-        let c = index.record(generation(4), CheckpointKind::Post, &session).expect("row");
+        let c = index
+            .record(generation(4), CheckpointKind::Post, &session)
+            .expect("row");
 
         // checkpoint -> (session, turn, prompt)
         let row = index.by_id(b).expect("q").expect("s");
@@ -876,9 +891,15 @@ mod tests {
             session_id: Some("s1".into()),
             ..Attribution::default()
         };
-        let keep = index.record(generation(1), CheckpointKind::Post, &session).expect("row");
-        let lost_a = index.record(generation(2), CheckpointKind::Post, &session).expect("row");
-        let lost_b = index.record(generation(3), CheckpointKind::Post, &session).expect("row");
+        let keep = index
+            .record(generation(1), CheckpointKind::Post, &session)
+            .expect("row");
+        let lost_a = index
+            .record(generation(2), CheckpointKind::Post, &session)
+            .expect("row");
+        let lost_b = index
+            .record(generation(3), CheckpointKind::Post, &session)
+            .expect("row");
         let safety = index
             .record(
                 generation(3),

@@ -44,11 +44,15 @@ struct Payload {
 
 impl Payload {
     fn session(&mut self) -> Option<String> {
-        self.session_id.take().or_else(|| self.conversation_id.take())
+        self.session_id
+            .take()
+            .or_else(|| self.conversation_id.take())
     }
 
     fn tool(&mut self) -> Option<String> {
-        self.tool_name.take().or_else(|| self.command.take().map(|_| "Bash".to_string()))
+        self.tool_name
+            .take()
+            .or_else(|| self.command.take().map(|_| "Bash".to_string()))
     }
 }
 

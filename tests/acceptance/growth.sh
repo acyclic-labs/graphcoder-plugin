@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Store growth (plans/01-rewind.md): a long session of distinct checkpoints
+# Store growth (docs/design/01-rewind.md): a long session of distinct checkpoints
 # must cost the same on a big tree as on a small one, i.e. growth is a
 # fixed per-checkpoint overhead (tree pages, generation roots) and never a
 # copy of the tree. Two repos, same edit sequence, 4x the blob size: the

@@ -19,7 +19,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 fn guarded_error() -> MountSourceError {
-    MountSourceError::Unsupported(format!("path is guarded by {}", crate::product::repo_config_file()))
+    MountSourceError::Unsupported(format!(
+        "path is guarded by {}",
+        crate::product::repo_config_file()
+    ))
 }
 
 /// One guarded path prefix, pre-split into components for comparison
@@ -571,7 +574,9 @@ mod tests {
                 "sidecar {sidecar:?} must be refused"
             );
         }
-        assert!(guard.create_file(&test_path(&["notes.txt"]), metadata()).is_ok());
+        assert!(guard
+            .create_file(&test_path(&["notes.txt"]), metadata())
+            .is_ok());
         Ok(())
     }
 

@@ -12,6 +12,7 @@ use acyclic_engine::guard::GuardedMountFilesystem;
 use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::merge::{self, Entry};
 use acyclic_engine::pipeline::{self, PipelineHandle};
+use acyclic_engine::product::NAME;
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
 use acyclic_fs::model::VolumeConfig;
@@ -19,7 +20,6 @@ use acyclic_fs::{
     mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
     NativeMountRequest, NativeMountSession, RoutedMountSource,
 };
-use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -224,7 +224,7 @@ impl Server {
                     reply_name(&reply),
                     acyclic_engine::trace::ms(started)
                 );
-                proto::Payload::Ok(reply)
+                proto::Payload::Ok(Box::new(reply))
             }
             Err(message) => {
                 acyclic_engine::trace!(
@@ -274,7 +274,10 @@ impl Server {
                     rewind_target: None,
                 };
                 if wait {
-                    acyclic_engine::trace!("daemon", "checkpoint: WAIT path (reply after the capture lands; durable={durable})");
+                    acyclic_engine::trace!(
+                        "daemon",
+                        "checkpoint: WAIT path (reply after the capture lands; durable={durable})"
+                    );
                     let outcome = self
                         .handle
                         .checkpoint(kind, attribution)
@@ -293,7 +296,10 @@ impl Server {
                     // happens BEFORE the ack, so a stop arriving after the
                     // ack queues behind the capture instead of dropping it.
                     // Failures land in the index as `failed`.
-                    acyclic_engine::trace!("daemon", "checkpoint: ENQUEUE path (ack on admission, capture runs behind)");
+                    acyclic_engine::trace!(
+                        "daemon",
+                        "checkpoint: ENQUEUE path (ack on admission, capture runs behind)"
+                    );
                     self.handle
                         .checkpoint_enqueued(kind, attribution)
                         .await
@@ -432,7 +438,12 @@ impl Server {
                     .restore_path(row, PathBuf::from(&path))
                     .await
                     .map_err(stringify)?;
-                let recorded_checkpoint = self.handle.status().await.map_err(stringify)?.last_checkpoint;
+                let recorded_checkpoint = self
+                    .handle
+                    .status()
+                    .await
+                    .map_err(stringify)?
+                    .last_checkpoint;
                 Ok(proto::Reply::Restore(proto::RestoreInfo {
                     checkpoint: row_id,
                     path: outcome.path.display().to_string(),
@@ -464,7 +475,9 @@ impl Server {
                 // handle is not Sync and must not live across it.
                 let (before_row, after_row) = {
                     let index = self.open_index()?;
-                    let resolve = |id: Option<i64>, hex: Option<String>| -> Result<Option<CheckpointRow>, String> {
+                    let resolve = |id: Option<i64>,
+                                   hex: Option<String>|
+                     -> Result<Option<CheckpointRow>, String> {
                         match (id, hex) {
                             (Some(id), _) => Ok(Some(
                                 index
@@ -501,9 +514,9 @@ impl Server {
                     .diff(before_row.generation, after_row.generation)
                     .await
                     .map_err(stringify)?;
-                Ok(proto::Reply::Diff(
-                    self.annotate_ignored(changes.into_iter().map(diff_entry).collect()),
-                ))
+                Ok(proto::Reply::Diff(self.annotate_ignored(
+                    changes.into_iter().map(diff_entry).collect(),
+                )))
             }
             proto::Op::SessionStart { session_id, host } => {
                 self.handle
@@ -536,7 +549,8 @@ impl Server {
                 for id in scratch_ids {
                     let fork = self.forks.lock().await.remove(&id);
                     let copy_dir = fork.and_then(|fork| fork.copy_dir);
-                    if let Err(error) = self.discard_fork_workspace(&id, copy_dir.as_deref()).await {
+                    if let Err(error) = self.discard_fork_workspace(&id, copy_dir.as_deref()).await
+                    {
                         eprintln!("{NAME} daemon: drop scratch fork {id}: {error}");
                     }
                 }
@@ -581,7 +595,8 @@ impl Server {
                 for _ in 0..count {
                     let seed = self.handle.fork().await.map_err(stringify)?;
                     let id = short_id();
-                    self.attach_route(&id, Arc::clone(&seed.shared), seed.config, seed.volume_id).await?;
+                    self.attach_route(&id, Arc::clone(&seed.shared), seed.config, seed.volume_id)
+                        .await?;
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
@@ -619,7 +634,8 @@ impl Server {
                 let mut forks = self.forks.lock().await;
                 let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
-                self.discard_fork_workspace(&id, fork.copy_dir.as_deref()).await?;
+                self.discard_fork_workspace(&id, fork.copy_dir.as_deref())
+                    .await?;
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Promote { id } => {
@@ -629,7 +645,12 @@ impl Server {
                 let label = format!("promote fork {id}");
                 let result = self.promote_fork(&id, &fork, &label).await;
                 let landed = match result {
-                    Ok(Landed::Conflicted { theirs, ours, files, kept }) => {
+                    Ok(Landed::Conflicted {
+                        theirs,
+                        ours,
+                        files,
+                        kept,
+                    }) => {
                         // Nothing landed: the fork was rebased onto `theirs`
                         // with markers written in. Keep it, judged against
                         // the head it now sits on.
@@ -664,7 +685,9 @@ impl Server {
                         // A refusal (or a failure) leaves the fork exactly as
                         // it was, still promotable once the cause is fixed.
                         // A resolved conflict stays resolved.
-                        if fork.conflict.is_some() && !message.starts_with("unresolved conflict markers") {
+                        if fork.conflict.is_some()
+                            && !message.starts_with("unresolved conflict markers")
+                        {
                             fork.conflict = None;
                             fork.entry.conflict_paths.clear();
                             fork.entry.conflict = None;
@@ -676,7 +699,10 @@ impl Server {
                 };
                 // Landed: the fork is consumed. Drop its route (mount fork)
                 // or its directory (copy fork).
-                if let Err(error) = self.discard_fork_workspace(&id, fork.copy_dir.as_deref()).await {
+                if let Err(error) = self
+                    .discard_fork_workspace(&id, fork.copy_dir.as_deref())
+                    .await
+                {
                     eprintln!("{NAME} daemon: discard fork {id} after promote: {error}");
                 }
                 match landed {
@@ -690,7 +716,8 @@ impl Server {
                         generation: acyclic_engine::generation_hex(generation),
                         old_tree: None,
                         warning: if moved {
-                            "the mainline had moved; the fork's paths were merged onto it in place".into()
+                            "the mainline had moved; the fork's paths were merged onto it in place"
+                                .into()
                         } else {
                             String::new()
                         },
@@ -731,8 +758,11 @@ impl Server {
                 let overlay = match copy_dir {
                     None => shared,
                     Some(dir) => {
-                        let scratch =
-                            self.handle.scratch_checkout(base).await.map_err(stringify)?;
+                        let scratch = self
+                            .handle
+                            .scratch_checkout(base)
+                            .await
+                            .map_err(stringify)?;
                         fork::capture_copy(&scratch, &dir)
                             .await
                             .map_err(stringify)?;
@@ -745,7 +775,10 @@ impl Server {
                         .snapshot_overlay(overlay)
                         .await
                         .map_err(stringify)?;
-                    self.handle.diff(base, generation).await.map_err(stringify)?
+                    self.handle
+                        .diff(base, generation)
+                        .await
+                        .map_err(stringify)?
                 } else {
                     Vec::new()
                 };
@@ -805,17 +838,14 @@ impl Server {
                             .diff(base, generation)
                             .await
                             .map_err(stringify)?;
-                        self.pending
-                            .lock()
-                            .await
-                            .insert(
-                                session_id.clone(),
-                                PendingSession {
-                                    generation,
-                                    base,
-                                    label,
-                                },
-                            );
+                        self.pending.lock().await.insert(
+                            session_id.clone(),
+                            PendingSession {
+                                generation,
+                                base,
+                                label,
+                            },
+                        );
                         Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
                             session_id,
                             diff: changes.into_iter().map(diff_entry).collect(),
@@ -983,7 +1013,11 @@ impl Server {
         // invalidate a route name.)
         let overlay = match fork.copy_dir.as_deref() {
             Some(dir) => {
-                let scratch = self.handle.scratch_checkout(fork.base).await.map_err(stringify)?;
+                let scratch = self
+                    .handle
+                    .scratch_checkout(fork.base)
+                    .await
+                    .map_err(stringify)?;
                 fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
                 scratch
             }
@@ -997,20 +1031,45 @@ impl Server {
         acyclic_engine::trace!(
             "daemon",
             "promote {id}: {} fork, mainline {} since the fork's base",
-            if fork.copy_dir.is_some() { "copy" } else { "mount" },
-            if head == fork.base { "UNMOVED (plain in-place write)" } else { "MOVED (three-way merge)" }
+            if fork.copy_dir.is_some() {
+                "copy"
+            } else {
+                "mount"
+            },
+            if head == fork.base {
+                "UNMOVED (plain in-place write)"
+            } else {
+                "MOVED (three-way merge)"
+            }
         );
         let landed = self
-            .merge_onto_head(id, overlay, fork.base, head, fork.copy_dir.as_deref(), label)
+            .merge_onto_head(
+                id,
+                overlay,
+                fork.base,
+                head,
+                fork.copy_dir.as_deref(),
+                label,
+            )
             .await;
         acyclic_engine::trace!(
             "daemon",
             "promote {id}: outcome {}",
             match &landed {
-                Ok(Landed::Replayed { paths, merged, kept, .. }) =>
-                    format!("LANDED ({paths} path(s) written, {merged} merged by content, {} ignored kept)", kept.len()),
+                Ok(Landed::Replayed {
+                    paths,
+                    merged,
+                    kept,
+                    ..
+                }) => format!(
+                    "LANDED ({paths} path(s) written, {merged} merged by content, {} ignored kept)",
+                    kept.len()
+                ),
                 Ok(Landed::Nothing { .. }) => "NOTHING to land".to_string(),
-                Ok(Landed::Conflicted { files, .. }) => format!("CONFLICT: {} file(s) rebased into the fork with markers", files.len()),
+                Ok(Landed::Conflicted { files, .. }) => format!(
+                    "CONFLICT: {} file(s) rebased into the fork with markers",
+                    files.len()
+                ),
                 Err(message) => format!("REFUSED: {}", message.lines().next().unwrap_or("")),
             }
         );
@@ -1019,7 +1078,10 @@ impl Server {
 
     /// Marks the entries the repo's `.gitignore` covers. One git call.
     fn annotate_ignored(&self, mut entries: Vec<proto::DiffEntry>) -> Vec<proto::DiffEntry> {
-        let paths: Vec<PathBuf> = entries.iter().map(|entry| PathBuf::from(&entry.path)).collect();
+        let paths: Vec<PathBuf> = entries
+            .iter()
+            .map(|entry| PathBuf::from(&entry.path))
+            .collect();
         let ignored = merge::ignored_paths(&self.repo_root, &paths);
         for entry in &mut entries {
             entry.ignored = ignored.iter().any(|path| path == Path::new(&entry.path));
@@ -1153,7 +1215,10 @@ impl Server {
     ) -> Result<Landed, String> {
         let moved = head != base;
         if !overlay.lock().await.has_pending_mutations() {
-            return Ok(Landed::Nothing { generation: head, kept: Vec::new() });
+            return Ok(Landed::Nothing {
+                generation: head,
+                kept: Vec::new(),
+            });
         }
         let snapshot = self
             .handle
@@ -1174,7 +1239,8 @@ impl Server {
             .map(|refusal| refusal.path.clone())
             .chain(plan.conflicted.iter().map(|file| file.path.clone()))
             .collect();
-        let ignored = tokio::task::block_in_place(|| merge::ignored_paths(&self.repo_root, &contested));
+        let ignored =
+            tokio::task::block_in_place(|| merge::ignored_paths(&self.repo_root, &contested));
         let kept: Vec<String> = plan
             .keep_mainline_for(&ignored)
             .iter()
@@ -1212,14 +1278,24 @@ impl Server {
             return Err("internal: conflicts against an unmoved mainline".into());
         }
         if plan.lands_nothing() {
-            return Ok(Landed::Nothing { generation: head, kept });
+            return Ok(Landed::Nothing {
+                generation: head,
+                kept,
+            });
         }
 
         // M = H + (fork-only subtrees from F) + (content-merged files).
         let mut entries: Vec<(PathBuf, Entry)> = plan
             .take_ours
             .iter()
-            .map(|path| (path.clone(), Entry::FromGeneration { generation: snapshot }))
+            .map(|path| {
+                (
+                    path.clone(),
+                    Entry::FromGeneration {
+                        generation: snapshot,
+                    },
+                )
+            })
             .collect();
         entries.extend(plan.merged.iter().map(|file| {
             (
@@ -1380,7 +1456,10 @@ impl Server {
         copy_dir: Option<&Path>,
     ) -> Result<(), String> {
         let changed: Vec<PathBuf> = content_changes(
-            self.handle.diff(snapshot, rebased).await.map_err(stringify)?,
+            self.handle
+                .diff(snapshot, rebased)
+                .await
+                .map_err(stringify)?,
         )
         .into_iter()
         .map(|change| change.path)
@@ -1415,10 +1494,15 @@ impl Server {
 
     /// Drops whatever backs a fork: its route for mounted forks, its
     /// directory for copy forks.
-    async fn discard_fork_workspace(&self, id: &str, copy_dir: Option<&Path>) -> Result<(), String> {
+    async fn discard_fork_workspace(
+        &self,
+        id: &str,
+        copy_dir: Option<&Path>,
+    ) -> Result<(), String> {
         match copy_dir {
             Some(dir) => {
-                std::fs::remove_dir_all(dir).map_err(|error| format!("remove fork copy: {error}"))?;
+                std::fs::remove_dir_all(dir)
+                    .map_err(|error| format!("remove fork copy: {error}"))?;
                 Self::remove_if_empty(dir.parent());
                 Ok(())
             }
@@ -1513,7 +1597,11 @@ impl Server {
         let id = session.session_id.clone();
         let start = index.session_start(&id).map_err(stringify)?;
         let end = index.session_end(&id).map_err(stringify)?;
-        let last_any = index.list(Some(&id), None, 1).map_err(stringify)?.into_iter().next();
+        let last_any = index
+            .list(Some(&id), None, 1)
+            .map_err(stringify)?
+            .into_iter()
+            .next();
 
         let (files_changed, sample_paths) = match (&start, &end) {
             (Some(start), Some(end)) if start.generation != end.generation => {
@@ -1539,7 +1627,9 @@ impl Server {
                 .rewinds_between(start.id, last.id)
                 .map_err(stringify)?
             {
-                let Some(target) = rewind.rewind_target else { continue };
+                let Some(target) = rewind.rewind_target else {
+                    continue;
+                };
                 let branch = index.between(target, rewind.id).map_err(stringify)?;
                 let (Some(first), Some(last)) = (branch.first(), branch.last()) else {
                     continue;
@@ -1580,7 +1670,10 @@ impl Server {
         let (end_turn, end_prompt) = match end.as_ref().and_then(|row| row.turn) {
             Some(turn) => (
                 Some(turn),
-                index.turn(&id, turn).map_err(stringify)?.map(|turn| turn.prompt),
+                index
+                    .turn(&id, turn)
+                    .map_err(stringify)?
+                    .map(|turn| turn.prompt),
             ),
             None => (None, None),
         };
@@ -1594,7 +1687,8 @@ impl Server {
                     .await
                     .map_err(stringify)?,
             )
-            .len() as u64,
+            .len()
+                as u64,
             _ => 0,
         };
 
@@ -1680,7 +1774,7 @@ enum Landed {
 fn op_name(op: &proto::Op) -> String {
     let debug = format!("{op:?}");
     debug
-        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .split([' ', '{', '('])
         .next()
         .unwrap_or("?")
         .to_string()
@@ -1689,14 +1783,17 @@ fn op_name(op: &proto::Op) -> String {
 fn reply_name(reply: &proto::Reply) -> String {
     let debug = format!("{reply:?}");
     debug
-        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .split([' ', '{', '('])
         .next()
         .unwrap_or("?")
         .to_string()
 }
 
 fn unresolved_message(paths: &[PathBuf]) -> String {
-    let shown: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+    let shown: Vec<String> = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
     format!(
         "unresolved conflict markers in: {}. Resolve every <<<<<<< / ||||||| / ======= / >>>>>>> block \
          in the fork (or delete the file) and promote again",

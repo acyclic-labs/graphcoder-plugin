@@ -66,7 +66,7 @@ Unmounts, discards the overlay, removes the workspace dir. Unknown id → error.
    path → refused by name; nothing changes.
 3. Fork with no writes → success, "nothing to land", mainline untouched.
 4. Mainline moved (per Definitions) → three-way merge of base/head/fork
-   per `plans/implementation-merge.md`: fork-only paths are replayed in
+   per `docs/design/implementation-merge.md`: fork-only paths are replayed in
    place, files both sides edited are merged by line, and the result is
    checkpointed and published ("promoted by merge/replay"). A content
    conflict rebases the fork onto the head, writes diff3 markers into the
