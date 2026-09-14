@@ -8,5 +8,4 @@ description = "Phase 0 qualification harness: proves acyclic-fs capture/restore 
 
 [dependencies]
 acyclic-fs.workspace = true
-acyclic-fs-mount.workspace = true
 tokio.workspace = true

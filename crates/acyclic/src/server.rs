@@ -1,17 +1,40 @@
 //! The per-repo daemon: owns the pipeline, serves the unix socket.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acyclic_engine::config::Config;
+use acyclic_engine::fork::{self, PromoteOutcome, SharedLocalCheckout};
 use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
+use acyclic_fs::{
+    mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
+    RoutedMountSource,
+};
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
+
+/// One live fork: the shared checkout its route serves plus wire facts.
+/// Forks are routes inside ONE native mount session (see [`ForkMount`]):
+/// FUSE-T serves a single session per burst reliably, and one session is
+/// all the routed design ever needs.
+struct ForkState {
+    shared: Arc<SharedLocalCheckout>,
+    base: acyclic_engine::GenerationId,
+    entry: proto::ForkEntry,
+}
+
+/// The one native session projecting every fork through the router.
+/// Mounted lazily on the first fork, unmounted when the last route goes.
+struct ForkMount {
+    router: Arc<RoutedMountSource>,
+    session: Option<NativeMountSession>,
+}
 
 pub fn run(repo_root: &Path) -> Result<(), String> {
     let config = Config::load(repo_root).map_err(|error| error.to_string())?;
@@ -20,8 +43,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     // Finish or unwind any rewind that a crash interrupted BEFORE the store
-    // opens and the pipeline baselines.
+    // opens and the pipeline baselines; sweep fork dirs a dead daemon left
+    // mounted (fork sessions do not survive the daemon).
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
+    fork::sweep_stale_forks(repo_root);
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let store = runtime
@@ -47,6 +72,11 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         store_root: paths.root.clone(),
         repo_root,
         shutdown: shutdown.clone(),
+        forks: Arc::new(Mutex::new(HashMap::new())),
+        fork_mount: Arc::new(Mutex::new(ForkMount {
+            router: Arc::new(RoutedMountSource::new()),
+            session: None,
+        })),
     };
 
     runtime.block_on(async move {
@@ -77,6 +107,8 @@ struct Server {
     store_root: PathBuf,
     repo_root: PathBuf,
     shutdown: Arc<Notify>,
+    forks: Arc<Mutex<HashMap<String, ForkState>>>,
+    fork_mount: Arc<Mutex<ForkMount>>,
 }
 
 impl Server {
@@ -258,10 +290,168 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Stop => {
+                // Detach the fork session before the pipeline goes away: its
+                // callback runtimes reach into the shared checkouts.
+                self.forks.lock().await.clear();
+                let mut mount = self.fork_mount.lock().await;
+                if let Some(mut session) = mount.session.take() {
+                    let _ = tokio::task::block_in_place(|| session.stop());
+                }
+                drop(mount);
+                if let Some(root) = fork::forks_mount_root(&self.repo_root) {
+                    let _ = std::fs::remove_dir_all(root);
+                }
                 self.shutdown.notify_one();
                 Ok(proto::Reply::Unit)
             }
+            proto::Op::Fork { count } => {
+                if count == 0 || count > 16 {
+                    return Err("fork count must be 1..=16".into());
+                }
+                let root = fork::forks_mount_root(&self.repo_root)
+                    .ok_or("repo root has no parent for fork workspaces")?;
+                let mut created = Vec::new();
+                for _ in 0..count {
+                    let seed = self.handle.fork().await.map_err(stringify)?;
+                    let id = short_id();
+                    // Mount-source construction spins up a callback runtime;
+                    // keep it (and any mount syscall) off async workers.
+                    let shared = Arc::clone(&seed.shared);
+                    let config = seed.config;
+                    let source = tokio::task::block_in_place(move || {
+                        CheckoutMountSource::new(shared, config)
+                            .map_err(|error| format!("mount source: {error:?}"))
+                    })?;
+                    let mut mount = self.fork_mount.lock().await;
+                    mount
+                        .router
+                        .add_route(
+                            id.clone().into_bytes(),
+                            Arc::new(source) as Arc<dyn MountFilesystem>,
+                        )
+                        .map_err(|error| format!("route: {error:?}"))?;
+                    // The ONE session, mounted lazily on the first fork. A
+                    // route insert is all later forks pay.
+                    if mount.session.is_none() {
+                        let _ = std::fs::remove_dir_all(&root);
+                        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+                        let router =
+                            Arc::clone(&mount.router) as Arc<dyn MountFilesystem>;
+                        let volume_id = seed.volume_id;
+                        let dest = root.clone();
+                        let session = tokio::task::block_in_place(move || {
+                            mount_native(
+                                NativeMountRequest {
+                                    mount_id: acyclic_engine::MountId::new(),
+                                    volume_id,
+                                    destination: dest,
+                                    writable: true,
+                                },
+                                router,
+                            )
+                            .map_err(|error| format!("mount: {error:?}"))
+                        });
+                        match session {
+                            Ok(session) => mount.session = Some(session),
+                            Err(error) => {
+                                tokio::task::block_in_place(|| {
+                                    mount.router.remove_route(id.as_bytes())
+                                });
+                                return Err(error);
+                            }
+                        }
+                    }
+                    drop(mount);
+                    let entry = proto::ForkEntry {
+                        id: id.clone(),
+                        path: root.join(&id).display().to_string(),
+                        base: acyclic_engine::generation_hex(seed.base),
+                        created_at: unix_now(),
+                    };
+                    self.forks.lock().await.insert(
+                        id,
+                        ForkState {
+                            shared: seed.shared,
+                            base: seed.base,
+                            entry: clone_entry(&entry),
+                        },
+                    );
+                    created.push(entry);
+                }
+                Ok(proto::Reply::Forks(created))
+            }
+            proto::Op::ForkList => {
+                let forks = self.forks.lock().await;
+                let mut entries: Vec<proto::ForkEntry> =
+                    forks.values().map(|fork| clone_entry(&fork.entry)).collect();
+                entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                Ok(proto::Reply::Forks(entries))
+            }
+            proto::Op::ForkDrop { id } => {
+                let mut forks = self.forks.lock().await;
+                forks.remove(&id).ok_or(format!("no fork {id}"))?;
+                drop(forks);
+                self.detach_route(&id).await?;
+                Ok(proto::Reply::Unit)
+            }
+            proto::Op::Promote { id } => {
+                let mut forks = self.forks.lock().await;
+                let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
+                drop(forks);
+                // Detach the route first: new writes stop reaching the
+                // overlay before its commit (in-flight handles detach).
+                self.detach_route(&id).await?;
+
+                let outcome = self
+                    .handle
+                    .promote(
+                        Arc::clone(&fork.shared),
+                        fork.base,
+                        format!("promote fork {id}"),
+                    )
+                    .await
+                    .map_err(stringify)?;
+                match outcome {
+                    PromoteOutcome::Promoted { generation, old_tree } => {
+                        Ok(proto::Reply::Promote(proto::PromoteInfo {
+                            generation: acyclic_engine::generation_hex(generation),
+                            old_tree: old_tree.map(|path| path.display().to_string()),
+                            warning:
+                                "reload your editor: open files still point at the replaced tree"
+                                    .into(),
+                        }))
+                    }
+                    PromoteOutcome::Conflict { message } => Err(message),
+                }
+            }
         }
+    }
+
+    /// Removes one fork's route; the session unmounts (and the mount root
+    /// disappears) when the last route goes, freeing the FUSE-T pool slot.
+    async fn detach_route(&self, id: &str) -> Result<(), String> {
+        let mut mount = self.fork_mount.lock().await;
+        // Dropping a route drops its CheckoutMountSource, which owns a tokio
+        // runtime — runtimes must never be dropped on an async worker.
+        tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+        // The kernel may hold a positive entry cache for the removed name
+        // (FSKit caches until told otherwise): invalidate it eagerly.
+        if let Some(session) = mount.session.as_ref() {
+            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes()))
+            {
+                eprintln!("acyclic daemon: invalidate {id}: {error:?}");
+            }
+        }
+        if mount.router.is_empty() {
+            if let Some(mut session) = mount.session.take() {
+                tokio::task::block_in_place(|| session.stop())
+                    .map_err(|error| format!("unmount: {error:?}"))?;
+            }
+            if let Some(root) = fork::forks_mount_root(&self.repo_root) {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+        Ok(())
     }
 
     fn open_index(&self) -> Result<Index, String> {
@@ -305,6 +495,32 @@ impl Server {
 fn err(message: String) -> proto::Payload {
     proto::Payload::Err { message }
 }
+
+fn short_id() -> String {
+    // UUIDv7 leads with timestamp bits (identical across nearby calls);
+    // the tail is the random section.
+    acyclic_engine::MountId::new().into_bytes()[10..]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
+    proto::ForkEntry {
+        id: entry.id.clone(),
+        path: entry.path.clone(),
+        base: entry.base.clone(),
+        created_at: entry.created_at,
+    }
+}
+
 
 fn stringify(error: EngineError) -> String {
     error.to_string()

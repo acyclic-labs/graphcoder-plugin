@@ -70,6 +70,24 @@ pub enum Op {
     },
     Commit,
     Stop,
+    Fork {
+        #[serde(default = "default_fork_count")]
+        count: u32,
+    },
+    ForkList,
+    ForkDrop {
+        /// Named `fork` on the wire: the envelope already owns `id`.
+        #[serde(rename = "fork")]
+        id: String,
+    },
+    Promote {
+        #[serde(rename = "fork")]
+        id: String,
+    },
+}
+
+fn default_fork_count() -> u32 {
+    1
 }
 
 fn default_limit() -> u32 {
@@ -110,6 +128,25 @@ pub enum Reply {
     Timeline(Vec<TimelineEntry>),
     Rewind(RewindInfo),
     Diff(Vec<DiffEntry>),
+    Forks(Vec<ForkEntry>),
+    Promote(PromoteInfo),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForkEntry {
+    pub id: String,
+    pub path: String,
+    /// Hex of the published generation the fork was cut from.
+    pub base: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PromoteInfo {
+    pub generation: String,
+    /// Where the replaced tree went; absent when the fork had no writes.
+    pub old_tree: Option<String>,
+    pub warning: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

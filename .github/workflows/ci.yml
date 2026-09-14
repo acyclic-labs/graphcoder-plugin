@@ -8,6 +8,10 @@ on:
 env:
   FUSE_T_VERSION: 1.2.7
   CARGO_TERM_COLOR: always
+  # acyclic-fs is fetched from its own git repo (see Cargo.toml); cargo's
+  # built-in libgit2 fetcher can't resolve a pinned commit SHA that isn't a
+  # branch tip on that host, so delegate to the system git CLI instead.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   test:
@@ -21,16 +25,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: graphcoder-plugin
-
-      # The engine is a path dependency on the sibling fs repo; the checkout
-      # layout is a build input. FS_CHECKOUT_TOKEN must grant read access to
-      # acyclic-labs/fs.
-      - name: Checkout fs (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: acyclic-labs/fs
-          path: fs
-          token: ${{ secrets.FS_CHECKOUT_TOKEN }}
 
       - name: Install FUSE-T (macOS)
         if: runner.os == 'macOS'
