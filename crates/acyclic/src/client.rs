@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
 pub enum Spawn {
@@ -33,14 +34,22 @@ impl Client {
         log_path: &Path,
         spawn: Spawn,
     ) -> Result<Self, ConnectError> {
+        let started = std::time::Instant::now();
         if let Ok(stream) = UnixStream::connect(socket) {
+            acyclic_engine::trace!("client", "connected to running daemon at {} in {:.1}ms", socket.display(), acyclic_engine::trace::ms(started));
             return Self::from_stream(stream);
         }
         match spawn {
-            Spawn::Never => Err(ConnectError::NoDaemon),
+            Spawn::Never => {
+                acyclic_engine::trace!("client", "no daemon at {} and spawning is not allowed here", socket.display());
+                Err(ConnectError::NoDaemon)
+            }
             Spawn::Allowed => {
+                acyclic_engine::trace!("client", "no daemon at {}: spawning one", socket.display());
                 let child = spawn_daemon(repo_root, log_path)?;
-                wait_for_socket(socket, child, log_path)
+                let client = wait_for_socket(socket, child, log_path);
+                acyclic_engine::trace!("client", "daemon spawn + socket wait took {:.1}ms", acyclic_engine::trace::ms(started));
+                client
             }
         }
     }
@@ -65,6 +74,23 @@ impl Client {
     pub fn call(&mut self, op: proto::Op) -> Result<proto::Reply, String> {
         let id = self.next_id;
         self.next_id += 1;
+        let name = format!("{op:?}");
+        let name = name.split(|c: char| c == ' ' || c == '{' || c == '(').next().unwrap_or("?").to_string();
+        let started = std::time::Instant::now();
+        acyclic_engine::trace!("client", "call #{id} {name}");
+        let result = self.call_inner(id, op);
+        match &result {
+            Ok(reply) => {
+                let reply_name = format!("{reply:?}");
+                let reply_name = reply_name.split(|c: char| c == ' ' || c == '{' || c == '(').next().unwrap_or("?");
+                acyclic_engine::trace!("client", "call #{id} {name} -> {reply_name} in {:.1}ms", acyclic_engine::trace::ms(started));
+            }
+            Err(message) => acyclic_engine::trace!("client", "call #{id} {name} -> error in {:.1}ms: {}", acyclic_engine::trace::ms(started), message.lines().next().unwrap_or("")),
+        }
+        result
+    }
+
+    fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Reply, String> {
         let request = proto::Request {
             v: proto::PROTOCOL_VERSION,
             id,
@@ -136,7 +162,7 @@ fn wait_for_socket(
             )));
         }
         if started.elapsed() > Duration::from_secs(2) && !reported {
-            eprintln!("acyclic: daemon starting (building the first snapshot of the tree)...");
+            eprintln!("{NAME}: daemon starting (building the first snapshot of the tree)...");
             reported = true;
         }
         std::thread::sleep(Duration::from_millis(200));

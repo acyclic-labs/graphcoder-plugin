@@ -69,7 +69,7 @@ guarded_paths = [".env", "migrations/"]
 EOF
 acy init >/dev/null || fail "init"
 REAL_BEFORE="$(tree_digest "$R")"
-INODE_BEFORE="$(stat -f '%i' "$R")"
+INODE_BEFORE="$(inode "$R")"
 
 # --- S1: session start shadows the repo root; identical to the agent ------
 if ! OUT="$(acy session-start dry-1 --host acceptance 2>&1)"; then
@@ -143,7 +143,7 @@ echo "$STATUS" | grep -q "state:         ready" || fail "S5: daemon not ready mi
 # --- S6: resolve unmounts, restores the real view, shows the exact diff ---
 DIFF="$(acy session-resolve dry-1)" || fail "S6: session-resolve: $DIFF"
 shadowed && fail "S6: still shadow-mounted after resolve"
-[ "$(stat -f '%i' "$R")" = "$INODE_BEFORE" ] || fail "S6: real root inode changed"
+[ "$(inode "$R")" = "$INODE_BEFORE" ] || fail "S6: real root inode changed"
 [ "$(tree_digest "$R")" = "$REAL_BEFORE" ] || fail "S6: real tree changed before apply"
 echo "$DIFF" | grep -q "^M src/main.rs" || fail "S6: diff missing edit: $DIFF"
 echo "$DIFF" | grep -q "^D src/b.rs" || fail "S6: diff missing rm: $DIFF"

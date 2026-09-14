@@ -35,12 +35,19 @@ pub enum ChangeKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct RecordSummary {
-    kind: FileKind,
+pub(crate) struct RecordSummary {
+    pub(crate) kind: FileKind,
     /// Full payload for content comparison (inline bytes included).
     /// `None` for directories: their payload changes with any descendant.
-    payload: Option<acyclic_fs::kernel::FilePayload>,
-    metadata: ObjectId,
+    pub(crate) payload: Option<acyclic_fs::kernel::FilePayload>,
+    pub(crate) metadata: ObjectId,
+}
+
+impl RecordSummary {
+    /// Same kind and same content; metadata (mode, times) is ignored.
+    pub(crate) fn same_content(&self, other: &RecordSummary) -> bool {
+        self.kind == other.kind && self.payload == other.payload
+    }
 }
 
 /// Computes the path-keyed diff `before → after`.
@@ -98,7 +105,7 @@ pub async fn diff(
 }
 
 /// `.git` itself or anything beneath it, at the repo root only.
-fn is_git_internal(path: &std::path::Path) -> bool {
+pub(crate) fn is_git_internal(path: &std::path::Path) -> bool {
     path.components()
         .next()
         .is_some_and(|first| first.as_os_str() == ".git")
@@ -119,6 +126,15 @@ mod tests {
         assert!(!is_git_internal(Path::new("vendor/.gitkeep")));
         assert!(!is_git_internal(Path::new("a.txt")));
     }
+}
+
+/// Path → record summary of every entry in `generation` (directories included).
+pub(crate) async fn summaries(
+    store: &Store,
+    generation: GenerationId,
+) -> Result<BTreeMap<PathBuf, RecordSummary>> {
+    let mut checkout = store.checkout_exact(generation).await?;
+    walk(&mut checkout).await
 }
 
 /// Walks every directory record in a generation into path → record summary.

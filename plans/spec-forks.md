@@ -62,14 +62,23 @@ Unmounts, discards the overlay, removes the workspace dir. Unknown id → error.
 
 ### `promote <id>`
 1. Unmounts the fork first (no writes can race the commit).
-2. Fork with no writes → success, "nothing to land", mainline untouched.
-3. Mainline moved (per Definitions) → **conflict**: legible message naming
-   the base, tree untouched, fork consumed (v1; re-fork to retry).
-4. Otherwise → fork overlay publishes (head `H2`); mainline tree is
-   replaced with `H2` via the journaled rewind swap (safety `pre_rewind`
-   row first); a `manual` row labeled `promote <id>` records it; watcher
-   re-baselines. Byte-verified content, gitignored files included; the
-   same mtime/editor caveats as rewind.
+2. A rebased fork (see 4) still holding conflict markers in any conflicted
+   path → refused by name; nothing changes.
+3. Fork with no writes → success, "nothing to land", mainline untouched.
+4. Mainline moved (per Definitions) → three-way merge of base/head/fork
+   per `plans/implementation-merge.md`: fork-only paths are replayed in
+   place, files both sides edited are merged by line, and the result is
+   checkpointed and published ("promoted by merge/replay"). A content
+   conflict rebases the fork onto the head, writes diff3 markers into the
+   fork, and lands nothing; the fork stays live for resolve-and-promote.
+   A refusal (binary, too large, kind change, directory ancestry) is a
+   legible error naming the paths; fork and tree untouched.
+5. Otherwise (mainline unmoved) → the fork's changed paths are written
+   onto the real tree one at a time with the same atomic single-path
+   restore, checkpointed and published; a `manual` row labeled
+   `promote <id> (N path(s) written in place)` records it. The repo
+   directory is never replaced by a promote (Safe Mode `session-apply`
+   still swaps and says so). Gitignored files included.
 
 ### Daemon stop / crash
 Stop unmounts all forks and removes workspace dirs before the pipeline
@@ -89,12 +98,15 @@ remove) at next start, before the store opens.
 | M2: divergent writes isolated (I1, I2) | `forks.sh` step 2 — different content per fork, mainline + siblings unchanged | acceptance | ❌ |
 | M3: mainline usable while forks live (I3) | `forks.sh` step 3 — checkpoint + diff succeed with mounts up | acceptance | ❌ |
 | M4: promote journey end-to-end (I4, I6) | `forks.sh` step 4 — promote A, byte-verify, losers dropped, timeline row | acceptance | ❌ |
-| M5: conflict via CLI (I4) | `forks.sh` step 5 — durable checkpoint then promote → error text, tree untouched | acceptance | ❌ |
+| M5: moved mainline via CLI (I4) | `merge.sh` G1–G26 — replay, content merge, conflict rebase + resolve, refusals, undo, CRLF, all-or-nothing; mount and copy modes | acceptance | ❌ |
+| C1: entry table, merge3, markers, text gate | `merge.rs` unit fixtures (graphcoder's six merge3 tests included) | unit | ✅ |
+| C2: plan over real generations, M and R, rebase into an overlay | `tests/merge.rs` | engine integration | ✅ |
 | M6: evaporation + sweep (I5) | `forks.sh` step 6 — fork-drop leaves nothing; kill -9 daemon, restart sweeps workspaces | acceptance | ❌ |
 | M7: stop cleans up (I5) | `forks.sh` teardown asserts no `forks` mounts remain | acceptance | ❌ |
 | U1: fork ids random-tailed, no collision (I7) | `server.rs` short_id guard + `fork.rs::forks_root_is_a_hidden_sibling` | unit | ✅ |
 | U2: stale sweep removes dirs | `fork.rs::sweep_removes_stale_directories` | unit | ✅ |
 
-Out of scope (v2 of this launch, documented): three-way merge onto a moved
-mainline, fork persistence across daemon restarts, subagent orchestration,
-per-fork port/env provisioning.
+Out of scope (documented): rename detection, semantic merges, conflict
+markers on the mainline, Safe Mode `apply_session` onto a moved mainline,
+fork persistence across daemon restarts, subagent orchestration, per-fork
+port/env provisioning.

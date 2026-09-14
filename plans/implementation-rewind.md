@@ -120,6 +120,17 @@ Built as `acyclic hook <event>` + `acyclic install <host>` (the installer embeds
 
 **Exit gate:** acceptance suite green in CI; clean-machine install flow works.
 
+**Status (2026-09-11): gate met, with the retention/purge scope deliberately narrowed.**
+
+Shipped:
+- Acceptance: `exclusions.sh` (declared paths never captured, noop on excluded-only edits, restore refused, rename into an excluded prefix scrubbed, rewind carries the live copies, pre-rule history untouched) and `growth.sh` (60 distinct checkpoints cost ~52 KB each, identical on a 4x larger tree: per-checkpoint overhead is tree pages, never a tree copy). Journey/soak/crash/latency were already green; the migration-script scenario is journey.sh's Bash side-effect step.
+- Snapshot exclusions (`exclude` in config): `acyclic-engine/src/exclude.rs`. Watcher hints at or under a rule are dropped before capture; renames across the boundary re-examine the uncovered side; a capture hinted at an ancestor (or the baseline) is followed by a checkout scrub before the generation is checkpointed; a full rewind (and promote / Safe Mode apply, which share `rewind::execute`) moves the live excluded paths into the new tree before the swap, journaled as a `Carrying` phase so kill -9 at any point returns them.
+- Retention: `status` reports store size, trash is TTL-pruned. **No fs GC, no purge in v1**, and this is a finding, not an omission: at sdk `8eced48`, `collect_local_garbage` keeps only authority heads plus retention facts (`RetentionKind::{Checkpoint,Pin,ForkBase}`), `retain_workspace_generation` is create-only (no release fact exists), and `prove_generation_closure` does not follow `GenerationRoot::parents`. Running GC would delete every checkpoint but the head; pinning every checkpoint first would make the store append-only forever. Purge cannot remove bytes from a retained generation for the same reason. **Upstream ask:** a retention-release fact (mirror of `encode_workspace_deleted` for retention authorities) honoured by the collector, plus a bulk "retain these N generations" call. With that, the plugin's policy is straightforward: pin what the TTL keeps, release the rest, collect.
+- Release engineering: `deny.toml` + a `deny` CI job (licenses inside a permissive allowlist, advisories, sources); an SPDX SBOM generated from `Cargo.lock` per target in `release.yml`, attested against each binary with `actions/attest-sbom`, one copy attached to the GitHub release and listed in `SHA256SUMS`; `scripts/install.sh` (verified download into `~/.local/bin`, `file://` base URL for offline tests); `scripts/install-smoke.sh` runs it on a bare Debian container and drives init → checkpoint → rewind, exclusions included. npm `@acyclic-labs/plugin` 0.0.1 is live.
+- Docs: README leads with the differentiators, documents `exclude`, and states the retention stance and caveats.
+
+Still open, by decision: the public name (`acyclic` vs graphcoder), and cutting the first `v*` tag through `release.yml`; both are the owner's call. Exclusions do not reach forks or Safe Mode sessions (they are served from generations), documented as a caveat.
+
 ---
 
 # Coordination with `fs` (being fixed upstream)

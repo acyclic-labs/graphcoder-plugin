@@ -92,9 +92,9 @@ echo "$OUT" | grep -q "promoted by replay: 1 path" || fail "M5: expected a 1-pat
 [ "$(cat "$R/src/app.txt")" = "MAINLINE" ] || fail "M5: replay touched an unrelated path"
 route_dead "$C" "${IDS[2]}" || fail "M5: replayed fork still serves"
 
-# --- M5b: overlap conflicts legibly and touches nothing ---------------------
+# --- M5b: a same-line overlap conflicts legibly, touches nothing, and
+# rebases the fork with markers (merge.sh covers the full contract) ---------
 # Fork D edits note.txt; the mainline edits note.txt again and publishes.
-# Both sides changed the same path: promote must refuse and name it.
 D_OUT="$(acy fork -n 1)" || fail "M5b: fork D"
 D_ID="$(echo "$D_OUT" | awk '/^fork /{print $2; exit}')"; D="$MNT/$D_ID"
 printf 'FORK-D-NOTE\n' > "$D/note.txt" || fail "M5b: write into fork D"
@@ -104,8 +104,10 @@ acy checkpoint --wait --durable >/dev/null || fail "M5b: durable checkpoint"
 if OUT="$(acy promote "$D_ID" 2>&1)"; then
   fail "M5b: overlapping promote should conflict: $OUT"
 fi
-echo "$OUT" | grep -q "both sides changed 1 path(s): note.txt" || fail "M5b: conflict not legible: $OUT"
+echo "$OUT" | grep -q "note.txt: 1 conflicting hunk(s)" || fail "M5b: conflict not legible: $OUT"
 [ "$(cat "$R/note.txt")" = "MAINLINE-NOTE-3" ] || fail "M5b: conflict touched the tree"
+grep -q '^<<<<<<< fork ' "$D/note.txt" || fail "M5b: markers must be written into the fork: $(cat "$D/note.txt")"
+acy fork-drop "$D_ID" >/dev/null || fail "M5b: drop D"
 
 # Restore an unmoved mainline for A and B by re-forking from current state.
 acy fork-drop "${IDS[0]}" >/dev/null || fail "drop stale A"

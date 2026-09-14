@@ -5,6 +5,7 @@
 //! the last session ended, what it changed, which branches it abandoned, and
 //! the verbs that reach the rest.
 
+use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
 /// Hard cap on the rendered text, including the trailing newline.
@@ -12,7 +13,7 @@ pub const BUDGET_BYTES: usize = 1000;
 
 pub fn render(info: &proto::BriefInfo) -> String {
     let Some(session) = &info.session else {
-        return "acyclic: no previous session on record for this repo.\n".to_string();
+        return "{NAME}: no previous session on record for this repo.\n".to_string();
     };
     let mut lines = Vec::new();
     let ended = match session.ended_at {
@@ -29,7 +30,7 @@ pub fn render(info: &proto::BriefInfo) -> String {
         _ => String::new(),
     };
     lines.push(format!(
-        "acyclic: last session {}{} {ended}{end}{end_turn}.",
+        "{NAME}: last session {}{} {ended}{end}{end_turn}.",
         short(&session.session_id),
         session
             .host
@@ -63,7 +64,7 @@ pub fn render(info: &proto::BriefInfo) -> String {
             };
             lines.push(format!(
                 "    #{}..#{}{turn}: {} checkpoints, {} files; rewound to #{}. \
-                 `acyclic diff {} {}` shows it.",
+                 `{NAME} diff {} {}` shows it.",
                 branch.from_checkpoint,
                 branch.to_checkpoint,
                 branch.checkpoints,
@@ -83,7 +84,7 @@ pub fn render(info: &proto::BriefInfo) -> String {
         lines.push("  tree unchanged since then.".to_string());
     }
     lines.push(
-        "  verbs: acyclic turns · timeline · diff --turn N · show <id> · \
+        "  verbs: {NAME} turns · timeline · diff --turn N · show <id> · \
          restore <id> <path> · rewind <id>"
             .to_string(),
     );

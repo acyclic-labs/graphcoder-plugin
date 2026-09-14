@@ -90,6 +90,12 @@ pub enum Op {
         before: Option<i64>,
         #[serde(default)]
         after: Option<i64>,
+        /// Alternatively, generation hex prefixes (what `promote` and
+        /// `status` print); resolved to the latest row holding them.
+        #[serde(default)]
+        before_hex: Option<String>,
+        #[serde(default)]
+        after_hex: Option<String>,
     },
     SessionStart {
         session_id: String,
@@ -219,6 +225,31 @@ pub struct ForkEntry {
     /// Owning session, if this is a scratch tree tied to one.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Paths still carrying conflict markers from a rebased promote; empty
+    /// when the fork has no open conflict.
+    #[serde(default)]
+    pub conflict_paths: Vec<String>,
+    /// The open conflict's three generations (hex), when one is open.
+    #[serde(default)]
+    pub conflict: Option<ConflictInfo>,
+}
+
+/// An open conflict on a fork: the generations it was judged between.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictInfo {
+    pub base: String,
+    /// The fork's snapshot at the conflicting promote.
+    pub ours: String,
+    /// The mainline head the fork was rebased onto.
+    pub theirs: String,
+}
+
+/// One file a promote could not merge cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictEntry {
+    pub path: String,
+    /// "3 conflicting hunk(s)", "mainline deleted, fork modified", ...
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,6 +263,24 @@ pub struct PromoteInfo {
     /// base and nothing overlapped. 0 for a plain swap or a no-op.
     #[serde(default)]
     pub replayed_paths: u32,
+    /// Files whose content was merged three-way before landing.
+    #[serde(default)]
+    pub merged_files: u32,
+    /// Non-empty when nothing landed: the fork was rebased onto the current
+    /// head and these files carry conflict markers in the fork workspace.
+    #[serde(default)]
+    pub conflicts: Vec<ConflictEntry>,
+    /// The fork workspace to resolve conflicts in (set with `conflicts`).
+    #[serde(default)]
+    pub fork_path: Option<String>,
+    /// Gitignored paths both sides changed: never merged or conflicted,
+    /// the mainline's copy was kept (and written into the fork on a rebase).
+    #[serde(default)]
+    pub kept_mainline: Vec<String>,
+    /// Whether the mainline had moved past the fork's base (the fork's
+    /// paths were merged onto it) or not (they were written as-is).
+    #[serde(default)]
+    pub mainline_moved: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -387,6 +436,10 @@ pub struct DiffEntry {
     /// "added" | "removed" | "modified" | "metadata"
     pub change: String,
     pub file_kind: String,
+    /// Matched by the repo's `.gitignore` (caches, build output, secrets):
+    /// shown, since rewind restores it, but not blast radius.
+    #[serde(default)]
+    pub ignored: bool,
 }
 
 fn default_fork_mode() -> String {
