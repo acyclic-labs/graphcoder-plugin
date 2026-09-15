@@ -83,6 +83,17 @@ impl StorePaths {
     pub fn meta(&self) -> PathBuf {
         self.root.join("meta.json")
     }
+    /// Speculation cache. Deliberately NOT a table in `index_db`: the
+    /// pipeline thread owns that connection and writes to it synchronously,
+    /// so a second writer contending for `SQLite`'s write lock would block the
+    /// thread every hook call waits on. See `crate::spec`.
+    pub fn spec_db(&self) -> PathBuf {
+        self.root.join("spec.db")
+    }
+    /// Scratch and pid files for in-flight speculative child processes.
+    pub fn spec_runs(&self) -> PathBuf {
+        self.root.join("spec")
+    }
 }
 
 /// Persisted store identity. The `VolumeId` MUST survive restarts:
