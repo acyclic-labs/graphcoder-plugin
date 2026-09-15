@@ -28,6 +28,8 @@ Each launch is one engine increment plus one coherent story, ordered by dependen
 | 4 | Safe Mode | Session redirection + write interposition | Agents on the codebase, not agents' mistakes in it | [04-safe-mode.md](04-safe-mode.md) |
 | 5 | Monorepo | Merkle-aware content + symbol index | The repo that finally works with agents | [05-monorepo.md](05-monorepo.md) |
 
+Cross-cutting, not a launch: **[Speculation](08-speculation.md)** — the daemon computes what the agent is about to ask for (the session brief, a turn summary) in the time when nobody is waiting. Off by default.
+
 Sequencing rationale:
 
 - Launches 1–2 ship on the cheap engine (hooks + snapshot store) without committing to how forks work. The hard CoW decision only becomes due at Launch 3.

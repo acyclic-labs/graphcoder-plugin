@@ -7,6 +7,7 @@ The plugin is open source and local-first, and that combination *is* the complia
 - **No data leaves the machine** — no DPA to sign, no data-residency question, no subprocessor list. Security review reduces to reviewing a local binary, not a vendor.
 - **Telemetry is opt-in and documented** — exactly what is sent (never code, paths, or prompts) is enumerated in the docs and inspectable in the source; a single config key and an env var disable it.
 - **Network egress is enumerable** — the daemon's only outbound calls (update check, opt-in telemetry) are listed and firewall-blockable without breaking the product.
+- **Speculation's model runs are the one exception, and they are off by default** — with `enabled` false (the default, and the only state a fresh install is ever in) nothing is sent anywhere and the claim above is literally true. A developer who turns them on in their own `~/.config/<name>/speculate.toml` is delegating to a command they named, with their own credentials: the egress is that command's, not a new endpoint of ours, and the subprocessor is whichever model vendor they already buy from. What bounds it is that the prompt is built from a store-computed diff — changed paths and the prompt excerpt, never file contents — so `exclude` governs it like everything else, and the child is given no filesystem route into the repo at all. `acyclic status` reports what has been spent. See [08-speculation.md](08-speculation.md).
 
 ## Open source made verifiable
 
