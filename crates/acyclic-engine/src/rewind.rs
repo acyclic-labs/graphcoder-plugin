@@ -953,4 +953,109 @@ mod tests {
         let journal: Journal = serde_json::from_str(text).expect("decode");
         assert!(journal.carried.is_empty());
     }
+
+    /// The contract every platform's exchange owes the caller, asserted
+    /// against whichever implementation this host compiled: after it, each
+    /// path names the other's tree. Windows reaches that through three
+    /// renames rather than one syscall, so it is the arm most worth pinning.
+    #[test]
+    fn exchange_swaps_two_directories() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let left = work.path().join("left");
+        let right = work.path().join("right");
+        std::fs::create_dir(&left).expect("left");
+        std::fs::create_dir(&right).expect("right");
+        std::fs::write(left.join("who.txt"), b"left").expect("seed left");
+        std::fs::write(right.join("who.txt"), b"right").expect("seed right");
+
+        atomic_exchange(&left, &right).expect("exchange");
+
+        assert_eq!(std::fs::read(left.join("who.txt")).expect("left"), b"right");
+        assert_eq!(
+            std::fs::read(right.join("who.txt")).expect("right"),
+            b"left"
+        );
+    }
+
+    /// A failed exchange must leave the tree it was given untouched rather
+    /// than half-moved. On Windows this exercises the unwind between the
+    /// first and second rename, which is the window where the repo path is
+    /// vacated and nothing has replaced it yet.
+    #[test]
+    fn a_failed_exchange_leaves_the_live_tree_whole() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let live = work.path().join("live");
+        std::fs::create_dir(&live).expect("live");
+        std::fs::write(live.join("keep.txt"), b"precious").expect("seed");
+        let missing = work.path().join("never-materialized");
+
+        atomic_exchange(&live, &missing).expect_err("exchange must fail");
+
+        assert!(live.is_dir(), "the live tree must still be a directory");
+        assert_eq!(
+            std::fs::read(live.join("keep.txt")).expect("content survives"),
+            b"precious"
+        );
+        #[cfg(windows)]
+        assert!(
+            !swap_scratch(&live).expect("scratch path").exists(),
+            "a failed exchange must not leave its scratch behind"
+        );
+    }
+
+    /// Windows swaps through a scratch directory, so a crash can leave the
+    /// repo path vacated with the new tree still at `tmp` and the old tree
+    /// parked in the scratch. Recovery has to finish the move *and* clear the
+    /// scratch, or the next rewind inherits a stale tree beside the repo.
+    #[cfg(windows)]
+    #[test]
+    fn recover_clears_the_scratch_a_windows_swap_left() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir(&tmp).expect("tmp");
+        std::fs::write(tmp.join("file.txt"), b"new tree").expect("seed new");
+        // Died between rename one and rename two: repo vacated, old tree parked.
+        let scratch = swap_scratch(&repo).expect("scratch path");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::fs::write(scratch.join("file.txt"), b"old tree").expect("seed old");
+        let journal_path = work.path().join("journal.json");
+        write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
+
+        recover(&journal_path).expect("recover");
+
+        assert_eq!(
+            std::fs::read(repo.join("file.txt")).expect("repo whole"),
+            b"new tree"
+        );
+        assert!(!scratch.exists(), "scratch must not outlive recovery");
+        assert!(!tmp.exists());
+        assert!(!journal_path.exists());
+    }
+
+    /// The other Windows crash point: rename two landed, so the repo already
+    /// holds the new tree and only the scratch is left to clear.
+    #[cfg(windows)]
+    #[test]
+    fn recover_clears_the_scratch_after_the_swap_landed() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::write(repo.join("file.txt"), b"new tree").expect("seed new");
+        let tmp = work.path().join("repo.tmp");
+        let scratch = swap_scratch(&repo).expect("scratch path");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::fs::write(scratch.join("file.txt"), b"old tree").expect("seed old");
+        let journal_path = work.path().join("journal.json");
+        write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
+
+        recover(&journal_path).expect("recover");
+
+        assert_eq!(
+            std::fs::read(repo.join("file.txt")).expect("repo whole"),
+            b"new tree"
+        );
+        assert!(!scratch.exists(), "scratch must not outlive recovery");
+        assert!(!journal_path.exists());
+    }
 }
