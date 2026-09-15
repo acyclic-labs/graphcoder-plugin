@@ -171,6 +171,20 @@ struct DiffParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SummaryParams {
+    /// Session to summarise a turn of. Defaults to the most recent one.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Turn number. Defaults to the last turn that finished.
+    #[serde(default)]
+    turn: Option<i64>,
+    /// Milliseconds to wait if a summary is being produced right now. Up to
+    /// a few seconds is reasonable here; zero never waits.
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RestoreParams {
     /// Checkpoint id to restore from.
     checkpoint: i64,
@@ -439,6 +453,46 @@ impl McpServer {
                 return Err(internal_error("unexpected reply".into()));
             };
             Ok(crate::brief::render(&info))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "What one conversation turn changed, in prose. Usually instant: the \
+                       daemon writes these at turn boundaries, before anything asks. Returns \
+                       'no summary' rather than producing one on demand — summaries cost the \
+                       developer money, so asking is not permission to spend. The reply says \
+                       where the words came from; treat them as a generated summary, not as a \
+                       record of what happened.",
+        annotations(read_only_hint = true)
+    )]
+    async fn summary(
+        &self,
+        Parameters(params): Parameters<SummaryParams>,
+    ) -> Result<String, McpError> {
+        with_daemon(self.repo.clone(), move |client| {
+            let reply = call(
+                client,
+                proto::Op::Summary {
+                    session_id: params.session_id,
+                    turn: params.turn,
+                    wait_ms: params.wait_ms.unwrap_or(0),
+                },
+            )?;
+            let proto::Reply::Summary(info) = reply else {
+                return Err(internal_error("unexpected reply".into()));
+            };
+            let prompt = crate::brief::quote(&info.prompt, 100);
+            Ok(match info.text {
+                Some(text) => format!(
+                    "turn {} ({prompt}) — {} summary:\n{text}",
+                    info.turn, info.source
+                ),
+                None => format!(
+                    "turn {} ({prompt}): no summary ({})",
+                    info.turn, info.source
+                ),
+            })
         })
         .await
     }

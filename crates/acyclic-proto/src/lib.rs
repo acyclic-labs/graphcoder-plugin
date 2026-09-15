@@ -201,6 +201,19 @@ pub enum Op {
         #[serde(default = "default_limit")]
         limit: u32,
     },
+    /// Prose describing one conversation turn, produced by the speculation
+    /// runner at the turn boundary. Defaults to the most recent completed
+    /// turn of the most recent session.
+    Summary {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        turn: Option<i64>,
+        /// Milliseconds to wait for a summary already being produced. Zero
+        /// (the default) never waits, which is what every hook path wants.
+        #[serde(default)]
+        wait_ms: u64,
+    },
     /// Agent-readable summary of the previous session: where it ended and
     /// which branches were abandoned. `current` is excluded (it is the
     /// session asking, and it has no history yet).
@@ -330,10 +343,29 @@ pub enum Reply {
     Inspect(InspectInfo),
     Sessions(Vec<SessionEntry>),
     Brief(BriefInfo),
+    Summary(SummaryInfo),
     Forks(Vec<ForkEntry>),
     Promote(PromoteInfo),
     /// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`.
     SessionPending(SessionPendingInfo),
+}
+
+/// One turn's summary, and where it came from.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SummaryInfo {
+    pub session_id: String,
+    pub turn: i64,
+    /// The prompt that caused the turn, as the index recorded it.
+    pub prompt: String,
+    /// `None` when nothing has been produced for this turn.
+    pub text: Option<String>,
+    /// "speculated" (it was waiting), "waited" (produced while asking), or
+    /// a reason it is unavailable. Callers surface this: a summary is
+    /// generated text, and where it came from is part of reading it.
+    pub source: String,
+    /// How far ahead of the request it landed, when it was waiting.
+    #[serde(default)]
+    pub lead_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -562,6 +594,11 @@ pub struct BriefSession {
     /// Files changed from the session's first checkpoint to its last.
     pub files_changed: u64,
     pub sample_paths: Vec<String>,
+    /// Prose for the session's last turn, when speculation produced one.
+    /// Looked up fresh rather than stored in the brief: whether a summary
+    /// exists is independent of everything else the brief reports.
+    #[serde(default)]
+    pub summary: Option<String>,
     pub abandoned: Vec<BriefAbandoned>,
 }
 

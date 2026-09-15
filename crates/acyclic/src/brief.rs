@@ -11,6 +11,11 @@ use acyclic_proto as proto;
 /// Hard cap on the rendered text, including the trailing newline.
 pub const BUDGET_BYTES: usize = 1000;
 
+/// Share of the budget a generated summary may take. Roughly a third: it
+/// earns a place, but the counts and the abandoned branches are facts and
+/// this is prose.
+const SUMMARY_BYTES: usize = 320;
+
 pub fn render(info: &proto::BriefInfo) -> String {
     let Some(session) = &info.session else {
         return format!("{NAME}: no previous session on record for this repo.\n");
@@ -53,6 +58,12 @@ pub fn render(info: &proto::BriefInfo) -> String {
         "  {} turns, {} checkpoints, {} files changed{sample}.",
         session.turns, session.checkpoints, session.files_changed
     ));
+    // High in the brief and bounded: the most useful line here, but it is
+    // generated prose, so it must not be able to crowd out the facts below
+    // it. `fit` trims branch detail from the end, never this.
+    if let Some(summary) = session.summary.as_ref().filter(|text| !text.is_empty()) {
+        lines.push(format!("  last turn: {}", bound(summary, SUMMARY_BYTES)));
+    }
     if session.abandoned.is_empty() {
         lines.push("  no abandoned branches.".to_owned());
     } else {
@@ -134,6 +145,19 @@ fn fit(mut lines: Vec<String>) -> String {
     text
 }
 
+/// Excerpt bounded to `max` bytes on a char boundary, whitespace collapsed.
+fn bound(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= max {
+        return collapsed;
+    }
+    let mut cut = max.saturating_sub(1);
+    while cut > 0 && !collapsed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", collapsed.get(..cut).unwrap_or(&collapsed))
+}
+
 /// Quoted excerpt bounded to `max` bytes on a char boundary.
 pub fn quote(prompt: &str, max: usize) -> String {
     let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -173,6 +197,10 @@ mod tests {
     use super::*;
 
     fn session(abandoned: usize) -> proto::BriefInfo {
+        summarized_session(abandoned, None)
+    }
+
+    fn summarized_session(abandoned: usize, summary: Option<String>) -> proto::BriefInfo {
         proto::BriefInfo {
             session: Some(proto::BriefSession {
                 session_id: "0123456789abcdef".into(),
@@ -186,6 +214,7 @@ mod tests {
                 end_prompt: Some("JWT refactor, approach 3, run the tests".repeat(4)),
                 files_changed: 12,
                 sample_paths: vec!["src/auth.rs".into(), "src/jwt.rs".into()],
+                summary,
                 abandoned: (0..abandoned)
                     .map(|index| proto::BriefAbandoned {
                         from_checkpoint: 10 + index as i64 * 10,
@@ -200,6 +229,35 @@ mod tests {
             }),
             drift_files: 3,
         }
+    }
+
+    /// A summary is model output, so its length is not ours to trust. The
+    /// brief's byte budget is a hard contract with the host — it is printed
+    /// straight into the agent's context — so a rambling summary must be cut
+    /// rather than allowed to push the facts out.
+    #[test]
+    fn a_long_summary_cannot_blow_the_budget() {
+        let rambling = "it refactored the whole authentication layer ".repeat(80);
+        for abandoned in [0, 3, 25] {
+            let text = render(&summarized_session(abandoned, Some(rambling.clone())));
+            assert!(
+                text.len() <= BUDGET_BYTES,
+                "{abandoned} branches: {} bytes",
+                text.len()
+            );
+            assert!(text.contains("last turn:"), "the summary should survive");
+            // And the facts it sits above survive with it.
+            assert!(
+                text.contains("checkpoints"),
+                "counts must not be crowded out"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_summary_prints_nothing() {
+        let text = render(&summarized_session(1, Some(String::new())));
+        assert!(!text.contains("last turn:"), "{text}");
     }
 
     #[test]

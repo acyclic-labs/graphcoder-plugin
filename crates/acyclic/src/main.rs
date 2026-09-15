@@ -19,6 +19,7 @@ mod hook;
 mod install;
 mod mcp;
 mod server;
+mod spec_runner;
 mod speculate;
 
 use std::path::{Path, PathBuf};
@@ -103,6 +104,21 @@ enum Command {
         #[arg(long)]
         current: Option<String>,
         /// Emit JSON instead of the agent-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What one conversation turn did, in prose, if speculation produced a
+    /// summary for it at the turn boundary.
+    Summary {
+        #[arg(long)]
+        session: Option<String>,
+        /// Defaults to the last turn that finished.
+        #[arg(long)]
+        turn: Option<i64>,
+        /// Milliseconds to wait for a summary still being produced. The
+        /// default never waits.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
         #[arg(long)]
         json: bool,
     },
@@ -665,6 +681,37 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 );
             } else {
                 print!("{}", brief::render(&info));
+            }
+            Ok(())
+        }
+        Command::Summary {
+            session,
+            turn,
+            wait_ms,
+            json,
+        } => {
+            let reply = client.call(proto::Op::Summary {
+                session_id: session,
+                turn,
+                wait_ms,
+            })?;
+            let proto::Reply::Summary(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("turn {} of {}", info.turn, short_session(&info.session_id));
+                println!("  prompt: {}", brief::quote(&info.prompt, 100));
+                match info.text {
+                    // Says where the words came from: this is generated
+                    // prose, not a record of what happened.
+                    Some(text) => println!("  {} summary: {text}", info.source),
+                    None => println!("  no summary ({})", info.source),
+                }
             }
             Ok(())
         }

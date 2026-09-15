@@ -99,3 +99,112 @@ acy stop >/dev/null || fail "S6: stop"
 sleep 1
 pgrep -f "acyclic.*__daemon.*$R" >/dev/null && fail "S6: daemon still running after stop"
 pass "S6: the scheduler stops with the daemon"
+
+# ================================================================= model runs
+# The half that spends money, driven by a stub so it costs nothing. What is
+# under test is the runner's contract, not any model's output: it is
+# pre-fired at a turn boundary, it is bounded, it is killable, and it never
+# produces a summary on demand.
+# Absolute: the child runs in an empty scratch dir, so a relative command
+# would be resolved against that and not found.
+STUB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stub-model.sh"
+
+# A conversation turn, as the host's UserPromptSubmit hook reports one.
+# There is no CLI verb for this on purpose: turns come from the host.
+turn() {
+  printf '{"session_id":"%s","prompt":"%s"}' "$1" "$2" \
+    | "$BIN" --repo "$R" hook user-prompt >/dev/null
+}
+
+# restart_with <toml-body>: a fresh daemon reading a new speculation config.
+restart_with() {
+  acy stop >/dev/null 2>&1 || true
+  sleep 1
+  printf '%s\n' "$1" > "$SPEC_CONFIG"
+  acy status >/dev/null || fail "restart with: $1"
+}
+
+# ------------------------------------------------ S7: two gates, not one
+# Naming summaries without a command must not start spending: it takes two
+# deliberate settings, so no single boolean can put anyone on the meter.
+restart_with 'enabled = true
+kinds = ["brief", "summary"]'
+acy status | grep -q "no model runs" \
+  || fail "S7: summaries without a command must not count as spending"
+pass "S7: enabling summaries without a command does not spend"
+
+restart_with "enabled = true
+kinds = [\"brief\", \"summary\"]
+command = [\"$STUB\"]
+min_run_interval_ms = 0"
+acy status | grep -q "precompute + model runs" \
+  || fail "S8: status should report that model runs are on"
+pass "S8: a configured command turns model runs on, and status says so"
+
+# ----------------------------------------- S9: pre-fired at a turn boundary
+# Turn 2 starting is what says turn 1 finished, and that is when the
+# summarizer runs — with nobody waiting on it.
+acy session-start s9 --host claude-code >/dev/null || fail "S9: session-start"
+turn s9 "add the retry helper"
+printf 'retry\n' > "$R/src/retry.rs"
+acy checkpoint --wait --session-id s9 -m "turn 1 work" >/dev/null || fail "S9: checkpoint"
+turn s9 "now the tests"
+settle 3
+
+SUMMARY="$(acy summary --session s9 --turn 1)" || fail "S9: summary"
+grep -q "stub summary of" <<<"$SUMMARY" \
+  || fail "S9: turn 1 was not summarised ahead of the request: $SUMMARY"
+# It must say where the words came from: this is generated prose.
+grep -q "speculated summary" <<<"$SUMMARY" \
+  || fail "S9: a served summary must name its source: $SUMMARY"
+pass "S9: a finished turn is summarised before anything asks"
+
+# ------------------------------------------- S10: never produced on demand
+# An unsummarised turn reports that plainly. Producing one here would bill
+# whoever asked, and asking is not consent to spend.
+MISSING="$(acy summary --session s9 --turn 99)" || fail "S10: summary"
+grep -q "no summary" <<<"$MISSING" \
+  || fail "S10: an unknown turn must not be produced on demand: $MISSING"
+pass "S10: a missing summary is reported, never produced on demand"
+
+# ---------------------------------------------------- S11: a run is bounded
+# A model command that never returns must not leave a process behind. The
+# (That the kill reaches a run's own children — the case that matters for a
+# real agent CLI, which is a runtime spawning subprocesses — is proven by
+# `spec_runner::tests::a_timeout_kills_the_children_too`, where the process
+# tree can be observed precisely.)
+#
+# The pattern is anchored to the child's exact argv, for two reasons: an
+# unanchored `pgrep -f` also matches any shell whose command line happens to
+# mention it (including the one running this suite), and `sh -c` execs a
+# simple command in place, so what is actually running is `sleep 97`.
+running() { pgrep -f '^sleep 97$' >/dev/null; }
+
+restart_with "enabled = true
+kinds = [\"summary\"]
+command = [\"/bin/sh\", \"-c\", \"sleep 97\"]
+timeout_ms = 2500
+kill_grace_ms = 200
+min_run_interval_ms = 0"
+acy session-start s11 --host claude-code >/dev/null || fail "S11: session-start"
+turn s11 "slow one"
+printf 'slow\n' > "$R/src/slow.rs"
+acy checkpoint --wait --session-id s11 -m "turn 1" >/dev/null || fail "S11: checkpoint"
+turn s11 "next"
+# Poll rather than sleep a fixed time: when the run starts depends on the
+# pipeline, and when it dies depends on the timeout.
+wait_for() { for _ in $(seq 1 60); do "$@" && return 0; sleep 0.2; done; return 1; }
+not_running() { ! running; }
+wait_for running || fail "S11: the run never started; rollup: $(rollup)"
+wait_for not_running || fail "S11: the run's child survived the timeout"
+# Poll for the record too: the child dies on SIGTERM, but the outcome is
+# written after the kill grace, so a single check here races the daemon.
+recorded_timeout() { rollup | grep -q "timeout"; }
+wait_for recorded_timeout \
+  || fail "S11: the timeout was not recorded; rollup: $(rollup)"
+pass "S11: a run that overruns is killed and recorded"
+
+acy stop >/dev/null || fail "S12: stop"
+sleep 1
+running && fail "S12: a model run outlived the daemon"
+pass "S12: no model run outlives the daemon"

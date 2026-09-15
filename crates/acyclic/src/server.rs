@@ -97,6 +97,9 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // mounted (fork sessions do not survive the daemon).
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     fork::sweep_stale_forks(repo_root);
+    // Same reason as the fork sweep, and the same moment: a model run a
+    // crashed daemon left behind is still running, and still billing.
+    crate::spec_runner::sweep_stale_runs(&paths.spec_runs());
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let store = runtime
@@ -139,6 +142,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         crate::speculate::SpecDeps {
             index_db: paths.index_db(),
             spec_db: paths.spec_db(),
+            spec_runs: paths.spec_runs(),
             handle: handle.clone(),
         },
     );
@@ -403,6 +407,12 @@ impl Server {
                     .turn_started(session_id.clone(), prompt)
                     .await
                     .map_err(stringify)?;
+                if let Some(spec) = self.spec.as_ref() {
+                    spec.notify(crate::speculate::SpecEvent::TurnStarted {
+                        session_id: session_id.clone(),
+                        turn,
+                    });
+                }
                 Ok(proto::Reply::Turn(proto::TurnInfo { session_id, turn }))
             }
             proto::Op::Inspect { checkpoint } => {
@@ -466,6 +476,14 @@ impl Server {
                 }
                 Ok(proto::Reply::Sessions(entries))
             }
+            proto::Op::Summary {
+                session_id,
+                turn,
+                wait_ms,
+            } => {
+                let info = self.summary(session_id, turn, wait_ms).await?;
+                Ok(proto::Reply::Summary(info))
+            }
             proto::Op::Brief { current } => {
                 let brief = self.brief(current.as_deref()).await?;
                 Ok(proto::Reply::Brief(brief))
@@ -474,6 +492,7 @@ impl Server {
                 target,
                 path: Some(path),
             } => {
+                self.invalidate(&crate::speculate::Cause::TreeMoved);
                 let row = self.resolve_target(target)?;
                 let row_id = row.id;
                 let outcome = self
@@ -498,6 +517,7 @@ impl Server {
                 }))
             }
             proto::Op::Rewind { target, path: None } => {
+                self.invalidate(&crate::speculate::Cause::TreeMoved);
                 let row = self.resolve_target(target)?;
                 let row_id = row.id;
                 let outcome = self.handle.rewind(row).await.map_err(stringify)?;
@@ -600,6 +620,10 @@ impl Server {
                 // brief will describe, and nothing is asking for it yet:
                 // the ideal moment to compute it.
                 if let Some(spec) = self.spec.as_ref() {
+                    // Nothing left to summarise for a session that is over.
+                    spec.notify(crate::speculate::SpecEvent::Invalidate(
+                        crate::speculate::Cause::Session(session_id.clone()),
+                    ));
                     spec.notify(crate::speculate::SpecEvent::SessionEnded);
                 }
                 Ok(proto::Reply::Unit)
@@ -855,6 +879,7 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionResolve { session_id } => {
+                self.invalidate(&crate::speculate::Cause::Session(session_id.clone()));
                 let mut slot = self.dry_session.lock().await;
                 let session = slot
                     .take()
@@ -1645,6 +1670,96 @@ impl Server {
         clippy::too_many_lines,
         reason = "one pass over the session's rows builds every section of the brief"
     )]
+    /// One turn's summary, from the speculation cache.
+    ///
+    /// Never produces one on demand: a summary costs money, and a request
+    /// arriving is not consent to spend. If the runner has not produced one,
+    /// this says so and says why — the alternative, quietly billing whoever
+    /// asked, is worse than an honest "not ready".
+    async fn summary(
+        &self,
+        session_id: Option<String>,
+        turn: Option<i64>,
+        wait_ms: u64,
+    ) -> Result<proto::SummaryInfo, String> {
+        let index = self.open_index()?;
+        // "Nothing to summarise yet" is an answer, not an error: this is an
+        // informational read, and a host that surfaces an error for an empty
+        // repo makes the tool look broken.
+        let nothing = |reason: &str| proto::SummaryInfo {
+            session_id: String::new(),
+            turn: 0,
+            prompt: String::new(),
+            text: None,
+            source: format!("unavailable: {reason}"),
+            lead_ms: None,
+        };
+        let session_id = match session_id {
+            Some(id) => id,
+            None => match index.latest_session().map_err(stringify)? {
+                Some(session) => session.session_id,
+                None => return Ok(nothing("no sessions on record")),
+            },
+        };
+        // The default is the last turn that has actually finished: the
+        // current one is still being worked on and cannot be summarised.
+        let turn = if let Some(turn) = turn {
+            turn
+        } else {
+            let last = index
+                .turns(Some(&session_id))
+                .map_err(stringify)?
+                .iter()
+                .filter(|row| row.checkpoints > 0)
+                .map(|row| row.turn)
+                .next_back();
+            let Some(last) = last else {
+                return Ok(nothing("no completed turn in this session"));
+            };
+            last
+        };
+        let unavailable = |source: &str, prompt: String| proto::SummaryInfo {
+            session_id: session_id.clone(),
+            turn,
+            prompt,
+            text: None,
+            source: source.to_owned(),
+            lead_ms: None,
+        };
+        let Some(spec) = self.spec.as_ref() else {
+            return Ok(unavailable(
+                "unavailable: speculation is off",
+                String::new(),
+            ));
+        };
+        let Some((key, prompt)) = spec.summary_key(&index, &session_id, turn) else {
+            return Ok(unavailable(
+                "unavailable: this turn changed nothing",
+                String::new(),
+            ));
+        };
+        let (hit, source) = spec.claim_summary(&key, wait_ms).await;
+        Ok(proto::SummaryInfo {
+            session_id,
+            turn,
+            prompt,
+            text: hit.as_ref().map(|hit| hit.body.trim().to_owned()),
+            lead_ms: hit.as_ref().map(|hit| hit.lead_ms),
+            source,
+        })
+    }
+
+    /// Stops a model run that real work has just made pointless.
+    ///
+    /// Purely a spend control. A result computed against a tree that has
+    /// moved is already unreachable through its key, so nothing here is
+    /// protecting correctness — it is protecting the bill.
+    fn invalidate(&self, cause: &crate::speculate::Cause) {
+        if let Some(spec) = self.spec.as_ref() {
+            spec.notify(crate::speculate::SpecEvent::Invalidate(cause.clone()));
+        }
+    }
+
     /// Speculation's rollup for `status`, or `None` when it is off — which
     /// keeps the default output byte-identical to before the feature.
     fn speculation_status(&self) -> Option<proto::SpecStatus> {
@@ -1676,17 +1791,39 @@ impl Server {
         };
         let key = crate::speculate::brief_key(&index, spec.config(), current).ok();
         if let Some(key) = key.as_ref().and_then(Option::as_ref) {
-            if let Some(info) = spec.claim_brief(key) {
+            if let Some(mut info) = spec.claim_brief(key) {
+                self.attach_summary(&mut info).await;
                 return Ok(info);
             }
         }
-        let info = compute_brief(index, &self.handle, current).await?;
+        drop(index);
+        let index = self.open_index()?;
+        let mut info = compute_brief(index, &self.handle, current).await?;
         // Memoize the miss: the next session start over this same tree is a
         // hit even though nothing scheduled it.
         if let Some(key) = key.and_then(|key| key) {
             spec.store_brief(&key, &info);
         }
+        self.attach_summary(&mut info).await;
         Ok(info)
+    }
+
+    /// Adds the previous session's closing summary to a brief, when the
+    /// runner produced one.
+    ///
+    /// Looked up after the brief rather than inside it, and never waited
+    /// for: this runs on `SessionStart`, which the agent blocks on.
+    async fn attach_summary(&self, info: &mut proto::BriefInfo) {
+        let (Some(spec), Some(session)) = (self.spec.as_ref(), info.session.as_mut()) else {
+            return;
+        };
+        let Some(turn) = session.end_turn else { return };
+        let Ok(index) = self.open_index() else { return };
+        let Some((key, _)) = spec.summary_key(&index, &session.session_id, turn) else {
+            return;
+        };
+        let (hit, _) = spec.claim_summary(&key, 0).await;
+        session.summary = hit.map(|hit| hit.body.trim().to_owned());
     }
 }
 
@@ -1802,6 +1939,11 @@ pub(crate) async fn compute_brief(
             end_prompt,
             files_changed,
             sample_paths,
+            // Filled in by the caller: whether a summary exists is
+            // independent of everything else here, so baking it into the
+            // cached body would mean a brief cached before the summary
+            // landed could never pick it up.
+            summary: None,
             abandoned,
         }),
         drift_files,

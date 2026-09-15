@@ -581,6 +581,10 @@ pub struct SpeculateConfig {
     /// Argv of the model command, e.g.
     /// `["claude", "-p", "--model", "claude-haiku-4-5-20251001"]`. Never a
     /// shell string: the prompt goes on stdin, not the command line.
+    ///
+    /// The program must be on `PATH` or absolute. A relative path would be
+    /// resolved against the run's scratch directory, which is empty by
+    /// design — the child is given no route into the repository.
     pub command: Vec<String>,
     /// Informational, but it enters the cache key, so changing it stops
     /// serving the previous model's prose.
