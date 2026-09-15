@@ -428,6 +428,33 @@ pub struct StatusInfo {
     /// Why mounts are unavailable, when they are.
     #[serde(default)]
     pub mount_reason: Option<String>,
+    /// Speculation, when it is configured at all. `None` — the default —
+    /// means the daemon prints exactly what it printed before the feature
+    /// existed; several acceptance scripts read this output.
+    #[serde(default)]
+    pub speculate: Option<SpecStatus>,
+}
+
+/// What speculation has been doing, over the last 24 hours.
+///
+/// Reports bytes and run counts rather than money: the daemon cannot know
+/// anyone's pricing and should not pretend to. `claimed` against `missed` is
+/// the number that says whether speculating is paying off at all.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpecStatus {
+    /// Whether this configuration can run a model, and so spend.
+    pub spends_tokens: bool,
+    /// How the model is invoked, for the status line. Empty when nothing
+    /// paid is configured.
+    pub command: String,
+    pub runs: u64,
+    pub claimed: u64,
+    pub missed: u64,
+    pub timeouts: u64,
+    pub bytes_out: u64,
+    /// How far ahead of the request a claimed result landed. Near zero means
+    /// the trigger is firing too late to be worth anything.
+    pub median_lead_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

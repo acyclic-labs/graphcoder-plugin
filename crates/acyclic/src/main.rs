@@ -19,6 +19,7 @@ mod hook;
 mod install;
 mod mcp;
 mod server;
+mod speculate;
 
 use std::path::{Path, PathBuf};
 
@@ -364,6 +365,46 @@ fn print_mount_capability() {
 
 /// `{NAME} policy`: the effective `[decompose]` parameters as `key = value`
 /// lines, so the skill reads one command instead of parsing TOML.
+/// The speculation rollup under `status`.
+///
+/// Two lines, and both earn their place: the first says whether this daemon
+/// can spend money, the second says whether speculating is working. A claim
+/// rate near zero, or a median lead near zero, means the triggers are firing
+/// too late to be worth anything — which is the point of measuring it.
+fn print_speculation(spec: &proto::SpecStatus) {
+    let mode = if spec.spends_tokens {
+        format!("precompute + model runs ({})", spec.command)
+    } else {
+        "precompute only, no model runs".to_owned()
+    };
+    println!("speculation:   on — {mode}");
+    let attempts = spec.claimed.saturating_add(spec.missed);
+    let claimed = match spec.claimed.saturating_mul(100).checked_div(attempts) {
+        Some(percent) => format!("{} of {attempts} claimed ({percent}%)", spec.claimed),
+        None => "nothing asked yet".to_owned(),
+    };
+    // Integer maths rather than a float: a lead is milliseconds, and casting
+    // i64 to f64 to print one decimal place is a lossy cast for nothing.
+    let lead = match spec.median_lead_ms {
+        Some(lead_ms) => format!(
+            " · median lead {}.{}s",
+            lead_ms / 1_000,
+            (lead_ms % 1_000) / 100
+        ),
+        None => String::new(),
+    };
+    let timeouts = if spec.timeouts > 0 {
+        format!(" · {} timeout(s)", spec.timeouts)
+    } else {
+        String::new()
+    };
+    println!(
+        "               24h: {} run(s) · {claimed}{lead} · {} out{timeouts}",
+        spec.runs,
+        human_bytes(spec.bytes_out)
+    );
+}
+
 fn policy(repo: &Path) -> i32 {
     match acyclic_engine::config::Config::load(repo) {
         Ok(config) => {
@@ -865,6 +906,11 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     "mounts:        unavailable ({}) — forks copy, Safe Mode off",
                     info.mount_reason.as_deref().unwrap_or("unknown reason")
                 );
+            }
+            // Printed only when speculation is configured: the default
+            // output has to stay exactly what it was.
+            if let Some(spec) = info.speculate {
+                print_speculation(&spec);
             }
             Ok(())
         }

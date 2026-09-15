@@ -6,7 +6,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 FAILED=0
-SCRIPTS=(journey.sh timeline.sh exclusions.sh growth.sh soak.sh crash.sh latency.sh forks.sh merge.sh safe-mode.sh mcp-e2e.sh)
+SCRIPTS=(journey.sh timeline.sh exclusions.sh growth.sh soak.sh crash.sh latency.sh speculation.sh forks.sh merge.sh safe-mode.sh mcp-e2e.sh)
 # The live host-session tests need their CLI + credentials and cost a model
 # session each; opt in with ACYCLIC_E2E=1. (mcp-e2e.sh is not one of them:
 # it drives `acyclic mcp` with a scripted client, no host app or model.)
