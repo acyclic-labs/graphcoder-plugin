@@ -6,8 +6,8 @@ branch. Two capabilities are deliberately *not* offered on Windows — mounted
 forks and Safe Mode — for a reason recorded under [Known
 limits](#known-limits); everything else behaves as it does on POSIX.
 
-`tests/acceptance/windows-smoke.sh` is the executable form of checks 3–7 and
-runs in CI on `windows-2022` (the `windows` job in `.github/workflows/ci.yml`).
+`tests/acceptance/windows-smoke.sh` is the executable form of checks 3–7,
+plus the pipe-access assertion below, and runs in CI on `windows-2022` (the `windows` job in `.github/workflows/ci.yml`).
 That job also builds and clippies the `cfg(windows)` arms, which the Linux
 lint job cannot see.
 
@@ -15,7 +15,7 @@ lint job cannot see.
 
 | Area | Change |
 | --- | --- |
-| `crates/acyclic/src/ipc.rs` | New. The transport split: Unix domain socket vs. Windows named pipe. |
+| `crates/acyclic/src/ipc.rs` | New. The transport split: Unix domain socket vs. Windows named pipe, with an owner-only pipe DACL. |
 | `crates/acyclic-engine/src/names.rs` | New. The one definition of how a host name becomes engine bytes. |
 | `crates/acyclic/src/client.rs` | `ipc::ClientStream`; daemon spawn no longer leaks stdio handles or stands in the repo. |
 | `crates/acyclic/src/server.rs` | `ipc::Listener`/`ipc::ServerStream`; fork route names carry the host encoding. |
@@ -60,6 +60,36 @@ exists so there is exactly one place this can be got wrong.
 Because the profile is fixed for the life of a volume, a store created on
 Windows cannot be moved to a POSIX host or back. Stores are per-machine and
 keyed by repo path, so nothing in the product moves them today.
+
+## Who can reach the daemon
+
+On Unix the socket is protected by where it lives: a per-uid directory this
+crate chmods to `0o700`, so no other account can see it. A named pipe has no
+parent to hide behind — it sits in a global namespace — and one created with
+no security descriptor, which is what `ServerOptions::create` does, gets the
+system default. That default was verified on this host to be:
+
+```
+D:(A;;FR;;;WD)(A;;FR;;;AN)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<user>)
+```
+
+`WD` is `Everyone` and `AN` is `ANONYMOUS LOGON`, both with read access, on
+the endpoint of a daemon that restores files and rewinds trees on request.
+No other local account could *drive* it — `FR` carries no write access, so a
+request cannot be sent — but any of them could open the endpoint, which is
+enough to read from it and to consume the single idle pipe instance the
+listener keeps free.
+
+`ipc::create_pipe_instance` now builds an explicit protected DACL for every
+instance, listing only the owning user, `SYSTEM` and `Administrators`:
+
+```
+D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<user>)
+```
+
+`tests/acceptance/windows-pipe-acl.ps1` asserts this against the live pipe
+and runs as part of the smoke, because a weakened DACL does not break the
+transport and so would otherwise regress in silence.
 
 ## The checks
 

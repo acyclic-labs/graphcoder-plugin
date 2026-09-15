@@ -23,9 +23,16 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# `SetHandleInformation` only: the daemon must not inherit the caller's
-# stdio handles (see `client::spawn_daemon`).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# Handle-inheritance control for the daemon spawn (`client::spawn_daemon`),
+# and the security descriptor that keeps the daemon's named pipe to this
+# user (`ipc::Listener::bind`).
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -52,6 +52,10 @@ echo "--- init (stdout through a pipe: must not hang)"
 # leaves this blocked forever rather than returning.
 "$ACYCLIC" init < /dev/null | cat > /dev/null || fail "init failed"
 
+echo "--- the daemon pipe is reachable only by this account"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/windows-pipe-acl.ps1" \
+  || fail "the daemon pipe is not owner-only"
+
 echo "--- checkpoint and timeline"
 # Let the baseline settle before editing. `init` returning does not guarantee
 # the baseline predates a write landing microseconds later: the change gets
