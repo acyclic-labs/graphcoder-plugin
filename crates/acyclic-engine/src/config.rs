@@ -139,20 +139,63 @@ impl Config {
 
     /// The layering itself, with an explicit machine-config path so tests
     /// (and future hosts) control every input.
+    ///
+    /// Merging is per key, not per file: the repo layer overrides only the
+    /// keys it names, and a key set only in the machine layer survives. The
+    /// obvious shape — deserialize each file into a whole `Config` — cannot
+    /// do that, because `#[serde(default)]` makes "absent" and "set to the
+    /// default" indistinguishable once parsed, so the later file would
+    /// silently reset every key it omits.
     pub fn load_layered(machine: Option<&Path>, repo_root: &Path) -> Result<Self> {
-        let mut config = Config::default();
+        let mut merged = toml::value::Table::new();
         if let Some(machine) = machine {
-            config = Self::merge_file(config, machine)?;
+            Self::merge_file(&mut merged, machine)?;
         }
-        Self::merge_file(config, &repo_root.join(crate::product::repo_config_file()))
+        Self::merge_file(
+            &mut merged,
+            &repo_root.join(crate::product::repo_config_file()),
+        )?;
+        toml::Value::Table(merged)
+            .try_into()
+            .map_err(|error| EngineError::Config(error.to_string()))
     }
 
-    fn merge_file(base: Config, path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text)
-                .map_err(|error| EngineError::Config(format!("{}: {error}", path.display()))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(base),
-            Err(error) => Err(error.into()),
+    /// Overlays one file's keys onto `merged`. A missing file is fine.
+    fn merge_file(merged: &mut toml::value::Table, path: &Path) -> Result<()> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let named = |error: &dyn std::fmt::Display| {
+            EngineError::Config(format!("{}: {error}", path.display()))
+        };
+        let table: toml::value::Table = toml::from_str(&text).map_err(|error| named(&error))?;
+        // Validate this layer on its own so an unknown key or a bad type is
+        // reported against the file that holds it. The merged value is
+        // deserialized again by the caller; this pass only names the file.
+        let _: Self = table
+            .clone()
+            .try_into()
+            .map_err(|error: toml::de::Error| named(&error))?;
+        overlay(merged, table);
+        Ok(())
+    }
+}
+
+/// Deep-merges `overlay` onto `base`: tables recurse, everything else
+/// (scalars, arrays) replaces. Replacing arrays is what a reader expects of
+/// `exclude` or `guarded_paths` — a repo list overrides the machine list
+/// rather than appending to it.
+fn overlay(base: &mut toml::value::Table, overlay_table: toml::value::Table) {
+    for (key, value) in overlay_table {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                overlay(existing, incoming);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
         }
     }
 }
@@ -253,5 +296,80 @@ mod tests {
         )
         .expect("write");
         assert!(Config::load_layered(None, repo.path()).is_err());
+    }
+
+    /// The layering the doc comment and README promise: a key set only in
+    /// the machine config survives a repo config that does not mention it.
+    /// Before the per-key merge, parsing the repo file discarded the whole
+    /// machine layer.
+    #[test]
+    fn machine_and_repo_layers_merge_per_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let machine = home.path().join("config.toml");
+        std::fs::write(
+            &machine,
+            "quiesce_ms = 10\ncommit_every = 5\nstore_dir = \"/tmp/machine-stores\"\n\
+             [decompose]\nfan_out = 4\nmax_depth = 7\n",
+        )
+        .expect("write");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
+        std::fs::write(
+            repo.path().join(crate::product::repo_config_file()),
+            "commit_every = 9\ntrash_ttl_days = 3\n[decompose]\nfan_out = 2\n",
+        )
+        .expect("write");
+
+        let config = Config::load_layered(Some(&machine), repo.path()).expect("load");
+        // Machine-only keys survive.
+        assert_eq!(config.quiesce_ms, 10);
+        assert_eq!(config.store_dir.as_deref(), Some("/tmp/machine-stores"));
+        // The repo layer wins where both name a key.
+        assert_eq!(config.commit_every, 9);
+        // Repo-only keys apply.
+        assert_eq!(config.trash_ttl_days, 3);
+        // Sub-tables merge per key too, rather than replacing wholesale.
+        assert_eq!(config.decompose.fan_out, 2);
+        assert_eq!(config.decompose.max_depth, 7);
+        assert_eq!(
+            config.decompose.max_forks,
+            Config::default().decompose.max_forks
+        );
+        // Keys named by neither file keep their defaults.
+        assert_eq!(config.quiesce_cap_ms, Config::default().quiesce_cap_ms);
+    }
+
+    /// An unknown key is still fatal, and the error names the file holding
+    /// it rather than the merged result.
+    #[test]
+    fn a_bad_machine_layer_names_the_machine_file() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let machine = home.path().join("config.toml");
+        std::fs::write(&machine, "quiesce_millis = 10\n").expect("write");
+        let error =
+            Config::load_layered(Some(&machine), repo.path()).expect_err("unknown key must fail");
+        assert!(
+            error.to_string().contains("config.toml"),
+            "error should name the file: {error}"
+        );
+    }
+
+    /// A list in the repo layer replaces the machine list rather than
+    /// appending to it.
+    #[test]
+    fn repo_lists_replace_machine_lists() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let machine = home.path().join("config.toml");
+        std::fs::write(&machine, "exclude = [\"machine/\"]\n").expect("write");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
+        std::fs::write(
+            repo.path().join(crate::product::repo_config_file()),
+            "exclude = [\"repo/\"]\n",
+        )
+        .expect("write");
+        let config = Config::load_layered(Some(&machine), repo.path()).expect("load");
+        assert_eq!(config.exclude, vec!["repo/"]);
     }
 }
