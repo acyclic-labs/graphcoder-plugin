@@ -35,6 +35,8 @@ pub enum Host {
     ClaudeDesktop,
     #[value(name = "vscode")]
     VsCode,
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 // TODO(more hosts): the two shapes this file already covers — lifecycle
@@ -71,6 +73,7 @@ pub fn run(repo: &Path, host: Host) -> Result<(), String> {
         Host::AgentsMd => agents_md(repo),
         Host::ClaudeDesktop => claude_desktop(repo),
         Host::VsCode => vscode(repo),
+        Host::OpenCode => opencode(repo),
     }
 }
 
@@ -380,8 +383,18 @@ fn is_our_cursor_entry(entry: &Value) -> bool {
 struct McpConfigShape {
     /// "mcpServers" (Claude Desktop, Cursor) or "servers" (VS Code).
     servers_key: &'static str,
-    /// VS Code requires this; Claude Desktop and Cursor don't accept or need it.
-    explicit_stdio_type: bool,
+    /// The `type` field, where the host requires one: VS Code wants
+    /// `stdio`, `OpenCode` wants `local`. Claude Desktop and Cursor neither
+    /// accept nor need it.
+    explicit_type: Option<&'static str>,
+    /// `OpenCode` takes the binary and its arguments as ONE `command` array
+    /// rather than separate `command` + `args` fields.
+    command_as_array: bool,
+    /// `OpenCode` gates each server on an explicit `enabled` flag.
+    enabled_flag: bool,
+    /// Written at the top level when the file is created, so editors can
+    /// complete the config. Only `OpenCode` publishes one.
+    schema_url: Option<&'static str>,
     /// VS Code documents a `cwd` field and substitutes `${workspaceFolder}`
     /// in it; Cursor's stdio schema has no `cwd`, and cursor-agent starts
     /// the server in the shell's cwd (verified: a subdirectory stays a
@@ -392,13 +405,30 @@ struct McpConfigShape {
 /// The `mcpServers` family: Claude Desktop and Cursor read the same shape.
 const MCP_SERVERS_SHAPE: McpConfigShape = McpConfigShape {
     servers_key: "mcpServers",
-    explicit_stdio_type: false,
+    explicit_type: None,
+    command_as_array: false,
+    enabled_flag: false,
+    schema_url: None,
     workspace_cwd: false,
 };
 const VSCODE_MCP_SHAPE: McpConfigShape = McpConfigShape {
     servers_key: "servers",
-    explicit_stdio_type: true,
+    explicit_type: Some("stdio"),
+    command_as_array: false,
+    enabled_flag: false,
+    schema_url: None,
     workspace_cwd: true,
+};
+
+/// `OpenCode`'s `opencode.json`: its own top-level key, `type: "local"`,
+/// and the binary plus arguments as a single `command` array.
+const OPENCODE_MCP_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "mcp",
+    explicit_type: Some("local"),
+    command_as_array: true,
+    enabled_flag: true,
+    schema_url: Some("https://opencode.ai/config.json"),
+    workspace_cwd: false,
 };
 
 /// One `acyclic mcp` registration: the key it lives under and how the host
@@ -513,11 +543,13 @@ fn merge_mcp_server_json(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.to_string()),
     };
-    let servers = config
+    let root = config
         .as_object_mut()
-        .ok_or_else(|| format!("{} is not an object", config_path.display()))?
-        .entry(shape.servers_key)
-        .or_insert(json!({}));
+        .ok_or_else(|| format!("{} is not an object", config_path.display()))?;
+    if let Some(url) = shape.schema_url {
+        root.entry("$schema").or_insert(json!(url));
+    }
+    let servers = root.entry(shape.servers_key).or_insert(json!({}));
     let servers = servers
         .as_object_mut()
         .ok_or_else(|| format!("{} is not an object", shape.servers_key))?;
@@ -528,10 +560,23 @@ fn merge_mcp_server_json(
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     if let Some(fields) = value.as_object_mut() {
-        fields.insert("command".to_owned(), json!(entry.command));
-        fields.insert("args".to_owned(), entry.args());
-        if shape.explicit_stdio_type {
-            fields.insert("type".to_owned(), json!("stdio"));
+        if shape.command_as_array {
+            // one array: the binary followed by its arguments
+            let mut argv = vec![json!(entry.command)];
+            if let Some(args) = entry.args().as_array() {
+                argv.extend(args.iter().cloned());
+            }
+            fields.insert("command".to_owned(), Value::Array(argv));
+            fields.remove("args");
+        } else {
+            fields.insert("command".to_owned(), json!(entry.command));
+            fields.insert("args".to_owned(), entry.args());
+        }
+        if let Some(kind) = shape.explicit_type {
+            fields.insert("type".to_owned(), json!(kind));
+        }
+        if shape.enabled_flag && !fields.contains_key("enabled") {
+            fields.insert("enabled".to_owned(), json!(true));
         }
         if shape.workspace_cwd && entry.repo.is_none() {
             fields.insert("cwd".to_owned(), json!("${workspaceFolder}"));
@@ -657,6 +702,26 @@ fn vscode(repo: &Path) -> Result<(), String> {
     println!("vscode adapter installed into {}", vscode_dir.display());
     println!("  mcp: .vscode/mcp.json ({NAME} tools, project-scoped)");
     println!("check this file in so the whole team inherits it.");
+    Ok(())
+}
+
+fn opencode(repo: &Path) -> Result<(), String> {
+    // Project-scoped, checked in, and portable: a bare `acyclic` from PATH,
+    // with the server locating the repo from its working directory.
+    merge_mcp_server_json(
+        &repo.join("opencode.json"),
+        &OPENCODE_MCP_SHAPE,
+        &McpEntry::portable(),
+    )?;
+    // OpenCode has no lifecycle-hook API, so nothing checkpoints around a
+    // tool call; the cheatsheet plus the daemon's idle timer cover it.
+    agents_md(repo)?;
+
+    println!("opencode adapter installed into {}", repo.display());
+    println!("  mcp:        opencode.json ({NAME} tools, project-scoped)");
+    println!("  cheatsheet: AGENTS.md");
+    println!("check both files in so the whole team inherits them.");
+    println!("verify with: opencode mcp list");
     Ok(())
 }
 
@@ -988,6 +1053,45 @@ Before a risky change, checkpoint. After a failed attempt, rewind instead
 of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
 `exclude` in .{{name}}/config.toml are never checkpointed; a rewind leaves
 them untouched.
+
+## Splitting work across isolated forks
+
+A fork is a writable copy-on-write view of the tree, cut in well under a
+second however large the repo. Work inside one is invisible to the real
+tree until you promote it.
+
+    {{name}} policy                  the decomposition limits for this repo
+    {{name}} fork -n N               cut N forks; each prints its path
+    {{name}} fork-diff <id>          what one fork changed, before landing it
+    {{name}} promote <id>            land that fork into the real tree
+    {{name}} fork-drop <id>          discard it; its changes evaporate
+    {{name}} forks                   what is live right now
+
+Read `{{name}} policy` first and stay inside its limits. Then pick ONE:
+
+- **DO** - one obvious approach, or a handful of edits. Checkpoint and work
+  in the real tree. If unsure, prefer this: a fork must beat rewind, not
+  beat nothing.
+- **PARTITION** - independent parts touching different files. One fork per
+  part, promote every fork that passed.
+- **RACE** - one goal, 2+ genuinely different designs, expensive to guess
+  wrong. One fork per approach, land exactly one.
+- **SEQUENCE** - dependent steps. One fork per step, promote, re-fork.
+
+Rules that are easy to get wrong:
+
+- **Never fork a step that cannot be parallelised.** A summary, a merge, a
+  reconciliation or a final ranking has no alternatives to race and nothing
+  to split - forking it only adds coordination. Do it yourself.
+- **Give each fork enough work to be worth it.** Coordination costs roughly
+  a fixed amount per fork; if a fork's share is smaller than that, you are
+  slower than doing it serially.
+- **Freeze while forks are live.** Do not edit the real tree; a real-tree
+  edit merges like another fork would.
+- **Subagents never run `{{name}}`.** They work inside their fork directory
+  by absolute path. Only you fork, promote and drop.
+- A promote reporting `N file(s) conflict` wrote diff3 markers into THAT
+  FORK and landed nothing. Resolve them there, then promote again.
 "#;
 
 const CURSOR_RULE: &str = r#"---
@@ -1013,6 +1117,45 @@ Before a risky change, checkpoint. After a failed attempt, rewind instead
 of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
 `exclude` in .{{name}}/config.toml are never checkpointed; a rewind leaves
 them untouched.
+
+## Splitting work across isolated forks
+
+A fork is a writable copy-on-write view of the tree, cut in well under a
+second however large the repo. Work inside one is invisible to the real
+tree until you promote it.
+
+    {{name}} policy                  the decomposition limits for this repo
+    {{name}} fork -n N               cut N forks; each prints its path
+    {{name}} fork-diff <id>          what one fork changed, before landing it
+    {{name}} promote <id>            land that fork into the real tree
+    {{name}} fork-drop <id>          discard it; its changes evaporate
+    {{name}} forks                   what is live right now
+
+Read `{{name}} policy` first and stay inside its limits. Then pick ONE:
+
+- **DO** - one obvious approach, or a handful of edits. Checkpoint and work
+  in the real tree. If unsure, prefer this: a fork must beat rewind, not
+  beat nothing.
+- **PARTITION** - independent parts touching different files. One fork per
+  part, promote every fork that passed.
+- **RACE** - one goal, 2+ genuinely different designs, expensive to guess
+  wrong. One fork per approach, land exactly one.
+- **SEQUENCE** - dependent steps. One fork per step, promote, re-fork.
+
+Rules that are easy to get wrong:
+
+- **Never fork a step that cannot be parallelised.** A summary, a merge, a
+  reconciliation or a final ranking has no alternatives to race and nothing
+  to split - forking it only adds coordination. Do it yourself.
+- **Give each fork enough work to be worth it.** Coordination costs roughly
+  a fixed amount per fork; if a fork's share is smaller than that, you are
+  slower than doing it serially.
+- **Freeze while forks are live.** Do not edit the real tree; a real-tree
+  edit merges like another fork would.
+- **Subagents never run `{{name}}`.** They work inside their fork directory
+  by absolute path. Only you fork, promote and drop.
+- A promote reporting `N file(s) conflict` wrote diff3 markers into THAT
+  FORK and landed nothing. Resolve them there, then promote again.
 "#;
 #[cfg(test)]
 mod tests {
@@ -1285,7 +1428,8 @@ mod tests {
                 "cursor",
                 "agents-md",
                 "claude-desktop",
-                "vscode"
+                "vscode",
+                "opencode"
             ]
         );
     }
