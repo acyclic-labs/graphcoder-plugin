@@ -48,7 +48,7 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 
 ## Configuration
 
-`.acyclic/config.toml` is checked in, so the policy ships with the repo. Every key has a safe default; zero config is supported. Machine-level defaults live in `~/.config/acyclic/config.toml`.
+`.acyclic/config.toml` is checked in, so the policy ships with the repo. Every key has a safe default; zero config is supported. Machine-level defaults live in `~/.config/acyclic/config.toml`, and the two layers merge key by key — a repo config overrides only the keys it names.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -61,7 +61,38 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 | `[decompose]` / `[merge]` | | Fork decomposition policy and merge limits (Launch 3). |
 | `store_dir` | `~/.local/share/acyclic/stores` | Where stores live. Never inside the repo. |
 
+Speculation is configured separately, in `~/.config/acyclic/speculate.toml` — per developer, never checked in, because turning it on can spend that developer's money. See [Speculation](#speculation).
+
 Adding a path to `exclude` takes effect at the next daemon start; the baseline it builds is scrubbed, and every later checkpoint skips the path. Generations captured before the rule still hold it (see below).
+
+## Speculation
+
+The daemon knows things a request does not: it sees a prompt before the agent acts, it knows when a turn closed, and it knows when the watcher went quiet. Those are moments when the machine is idle and the answer to a question nobody has asked yet is already determined. So it computes them then.
+
+- **The session brief**, when a session ends. It is the most expensive thing the agent waits on — `SessionStart` blocks on it and prints it into the model's context — and it costs a pipeline diff per abandoned branch plus two more. The session that will read it ends long before it is asked for.
+- **A turn summary**, when the next turn starts. This one runs a model, so it is the only part of the product that spends money.
+
+A result is keyed by the generation it describes. Generations are Merkle ids, so a result computed against a tree that has since moved simply never matches the key a later request builds — a stale answer is unreachable rather than guarded against. Nothing speculative runs on the pipeline thread, and nothing speculative is load-bearing: a full queue, a wedged cache or a missing database all fall through to computing the answer the way it was computed before.
+
+Speculation is **off by default** and configured per developer in `~/.config/acyclic/speculate.toml`, never in the checked-in repo config: whether to spend tokens is a personal decision, not one a teammate inherits from a commit.
+
+```toml
+enabled              = true                 # the free half: precompute, zero tokens
+kinds                = ["brief", "summary"] # "summary" is the one that spends
+command              = ["claude", "-p", "--model", "claude-haiku-4-5-20251001"]
+max_runs_per_session = 20                   # hard ceiling
+```
+
+**Two gates, not one.** `enabled` alone buys the precompute half. Spending also needs a `command` *and* `"summary"` in `kinds`, so no single boolean can put you on the meter. The command must be on `PATH` or absolute, gets the prompt on stdin, and runs in an empty scratch directory with no filesystem route into the repo — its whole input is a store-computed diff (changed paths and the prompt excerpt, never file contents), so `exclude` governs what it can see. It runs in its own process group, so a timeout kills the children an agent CLI spawns rather than leaking them.
+
+`acyclic summary` and the `summary` MCP tool read what was produced; neither ever produces one on demand, because a request arriving is not consent to spend. `acyclic status` reports the hit rate and what has been spent:
+
+```
+speculation:   on — precompute + model runs (claude -p --model claude-haiku-4-5-20251001)
+               24h: 31 run(s) · 19 of 31 claimed (61%) · median lead 8.2s · 412.0 KB out
+```
+
+Median lead is the number to watch: it is how far ahead of the request a claimed result landed, and near zero means the trigger is firing too late to be worth anything. Design and rationale: [`docs/design/08-speculation.md`](docs/design/08-speculation.md); the egress note is in [`docs/design/07-compliance.md`](docs/design/07-compliance.md).
 
 ## Retention and purge
 

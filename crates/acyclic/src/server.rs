@@ -13,6 +13,7 @@ use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic_engine::merge::{self, Entry};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::product::NAME;
+use acyclic_engine::spec::SpeculateConfig;
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::{rewind, EngineError};
 use acyclic_fs::model::VolumeConfig;
@@ -96,6 +97,9 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // mounted (fork sessions do not survive the daemon).
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     fork::sweep_stale_forks(repo_root);
+    // Same reason as the fork sweep, and the same moment: a model run a
+    // crashed daemon left behind is still running, and still billing.
+    crate::spec_runner::sweep_stale_runs(&paths.spec_runs());
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let store = runtime
@@ -127,6 +131,36 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
             mounts.reason.as_deref().unwrap_or("unknown reason")
         );
     }
+    // Speculation is opt-in, per developer, from a file of its own; a
+    // malformed one disables it and says so rather than failing the daemon.
+    let (speculate_config, speculate_warning) = SpeculateConfig::load();
+    if let Some(warning) = speculate_warning {
+        eprintln!("{NAME} daemon: speculation config: {warning}");
+    }
+    let speculation = crate::speculate::spawn(
+        speculate_config,
+        crate::speculate::SpecDeps {
+            index_db: paths.index_db(),
+            spec_db: paths.spec_db(),
+            spec_runs: paths.spec_runs(),
+            handle: handle.clone(),
+        },
+    );
+    let (spec, spec_thread) = match speculation {
+        Some((handle, thread)) => (Some(Arc::new(handle)), Some(thread)),
+        None => (None, None),
+    };
+    if let Some(spec) = spec.as_ref() {
+        eprintln!(
+            "{NAME} daemon: speculation on ({})",
+            if spec.config().spends_tokens() {
+                "precompute + model runs"
+            } else {
+                "precompute only, no model runs"
+            }
+        );
+    }
+
     let server = Server {
         mounts,
         handle: handle.clone(),
@@ -142,6 +176,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         })),
         dry_session: Arc::new(Mutex::new(None)),
         pending: Arc::new(Mutex::new(HashMap::new())),
+        spec,
     };
 
     runtime.block_on(async move {
@@ -160,6 +195,9 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     });
 
     let _ = pipeline_thread.join();
+    if let Some(thread) = spec_thread {
+        let _ = thread.join();
+    }
     let _ = std::fs::remove_file(paths.socket());
     let _ = std::fs::remove_file(paths.pidfile());
     Ok(())
@@ -181,6 +219,9 @@ struct Server {
     dry_session: Arc<Mutex<Option<DrySession>>>,
     /// Sessions that resolved (committed) but haven't been applied/discarded.
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
+    /// The speculation scheduler, when it is enabled. `None` makes every
+    /// call site a no-op, so the default path costs nothing.
+    spec: Option<Arc<crate::speculate::SpecHandle>>,
 }
 
 impl Server {
@@ -258,6 +299,7 @@ impl Server {
                     mount_provider: self.mounts.provider.to_owned(),
                     mount_available: self.mounts.available,
                     mount_reason: self.mounts.reason.clone(),
+                    speculate: self.speculation_status(),
                 }))
             }
             proto::Op::Checkpoint {
@@ -365,6 +407,12 @@ impl Server {
                     .turn_started(session_id.clone(), prompt)
                     .await
                     .map_err(stringify)?;
+                if let Some(spec) = self.spec.as_ref() {
+                    spec.notify(crate::speculate::SpecEvent::TurnStarted {
+                        session_id: session_id.clone(),
+                        turn,
+                    });
+                }
                 Ok(proto::Reply::Turn(proto::TurnInfo { session_id, turn }))
             }
             proto::Op::Inspect { checkpoint } => {
@@ -428,6 +476,14 @@ impl Server {
                 }
                 Ok(proto::Reply::Sessions(entries))
             }
+            proto::Op::Summary {
+                session_id,
+                turn,
+                wait_ms,
+            } => {
+                let info = self.summary(session_id, turn, wait_ms).await?;
+                Ok(proto::Reply::Summary(info))
+            }
             proto::Op::Brief { current } => {
                 let brief = self.brief(current.as_deref()).await?;
                 Ok(proto::Reply::Brief(brief))
@@ -436,6 +492,7 @@ impl Server {
                 target,
                 path: Some(path),
             } => {
+                self.invalidate(&crate::speculate::Cause::TreeMoved);
                 let row = self.resolve_target(target)?;
                 let row_id = row.id;
                 let outcome = self
@@ -460,6 +517,7 @@ impl Server {
                 }))
             }
             proto::Op::Rewind { target, path: None } => {
+                self.invalidate(&crate::speculate::Cause::TreeMoved);
                 let row = self.resolve_target(target)?;
                 let row_id = row.id;
                 let outcome = self.handle.rewind(row).await.map_err(stringify)?;
@@ -558,6 +616,16 @@ impl Server {
                         eprintln!("{NAME} daemon: drop scratch fork {id}: {error}");
                     }
                 }
+                // The session that just ended is the one the NEXT session's
+                // brief will describe, and nothing is asking for it yet:
+                // the ideal moment to compute it.
+                if let Some(spec) = self.spec.as_ref() {
+                    // Nothing left to summarise for a session that is over.
+                    spec.notify(crate::speculate::SpecEvent::Invalidate(
+                        crate::speculate::Cause::Session(session_id.clone()),
+                    ));
+                    spec.notify(crate::speculate::SpecEvent::SessionEnded);
+                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Commit => {
@@ -565,6 +633,12 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Stop => {
+                // Stop speculating before anything else is torn down: a
+                // speculation in flight is holding the pipeline handle this
+                // shutdown is about to invalidate.
+                if let Some(spec) = self.spec.as_ref() {
+                    spec.shutdown().await;
+                }
                 // Unmount an active Safe Mode shadow first: it sits directly
                 // on the real repo root, so this must never be left mounted
                 // once the daemon that owns it is gone.
@@ -805,6 +879,7 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionResolve { session_id } => {
+                self.invalidate(&crate::speculate::Cause::Session(session_id.clone()));
                 let mut slot = self.dry_session.lock().await;
                 let session = slot
                     .take()
@@ -1595,130 +1670,344 @@ impl Server {
         clippy::too_many_lines,
         reason = "one pass over the session's rows builds every section of the brief"
     )]
-    async fn brief(&self, current: Option<&str>) -> Result<proto::BriefInfo, String> {
+    /// One turn's summary, from the speculation cache.
+    ///
+    /// Never produces one on demand: a summary costs money, and a request
+    /// arriving is not consent to spend. If the runner has not produced one,
+    /// this says so and says why — the alternative, quietly billing whoever
+    /// asked, is worse than an honest "not ready".
+    async fn summary(
+        &self,
+        session_id: Option<String>,
+        turn: Option<i64>,
+        wait_ms: u64,
+    ) -> Result<proto::SummaryInfo, String> {
         let index = self.open_index()?;
-        let Some(session) = index
-            .last_session_with_checkpoints(current)
-            .map_err(stringify)?
-        else {
-            return Ok(proto::BriefInfo::default());
+        // "Nothing to summarise yet" is an answer, not an error: this is an
+        // informational read, and a host that surfaces an error for an empty
+        // repo makes the tool look broken.
+        let nothing = |reason: &str| proto::SummaryInfo {
+            session_id: String::new(),
+            turn: 0,
+            prompt: String::new(),
+            text: None,
+            source: format!("unavailable: {reason}"),
+            lead_ms: None,
         };
-        let id = session.session_id.clone();
-        let start = index.session_start(&id).map_err(stringify)?;
-        let end = index.session_end(&id).map_err(stringify)?;
-        let last_any = index
-            .list(Some(&id), None, 1)
-            .map_err(stringify)?
-            .into_iter()
-            .next();
-
-        let (files_changed, sample_paths) = match (&start, &end) {
-            (Some(start), Some(end)) if start.generation != end.generation => {
-                let changes = content_changes(
-                    self.handle
-                        .diff(start.generation, end.generation)
-                        .await
-                        .map_err(stringify)?,
-                );
-                let sample = changes
-                    .iter()
-                    .take(5)
-                    .map(|change| change.path.display().to_string())
-                    .collect();
-                (changes.len() as u64, sample)
-            }
-            _ => (0, Vec::new()),
+        let session_id = match session_id {
+            Some(id) => id,
+            None => match index.latest_session().map_err(stringify)? {
+                Some(session) => session.session_id,
+                None => return Ok(nothing("no sessions on record")),
+            },
         };
-
-        let mut abandoned = Vec::new();
-        if let (Some(start), Some(last)) = (&start, &last_any) {
-            for rewind in index
-                .rewinds_between(start.id, last.id)
+        // The default is the last turn that has actually finished: the
+        // current one is still being worked on and cannot be summarised.
+        let turn = if let Some(turn) = turn {
+            turn
+        } else {
+            let last = index
+                .turns(Some(&session_id))
                 .map_err(stringify)?
-            {
-                let Some(target) = rewind.rewind_target else {
-                    continue;
-                };
-                let branch = index.between(target, rewind.id).map_err(stringify)?;
-                let (Some(first), Some(last)) = (branch.first(), branch.last()) else {
-                    continue;
-                };
-                let target_row = index.by_id(target).map_err(stringify)?;
-                let files = match target_row {
-                    Some(target_row) if target_row.generation != last.generation => {
-                        content_changes(
-                            self.handle
-                                .diff(target_row.generation, last.generation)
-                                .await
-                                .map_err(stringify)?,
-                        )
-                        .len() as u64
-                    }
-                    _ => 0,
-                };
-                let turn = last.turn.or(first.turn);
-                let prompt = match (last.session_id.as_deref(), turn) {
-                    (Some(session), Some(turn)) => index
-                        .turn(session, turn)
-                        .map_err(stringify)?
-                        .map(|turn| turn.prompt),
-                    _ => None,
-                };
-                abandoned.push(proto::BriefAbandoned {
-                    from_checkpoint: first.id,
-                    to_checkpoint: last.id,
-                    rewound_to: target,
-                    turn,
-                    prompt,
-                    checkpoints: i64::try_from(branch.len()).unwrap_or(i64::MAX),
-                    files_changed: files,
-                });
-            }
-        }
-
-        let (end_turn, end_prompt) = match end.as_ref().and_then(|row| row.turn) {
-            Some(turn) => (
-                Some(turn),
-                index
-                    .turn(&id, turn)
-                    .map_err(stringify)?
-                    .map(|turn| turn.prompt),
-            ),
-            None => (None, None),
+                .iter()
+                .filter(|row| row.checkpoints > 0)
+                .map(|row| row.turn)
+                .next_back();
+            let Some(last) = last else {
+                return Ok(nothing("no completed turn in this session"));
+            };
+            last
         };
-
-        // Drift: the tree may have moved since the session ended (another
-        // session that never ended cleanly, or edits with no session).
-        let drift_files = match (&end, index.latest_target().map_err(stringify)?) {
-            (Some(end), Some(latest)) if latest.generation != end.generation => content_changes(
-                self.handle
-                    .diff(end.generation, latest.generation)
-                    .await
-                    .map_err(stringify)?,
-            )
-            .len()
-                as u64,
-            _ => 0,
+        let unavailable = |source: &str, prompt: String| proto::SummaryInfo {
+            session_id: session_id.clone(),
+            turn,
+            prompt,
+            text: None,
+            source: source.to_owned(),
+            lead_ms: None,
         };
-
-        Ok(proto::BriefInfo {
-            session: Some(proto::BriefSession {
-                session_id: id,
-                host: session.host,
-                started_at: session.started_at,
-                ended_at: session.ended_at,
-                turns: session.turns,
-                checkpoints: session.checkpoints,
-                end_checkpoint: end.as_ref().map(|row| row.id),
-                end_turn,
-                end_prompt,
-                files_changed,
-                sample_paths,
-                abandoned,
-            }),
-            drift_files,
+        let Some(spec) = self.spec.as_ref() else {
+            return Ok(unavailable(
+                "unavailable: speculation is off",
+                String::new(),
+            ));
+        };
+        let Some((key, prompt)) = spec.summary_key(&index, &session_id, turn) else {
+            return Ok(unavailable(
+                "unavailable: this turn changed nothing",
+                String::new(),
+            ));
+        };
+        let (hit, source) = spec.claim_summary(&key, wait_ms).await;
+        Ok(proto::SummaryInfo {
+            session_id,
+            turn,
+            prompt,
+            text: hit.as_ref().map(|hit| hit.body.trim().to_owned()),
+            lead_ms: hit.as_ref().map(|hit| hit.lead_ms),
+            source,
         })
     }
+
+    /// Stops a model run that real work has just made pointless.
+    ///
+    /// Purely a spend control. A result computed against a tree that has
+    /// moved is already unreachable through its key, so nothing here is
+    /// protecting correctness — it is protecting the bill.
+    fn invalidate(&self, cause: &crate::speculate::Cause) {
+        if let Some(spec) = self.spec.as_ref() {
+            spec.notify(crate::speculate::SpecEvent::Invalidate(cause.clone()));
+        }
+    }
+
+    /// Speculation's rollup for `status`, or `None` when it is off — which
+    /// keeps the default output byte-identical to before the feature.
+    fn speculation_status(&self) -> Option<proto::SpecStatus> {
+        let spec = self.spec.as_ref()?;
+        let metrics = spec.metrics().unwrap_or_default();
+        Some(proto::SpecStatus {
+            spends_tokens: spec.config().spends_tokens(),
+            command: spec.config().command.join(" "),
+            runs: metrics.runs,
+            claimed: metrics.claimed,
+            missed: metrics.missed,
+            timeouts: metrics.timeouts,
+            bytes_out: metrics.bytes_out,
+            median_lead_ms: metrics.median_lead_ms,
+        })
+    }
+
+    /// The brief, from the speculation cache when one matches and from the
+    /// pipeline otherwise.
+    ///
+    /// This is the request the agent actually waits on: the `SessionStart`
+    /// hook prints the result into the model's context before the session
+    /// does anything. Every speculative step here is allowed to fail — a
+    /// miss just means doing the work now, exactly as before.
+    async fn brief(&self, current: Option<&str>) -> Result<proto::BriefInfo, String> {
+        let index = self.open_index()?;
+        let Some(spec) = self.spec.as_ref() else {
+            return compute_brief(index, &self.handle, current).await;
+        };
+        let key = crate::speculate::brief_key(&index, spec.config(), current).ok();
+        if let Some(key) = key.as_ref().and_then(Option::as_ref) {
+            if let Some(mut info) = spec.claim_brief(key) {
+                self.attach_summary(&mut info).await;
+                return Ok(info);
+            }
+        }
+        drop(index);
+        let index = self.open_index()?;
+        let mut info = compute_brief(index, &self.handle, current).await?;
+        // Memoize the miss: the next session start over this same tree is a
+        // hit even though nothing scheduled it.
+        if let Some(key) = key.and_then(|key| key) {
+            spec.store_brief(&key, &info);
+        }
+        self.attach_summary(&mut info).await;
+        Ok(info)
+    }
+
+    /// Adds the previous session's closing summary to a brief, when the
+    /// runner produced one.
+    ///
+    /// Looked up after the brief rather than inside it, and never waited
+    /// for: this runs on `SessionStart`, which the agent blocks on.
+    async fn attach_summary(&self, info: &mut proto::BriefInfo) {
+        let (Some(spec), Some(session)) = (self.spec.as_ref(), info.session.as_mut()) else {
+            return;
+        };
+        let Some(turn) = session.end_turn else { return };
+        let Ok(index) = self.open_index() else { return };
+        let Some((key, _)) = spec.summary_key(&index, &session.session_id, turn) else {
+            return;
+        };
+        let (hit, _) = spec.claim_summary(&key, 0).await;
+        session.summary = hit.map(|hit| hit.body.trim().to_owned());
+    }
+}
+
+/// The previous-session brief: where the last session ended, what it changed,
+/// and which branches it abandoned.
+///
+/// A free function rather than a method because the speculation scheduler
+/// computes exactly this, ahead of time, off the request path. It is the
+/// most expensive thing the agent waits on — `SessionStart` prints it into
+/// context on every session start, and it costs one pipeline diff per
+/// abandoned branch plus two more.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the index must be OWNED across the awaits below: rusqlite's \
+              Connection is Send but not Sync, so a &Index held across an \
+              await would make this future non-Send and the per-connection \
+              tokio::spawn would not compile"
+)]
+pub(crate) async fn compute_brief(
+    index: Index,
+    handle: &PipelineHandle,
+    current: Option<&str>,
+) -> Result<proto::BriefInfo, String> {
+    let Some(session) = index
+        .last_session_with_checkpoints(current)
+        .map_err(stringify)?
+    else {
+        return Ok(proto::BriefInfo::default());
+    };
+    let id = session.session_id.clone();
+    let start = index.session_start(&id).map_err(stringify)?;
+    let end = index.session_end(&id).map_err(stringify)?;
+    let last_any = index
+        .list(Some(&id), None, 1)
+        .map_err(stringify)?
+        .into_iter()
+        .next();
+
+    let (files_changed, sample_paths) = match (&start, &end) {
+        (Some(start), Some(end)) if start.generation != end.generation => {
+            let changes = content_changes(
+                handle
+                    .diff(start.generation, end.generation)
+                    .await
+                    .map_err(stringify)?,
+            );
+            let sample = changes
+                .iter()
+                .take(5)
+                .map(|change| change.path.display().to_string())
+                .collect();
+            (changes.len() as u64, sample)
+        }
+        _ => (0, Vec::new()),
+    };
+
+    // Gathered from the index first (no awaits), then diffed: holding a
+    // `&Index` across an await would make this future non-Send.
+    let pending = abandoned_branches(&index, start.as_ref(), last_any.as_ref())?;
+    let mut abandoned = Vec::with_capacity(pending.len());
+    for branch in pending {
+        let files_changed = match branch.diff {
+            Some((before, after)) => {
+                content_changes(handle.diff(before, after).await.map_err(stringify)?).len() as u64
+            }
+            None => 0,
+        };
+        abandoned.push(proto::BriefAbandoned {
+            from_checkpoint: branch.from_checkpoint,
+            to_checkpoint: branch.to_checkpoint,
+            rewound_to: branch.rewound_to,
+            turn: branch.turn,
+            prompt: branch.prompt,
+            checkpoints: branch.checkpoints,
+            files_changed,
+        });
+    }
+
+    let (end_turn, end_prompt) = match end.as_ref().and_then(|row| row.turn) {
+        Some(turn) => (
+            Some(turn),
+            index
+                .turn(&id, turn)
+                .map_err(stringify)?
+                .map(|turn| turn.prompt),
+        ),
+        None => (None, None),
+    };
+
+    // Drift: the tree may have moved since the session ended (another
+    // session that never ended cleanly, or edits with no session).
+    let drift_files = match (&end, index.latest_target().map_err(stringify)?) {
+        (Some(end), Some(latest)) if latest.generation != end.generation => content_changes(
+            handle
+                .diff(end.generation, latest.generation)
+                .await
+                .map_err(stringify)?,
+        )
+        .len() as u64,
+        _ => 0,
+    };
+
+    Ok(proto::BriefInfo {
+        session: Some(proto::BriefSession {
+            session_id: id,
+            host: session.host,
+            started_at: session.started_at,
+            ended_at: session.ended_at,
+            turns: session.turns,
+            checkpoints: session.checkpoints,
+            end_checkpoint: end.as_ref().map(|row| row.id),
+            end_turn,
+            end_prompt,
+            files_changed,
+            sample_paths,
+            // Filled in by the caller: whether a summary exists is
+            // independent of everything else here, so baking it into the
+            // cached body would mean a brief cached before the summary
+            // landed could never pick it up.
+            summary: None,
+            abandoned,
+        }),
+        drift_files,
+    })
+}
+
+/// One abandoned branch, read out of the index but not yet costed.
+struct PendingBranch {
+    from_checkpoint: i64,
+    to_checkpoint: i64,
+    rewound_to: i64,
+    turn: Option<i64>,
+    prompt: Option<String>,
+    checkpoints: i64,
+    /// Generations to diff for the branch's size, when the two differ.
+    diff: Option<(acyclic_engine::GenerationId, acyclic_engine::GenerationId)>,
+}
+
+/// Every branch the session rewound away from, with the work it would take
+/// to size each one. Deliberately synchronous: the caller does the awaiting,
+/// so nothing holds a borrow of the index across one.
+fn abandoned_branches(
+    index: &Index,
+    start: Option<&CheckpointRow>,
+    last_any: Option<&CheckpointRow>,
+) -> Result<Vec<PendingBranch>, String> {
+    let (Some(start), Some(last_any)) = (start, last_any) else {
+        return Ok(Vec::new());
+    };
+    let mut branches = Vec::new();
+    for rewind in index
+        .rewinds_between(start.id, last_any.id)
+        .map_err(stringify)?
+    {
+        let Some(target) = rewind.rewind_target else {
+            continue;
+        };
+        let branch = index.between(target, rewind.id).map_err(stringify)?;
+        let (Some(first), Some(last)) = (branch.first(), branch.last()) else {
+            continue;
+        };
+        let target_row = index.by_id(target).map_err(stringify)?;
+        let diff = target_row
+            .filter(|row| row.generation != last.generation)
+            .map(|row| (row.generation, last.generation));
+        let turn = last.turn.or(first.turn);
+        let prompt = match (last.session_id.as_deref(), turn) {
+            (Some(session), Some(turn)) => index
+                .turn(session, turn)
+                .map_err(stringify)?
+                .map(|turn| turn.prompt),
+            _ => None,
+        };
+        branches.push(PendingBranch {
+            from_checkpoint: first.id,
+            to_checkpoint: last.id,
+            rewound_to: target,
+            turn,
+            prompt,
+            checkpoints: i64::try_from(branch.len()).unwrap_or(i64::MAX),
+            diff,
+        });
+    }
+    Ok(branches)
 }
 
 /// Content changes only. A rewind or restore rewrites mtimes on every path

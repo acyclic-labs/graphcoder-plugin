@@ -19,6 +19,8 @@ mod hook;
 mod install;
 mod mcp;
 mod server;
+mod spec_runner;
+mod speculate;
 
 use std::path::{Path, PathBuf};
 
@@ -102,6 +104,21 @@ enum Command {
         #[arg(long)]
         current: Option<String>,
         /// Emit JSON instead of the agent-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What one conversation turn did, in prose, if speculation produced a
+    /// summary for it at the turn boundary.
+    Summary {
+        #[arg(long)]
+        session: Option<String>,
+        /// Defaults to the last turn that finished.
+        #[arg(long)]
+        turn: Option<i64>,
+        /// Milliseconds to wait for a summary still being produced. The
+        /// default never waits.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
         #[arg(long)]
         json: bool,
     },
@@ -364,6 +381,46 @@ fn print_mount_capability() {
 
 /// `{NAME} policy`: the effective `[decompose]` parameters as `key = value`
 /// lines, so the skill reads one command instead of parsing TOML.
+/// The speculation rollup under `status`.
+///
+/// Two lines, and both earn their place: the first says whether this daemon
+/// can spend money, the second says whether speculating is working. A claim
+/// rate near zero, or a median lead near zero, means the triggers are firing
+/// too late to be worth anything — which is the point of measuring it.
+fn print_speculation(spec: &proto::SpecStatus) {
+    let mode = if spec.spends_tokens {
+        format!("precompute + model runs ({})", spec.command)
+    } else {
+        "precompute only, no model runs".to_owned()
+    };
+    println!("speculation:   on — {mode}");
+    let attempts = spec.claimed.saturating_add(spec.missed);
+    let claimed = match spec.claimed.saturating_mul(100).checked_div(attempts) {
+        Some(percent) => format!("{} of {attempts} claimed ({percent}%)", spec.claimed),
+        None => "nothing asked yet".to_owned(),
+    };
+    // Integer maths rather than a float: a lead is milliseconds, and casting
+    // i64 to f64 to print one decimal place is a lossy cast for nothing.
+    let lead = match spec.median_lead_ms {
+        Some(lead_ms) => format!(
+            " · median lead {}.{}s",
+            lead_ms / 1_000,
+            (lead_ms % 1_000) / 100
+        ),
+        None => String::new(),
+    };
+    let timeouts = if spec.timeouts > 0 {
+        format!(" · {} timeout(s)", spec.timeouts)
+    } else {
+        String::new()
+    };
+    println!(
+        "               24h: {} run(s) · {claimed}{lead} · {} out{timeouts}",
+        spec.runs,
+        human_bytes(spec.bytes_out)
+    );
+}
+
 fn policy(repo: &Path) -> i32 {
     match acyclic_engine::config::Config::load(repo) {
         Ok(config) => {
@@ -627,6 +684,37 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             Ok(())
         }
+        Command::Summary {
+            session,
+            turn,
+            wait_ms,
+            json,
+        } => {
+            let reply = client.call(proto::Op::Summary {
+                session_id: session,
+                turn,
+                wait_ms,
+            })?;
+            let proto::Reply::Summary(info) = reply else {
+                return Err("unexpected reply".into());
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("turn {} of {}", info.turn, short_session(&info.session_id));
+                println!("  prompt: {}", brief::quote(&info.prompt, 100));
+                match info.text {
+                    // Says where the words came from: this is generated
+                    // prose, not a record of what happened.
+                    Some(text) => println!("  {} summary: {text}", info.source),
+                    None => println!("  no summary ({})", info.source),
+                }
+            }
+            Ok(())
+        }
         Command::Restore { checkpoint, paths } => {
             for path in paths {
                 let reply = client.call(proto::Op::Rewind {
@@ -865,6 +953,11 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     "mounts:        unavailable ({}) — forks copy, Safe Mode off",
                     info.mount_reason.as_deref().unwrap_or("unknown reason")
                 );
+            }
+            // Printed only when speculation is configured: the default
+            // output has to stay exactly what it was.
+            if let Some(spec) = info.speculate {
+                print_speculation(&spec);
             }
             Ok(())
         }

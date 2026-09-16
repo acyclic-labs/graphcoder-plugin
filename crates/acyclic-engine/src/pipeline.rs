@@ -308,6 +308,38 @@ impl PipelineHandle {
         )?
     }
 
+    /// A diff that yields rather than queues.
+    ///
+    /// `Ok(None)` means the request channel was already loaded, so this
+    /// speculation is abandoned instead of landing behind a backlog. That is
+    /// the whole discipline speculation runs under: it may use idle capacity
+    /// and must never compete for busy capacity, because the queue it would
+    /// join is the one the hook path waits in. Deliberately not a new
+    /// `Request` variant — it reuses `Diff`, so the pipeline gains no state
+    /// and `fail_request` needs no new arm.
+    pub async fn diff_speculative(
+        &self,
+        before: GenerationId,
+        after: GenerationId,
+    ) -> Result<Option<Vec<FileChange>>> {
+        let (reply, receiver) = oneshot::channel();
+        match self.sender.try_send(Request::Diff {
+            before,
+            after,
+            reply,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Ok(None),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(EngineError::Store("pipeline is gone".into()))
+            }
+        }
+        let changes = receiver
+            .await
+            .map_err(|_| EngineError::Store("pipeline dropped the request".into()))??;
+        Ok(Some(changes))
+    }
+
     pub async fn fork(&self) -> Result<ForkSeed> {
         request!(self, Fork {})?
     }

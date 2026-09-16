@@ -8,7 +8,7 @@
 # lands a row the CLI sees under the same label, `timeline` reports it
 # back, `diff` names an edit, `restore` brings one path back (and refuses
 # an empty list), `rewind` refuses without confirm=true and restores the
-# tree with it, `brief` and `turns` answer — and the server exits cleanly
+# tree with it, `brief`, `turns` and `summary` answer — and the server exits cleanly
 # when the host closes stdin.
 #
 # Needs only the built binary — no host app, credentials, or model session
@@ -67,7 +67,7 @@ send '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 send '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 wait_for_id 2
 tools="$(response 2)"
-for tool in checkpoint timeline turns rewind diff restore brief; do
+for tool in checkpoint timeline turns rewind diff restore brief summary; do
   [[ "$tools" == *"\"name\":\"$tool\""* ]] || fail "tools/list is missing $tool: $tools"
 done
 
@@ -133,6 +133,15 @@ send '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"turns","a
 wait_for_id 12
 [[ "$(response 12)" == *'"isError":false'* ]] || fail "turns errored: $(response 12)"
 
+# Speculation is off here, so `summary` must answer that plainly rather
+# than erroring — and must not produce one on demand, which would spend the
+# developer's money because a tool was called.
+send '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"summary","arguments":{}}}'
+wait_for_id 13
+summary="$(response 13)"
+[[ "$summary" == *'"isError":false'* ]] || fail "summary errored with speculation off: $summary"
+[[ "$summary" == *'no summary'* ]] || fail "summary should report none is available: $summary"
+
 # A host stops its MCP server by closing stdin; the process must exit on
 # its own rather than needing a kill.
 exec 3>&-
@@ -147,4 +156,4 @@ while kill -0 "$MCP_PID" 2>/dev/null; do
 done
 wait "$MCP_PID" 2>/dev/null || fail "mcp server exited non-zero: $(tail -c 400 "$ERR")"
 
-pass "handshake, 7 tools listed and every one called (checkpoint, timeline, diff, restore, rewind with its confirm gate, brief, turns) through the shared daemon, clean exit on stdin close"
+pass "handshake, 8 tools listed and every one called (checkpoint, timeline, diff, restore, rewind with its confirm gate, brief, turns, summary) through the shared daemon, clean exit on stdin close"

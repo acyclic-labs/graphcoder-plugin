@@ -201,6 +201,19 @@ pub enum Op {
         #[serde(default = "default_limit")]
         limit: u32,
     },
+    /// Prose describing one conversation turn, produced by the speculation
+    /// runner at the turn boundary. Defaults to the most recent completed
+    /// turn of the most recent session.
+    Summary {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        turn: Option<i64>,
+        /// Milliseconds to wait for a summary already being produced. Zero
+        /// (the default) never waits, which is what every hook path wants.
+        #[serde(default)]
+        wait_ms: u64,
+    },
     /// Agent-readable summary of the previous session: where it ended and
     /// which branches were abandoned. `current` is excluded (it is the
     /// session asking, and it has no history yet).
@@ -330,10 +343,29 @@ pub enum Reply {
     Inspect(InspectInfo),
     Sessions(Vec<SessionEntry>),
     Brief(BriefInfo),
+    Summary(SummaryInfo),
     Forks(Vec<ForkEntry>),
     Promote(PromoteInfo),
     /// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`.
     SessionPending(SessionPendingInfo),
+}
+
+/// One turn's summary, and where it came from.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SummaryInfo {
+    pub session_id: String,
+    pub turn: i64,
+    /// The prompt that caused the turn, as the index recorded it.
+    pub prompt: String,
+    /// `None` when nothing has been produced for this turn.
+    pub text: Option<String>,
+    /// "speculated" (it was waiting), "waited" (produced while asking), or
+    /// a reason it is unavailable. Callers surface this: a summary is
+    /// generated text, and where it came from is part of reading it.
+    pub source: String,
+    /// How far ahead of the request it landed, when it was waiting.
+    #[serde(default)]
+    pub lead_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -428,6 +460,33 @@ pub struct StatusInfo {
     /// Why mounts are unavailable, when they are.
     #[serde(default)]
     pub mount_reason: Option<String>,
+    /// Speculation, when it is configured at all. `None` — the default —
+    /// means the daemon prints exactly what it printed before the feature
+    /// existed; several acceptance scripts read this output.
+    #[serde(default)]
+    pub speculate: Option<SpecStatus>,
+}
+
+/// What speculation has been doing, over the last 24 hours.
+///
+/// Reports bytes and run counts rather than money: the daemon cannot know
+/// anyone's pricing and should not pretend to. `claimed` against `missed` is
+/// the number that says whether speculating is paying off at all.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpecStatus {
+    /// Whether this configuration can run a model, and so spend.
+    pub spends_tokens: bool,
+    /// How the model is invoked, for the status line. Empty when nothing
+    /// paid is configured.
+    pub command: String,
+    pub runs: u64,
+    pub claimed: u64,
+    pub missed: u64,
+    pub timeouts: u64,
+    pub bytes_out: u64,
+    /// How far ahead of the request a claimed result landed. Near zero means
+    /// the trigger is firing too late to be worth anything.
+    pub median_lead_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -535,6 +594,11 @@ pub struct BriefSession {
     /// Files changed from the session's first checkpoint to its last.
     pub files_changed: u64,
     pub sample_paths: Vec<String>,
+    /// Prose for the session's last turn, when speculation produced one.
+    /// Looked up fresh rather than stored in the brief: whether a summary
+    /// exists is independent of everything else the brief reports.
+    #[serde(default)]
+    pub summary: Option<String>,
     pub abandoned: Vec<BriefAbandoned>,
 }
 

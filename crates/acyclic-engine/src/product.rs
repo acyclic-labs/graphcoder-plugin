@@ -10,6 +10,10 @@ pub const ENV_PREFIX: &str = env!("PRODUCT_ENV_PREFIX");
 pub const TRACE_ENV: &str = concat!(env!("PRODUCT_ENV_PREFIX"), "_TRACE");
 /// Environment variable that puts the CLI in hook mode.
 pub const HOOK_ENV: &str = concat!(env!("PRODUCT_ENV_PREFIX"), "_HOOK");
+/// Environment variable that overrides the per-developer speculation config
+/// path. Exists so tests (and a sandboxed CI run) never read the real
+/// `~/.config`, which the acceptance harness does not isolate.
+pub const SPECULATE_CONFIG_ENV: &str = concat!(env!("PRODUCT_ENV_PREFIX"), "_SPECULATE_CONFIG");
 /// The npm launcher package, for messages that point at the install path.
 pub const NPM_PACKAGE: &str = env!("PRODUCT_NPM_PACKAGE");
 /// `owner/repo` on GitHub, for release and issue links.

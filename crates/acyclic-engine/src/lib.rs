@@ -50,6 +50,7 @@ pub mod merge;
 pub mod pipeline;
 pub mod product;
 pub mod rewind;
+pub mod spec;
 pub mod store;
 pub mod trace;
 
