@@ -195,13 +195,20 @@ correct.
   not bound anything there. Closing this needs overlapped I/O or a watchdog
   thread. **The latency gate's guarantee does not hold on Windows.**
 
-- **A speculative run's timeout reaches the child, not its descendants.**
-  `spec_runner` puts each run in its own process group with `setsid` and
-  signals the group on timeout; neither has a Windows equivalent here, so
-  `own_process_group` and `kill_group` are no-ops and only `kill_on_drop`
-  fires. An agent CLI that is a runtime with children of its own therefore
-  leaves those children running — and billing. Closing this needs a job
-  object. Speculation is off by default, so nothing hits it unconfigured.
+- **A speculative run's timeout kills without a grace period, and a
+  descendant can escape the job.** `spec_runner` puts each run in a job
+  object rather than the Unix process group, and `TerminateJobObject` ends
+  the tree. Two differences from Unix follow. There is no graceful signal to
+  a job, so `kill_grace` is not honoured: the tree gets the `SIGKILL` half
+  without the `SIGTERM` half. And Windows has no `pre_exec`, so the child
+  joins the job just *after* `CreateProcess` returns rather than before it
+  runs — a grandchild started inside that window is not in the job and
+  survives. The window is small and closing it means hand-rolling
+  `CreateProcess` with `CREATE_SUSPENDED`. In exchange, the job's
+  `KILL_ON_JOB_CLOSE` limit makes Windows *better* than Unix in one respect:
+  the daemon holds the job's only handle, so a force-killed daemon reaps
+  every speculative descendant, and no equivalent of the Unix stale-run
+  sweep is needed.
 
 - **x64 only.** No `aarch64-pc-windows-msvc` target; Windows on ARM gets the
   launcher's "unsupported platform" message.

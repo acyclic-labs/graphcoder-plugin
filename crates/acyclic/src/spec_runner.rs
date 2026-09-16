@@ -15,9 +15,10 @@
 //!   watcher and manufacture checkpoints nobody asked for. That is the worst
 //!   failure mode available to a checkpointing product.
 //!
-//! The child is spawned into its own process group so a timeout kills the
-//! whole tree: an agent CLI is typically a runtime that spawns its own
-//! children, and killing only the direct child would leak them.
+//! The child is spawned into a group of its own — a process group on Unix,
+//! a job object on Windows — so a timeout kills the whole tree: an agent CLI
+//! is typically a runtime that spawns its own children, and killing only the
+//! direct child would leak them. See [`RunGroup`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -112,12 +113,13 @@ pub async fn run(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    own_process_group(&mut command);
+    let group = RunGroup::prepare(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return RunOutcome::Failed(format!("spawn {program}: {error}")),
     };
+    group.adopt(&child);
     // The child leads its own group, so its pid is the group id.
     let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
         return RunOutcome::Failed("child exited before it could be tracked".to_owned());
@@ -151,11 +153,11 @@ pub async fn run(
             Err(error) => RunOutcome::Failed(error.to_string()),
         },
         _ = tokio::time::sleep(spec.timeout) => {
-            kill_group(pid, spec.kill_grace).await;
+            group.kill(pid, spec.kill_grace).await;
             RunOutcome::Timeout
         }
         _ = cancel => {
-            kill_group(pid, spec.kill_grace).await;
+            group.kill(pid, spec.kill_grace).await;
             RunOutcome::Cancelled
         }
     };
@@ -163,46 +165,191 @@ pub async fn run(
     outcome
 }
 
-/// Signals the whole group, then makes sure. A model CLI is usually a
-/// runtime with children of its own, so signalling only the child we spawned
-/// would leave them running — and billing.
+/// Holds a run's whole process tree, so a timeout can reach all of it.
+///
+/// A model CLI is usually a runtime with children of its own, so killing
+/// only the child we spawned would leave them running — and billing. Both
+/// platforms have an answer; they are not the same answer.
+///
+/// - **Unix**: the child calls `setsid` between fork and exec, leading a
+///   process group of its own, and the timeout signals the group.
+/// - **Windows**: the child is assigned to a job object. There is no
+///   `pre_exec` equivalent, so the assignment happens just after spawn —
+///   a descendant started in that window escapes the job. It is narrow and
+///   it is the price of not hand-rolling `CreateProcess`.
+struct RunGroup {
+    /// The job the run's processes belong to, absent if it could not be
+    /// created. `None` degrades to killing the direct child, which is what
+    /// this platform did before.
+    #[cfg(windows)]
+    job: Option<OwnedJob>,
+}
+
 #[cfg(unix)]
-#[allow(
-    unsafe_code,
-    reason = "killpg on a group this process created and still owns; no \
-              handler runs and nothing is aliased"
-)]
-async fn kill_group(pgid: i32, grace: Duration) {
-    unsafe {
-        libc::killpg(pgid, libc::SIGTERM);
+impl RunGroup {
+    /// Puts the child in a process group of its own.
+    #[allow(
+        unsafe_code,
+        reason = "setsid() between fork and exec is async-signal-safe and is the \
+                  only way to make a timeout reach the child's own children"
+    )]
+    fn prepare(command: &mut Command) -> Self {
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        Self {}
     }
-    tokio::time::sleep(grace).await;
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
+
+    /// Nothing to do: `setsid` already ran, in the child.
+    fn adopt(&self, _child: &tokio::process::Child) {}
+
+    /// Signals the whole group, then makes sure.
+    #[allow(
+        unsafe_code,
+        reason = "killpg on a group this process created and still owns; no \
+                  handler runs and nothing is aliased"
+    )]
+    async fn kill(&self, pgid: i32, grace: Duration) {
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
+        }
+        tokio::time::sleep(grace).await;
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
     }
 }
 
-#[cfg(not(unix))]
-async fn kill_group(_pgid: i32, _grace: Duration) {}
+#[cfg(windows)]
+impl RunGroup {
+    /// Creates the job the child will be assigned to, before the spawn so
+    /// the window between the two is as short as it can be.
+    ///
+    /// `KILL_ON_JOB_CLOSE` is what makes the tree die with the daemon: this
+    /// handle is the only one, so a force-killed daemon takes every
+    /// speculative descendant with it. That is why `sweep_stale_runs` needs
+    /// no Windows arm.
+    #[allow(
+        unsafe_code,
+        reason = "creates an unnamed job object and sets one documented limit on it; \
+                  the handle is owned by OwnedJob and closed exactly once"
+    )]
+    fn prepare(_command: &mut Command) -> Self {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
 
-/// Puts the child in a process group of its own.
-#[cfg(unix)]
-#[allow(
-    unsafe_code,
-    reason = "setsid() between fork and exec is async-signal-safe and is the \
-              only way to make a timeout reach the child's own children"
-)]
-fn own_process_group(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+        // SAFETY: an unnamed job with default security; returns null on
+        // failure, which is the only thing done with the result.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Self { job: None };
+        }
+        let job = OwnedJob(handle as isize);
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0);
+        // SAFETY: `limits` is a live, fully initialised value of exactly the
+        // type the information class names, and its length is passed as
+        // written. A failure here costs the kill-on-close limit, not the
+        // job, so it is not treated as fatal.
+        unsafe {
+            SetInformationJobObject(
+                job.handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size,
+            );
+        }
+        Self { job: Some(job) }
+    }
+
+    /// Assigns the spawned child, and with it every process it goes on to
+    /// start, to the job.
+    #[allow(
+        unsafe_code,
+        reason = "assigns a child this process just spawned, and whose handle it still \
+                  owns, to a job it created"
+    )]
+    fn adopt(&self, child: &tokio::process::Child) {
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let (Some(job), Some(process)) = (self.job.as_ref(), child.raw_handle()) else {
+            return;
+        };
+        // SAFETY: both handles are live and owned here — the job by
+        // `OwnedJob`, the process by `child`, which outlives this call.
+        unsafe {
+            AssignProcessToJobObject(job.handle(), process.cast());
+        }
+    }
+
+    /// Ends the tree. The grace period has no counterpart here: Windows
+    /// offers no graceful signal to a job, so this is the `SIGKILL` half
+    /// without the `SIGTERM` half.
+    #[allow(
+        unsafe_code,
+        reason = "terminates a job this process created and still owns"
+    )]
+    async fn kill(&self, _pgid: i32, _grace: Duration) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        let Some(job) = self.job.as_ref() else { return };
+        // SAFETY: the handle is live for as long as `self` is.
+        unsafe {
+            TerminateJobObject(job.handle(), 1);
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn own_process_group(_command: &mut Command) {}
+/// Neither `setsid` nor a job object: the direct child is killed on drop and
+/// anything it started outlives it.
+#[cfg(not(any(unix, windows)))]
+impl RunGroup {
+    fn prepare(_command: &mut Command) -> Self {
+        Self {}
+    }
+
+    fn adopt(&self, _child: &tokio::process::Child) {}
+
+    async fn kill(&self, _pgid: i32, _grace: Duration) {}
+}
+
+/// Owns a job handle and closes it once.
+///
+/// Held as an `isize` rather than a `HANDLE`, because a raw pointer would
+/// make [`RunGroup`] `!Send` and the run future is spawned onto the runtime.
+#[cfg(windows)]
+struct OwnedJob(isize);
+
+#[cfg(windows)]
+impl OwnedJob {
+    fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0 as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedJob {
+    #[allow(
+        unsafe_code,
+        reason = "closes the handle CreateJobObjectW returned, exactly once"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `CreateJobObjectW` in `prepare`, is
+        // not closed anywhere else, and this runs once. Closing the last
+        // handle is also what enforces KILL_ON_JOB_CLOSE, reaping anything
+        // the run left behind.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle());
+        }
+    }
+}
 
 /// Kills anything a dead daemon left running, before the store opens.
 ///
@@ -251,6 +398,9 @@ pub fn sweep_stale_runs(spec_runs: &Path) {
     let _ = std::fs::remove_dir(spec_runs);
 }
 
+/// Windows needs no sweep: each run's job object carries
+/// `KILL_ON_JOB_CLOSE` and the daemon holds its only handle, so a daemon
+/// that dies — however it dies — takes the run's whole tree with it.
 #[cfg(not(unix))]
 pub fn sweep_stale_runs(_spec_runs: &Path) {}
 
@@ -372,6 +522,10 @@ mod tests {
     /// The property the timeout is actually for: an agent CLI is a runtime
     /// that spawns children, and killing only the process we spawned would
     /// leave those running — and billing.
+    ///
+    /// POSIX-only as written: it needs `pgrep` and a shell that backgrounds
+    /// with `&`. The Windows half of the same property is below.
+    #[cfg(unix)]
     #[test]
     fn a_timeout_kills_the_children_too() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -391,6 +545,52 @@ mod tests {
             "children survived: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// The Windows half, asserted at the mechanism rather than by hunting
+    /// processes: there is no `pgrep`, and job membership is exactly the
+    /// thing that can be queried directly. A process in a job has its own
+    /// descendants in that job — that is what a job object is — so
+    /// membership plus a working `TerminateJobObject` is the property.
+    ///
+    /// What this cannot see is the window between `CreateProcess` returning
+    /// and the assignment, which is recorded in `docs/windows-verification.md`.
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "IsProcessInJob only reads membership of two handles this test owns"
+    )]
+    fn the_child_joins_the_job_and_the_job_kill_ends_it() {
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut command = Command::new("cmd");
+            command
+                .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let group = RunGroup::prepare(&mut command);
+            let mut child = command.spawn().expect("spawn");
+            group.adopt(&child);
+
+            let process = child.raw_handle().expect("child is live");
+            let job = group.job.as_ref().expect("job created").handle();
+            let mut inside = 0;
+            // SAFETY: both handles are live and owned here — the process by
+            // `child`, the job by `group` — and the call only reads.
+            let queried = unsafe { IsProcessInJob(process.cast(), job, &raw mut inside) };
+            assert!(queried != 0, "IsProcessInJob failed");
+            assert!(inside != 0, "the child never joined the job");
+
+            group.kill(0, Duration::from_millis(0)).await;
+            let status = child.wait().await.expect("wait");
+            assert!(!status.success(), "a terminated child cannot exit cleanly");
+        });
     }
 
     #[test]
