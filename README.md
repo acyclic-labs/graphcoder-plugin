@@ -139,9 +139,11 @@ Full feature lists, user journeys, and technical requirements per launch: [docs/
 
 ## Compliance posture
 
-Local-first (no code leaves the machine in v1), verifiable open source (signed reproducible releases, SBOM, SLSA provenance), and first-class controls on the snapshot store (encryption at rest, snapshot exclusions, purge-through-history, team-enforced retention). See the compliance section of the docs page.
+**Local-first, and stronger than "no code leaves the machine":** there is no network code in the product at all. No HTTP client is compiled into any crate, so there is no telemetry, no update check, and no egress to enumerate or firewall. Security review is of a local binary, not a vendor.
 
-Note for Launch 1 design: purge-through-history and snapshot exclusions must be designed into the Merkle store from the start — content-addressed stores make retroactive deletion hard to retrofit.
+Releases carry a SLSA build-provenance attestation and an SPDX SBOM per binary, and every push is scanned for licences, advisories and sources against `deny.toml`. Builds are native per target rather than reproducible, and macOS binaries are not notarized.
+
+**The shipped control on the snapshot store is `exclude`.** Encryption at rest, purge-through-history, secret scanning and enforced retention have been described as controls but are **not built**; purge and GC are blocked on an upstream retention-release fact, so store retention is currently unbounded. [`docs/design/07-compliance.md`](docs/design/07-compliance.md) separates what is true today from what is intended, claim by claim — read it before making a compliance commitment to anyone.
 
 ## License
 
