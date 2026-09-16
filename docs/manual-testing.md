@@ -191,6 +191,35 @@ Open the Chat view in agent mode, start the `acyclic` server from the MCP
 servers list (or accept the prompt), send the prompt above, check the
 terminal. Needs the GitHub Copilot Chat extension.
 
+### GitHub Copilot CLI
+
+```sh
+export COPILOT_HOME="$(mktemp -d)"     # keep your real ~/.copilot out of this
+acyclic install copilot                 # writes $COPILOT_HOME/mcp-config.json
+cd <scratch repo> && copilot
+```
+
+Run `/mcp list` and confirm the `acyclic-<repo name>` server is connected and
+lists the seven tools, then send the prompt above and check the timeline in a
+terminal. The entry is per machine and binds one repo under its own key, the
+same as Claude Desktop. Without `COPILOT_HOME` this writes to your real
+`~/.copilot/mcp-config.json` — remove the entry by hand afterwards, or with
+`/mcp delete <name>`.
+
+### Copilot coding agent (cloud)
+
+```sh
+acyclic install copilot-agent           # writes .github/workflows/copilot-setup-steps.yml, prints MCP JSON
+```
+
+Not a local check. The workflow only runs once it is on the **default
+branch**, so this needs a merged PR before anything happens. Paste the printed
+JSON into the repo's Settings → Code & automation → Copilot → Coding agent,
+then assign an issue to Copilot and read the agent's session logs to confirm
+the setup steps installed the binary and `acyclic init` ran. Remember that any
+checkpoint it takes lives in that sandbox and is gone when the run ends —
+there is nothing to look for in your local timeline.
+
 ## Cleanup
 
 ```sh
@@ -198,8 +227,9 @@ acyclic stop                            # this repo's daemon
 rm -rf ~/.local/share/acyclic/stores/<hash>   # the scratch store; `acyclic status` prints the path
 ```
 
-`acyclic install claude-desktop` and `cursor-agent mcp enable` change
-per-machine state; undo them by hand if the scratch repo goes away.
+`acyclic install claude-desktop`, `acyclic install copilot` (unless you set
+`COPILOT_HOME`) and `cursor-agent mcp enable` change per-machine state; undo
+them by hand if the scratch repo goes away.
 
 ## Last full pass
 
@@ -216,6 +246,8 @@ per-machine state; undo them by hand if the scratch repo goes away.
 | OpenCode | 1.18.10 | MCP | connected (handshake); no model configured for a tool call |
 | Claude Desktop | current | MCP | server started, `initialize` + `tools/list` succeeded on launch; in-chat tool call not exercised |
 | VS Code | 1.137.0 | MCP | config written; Copilot extension not installed here, not exercised |
+| GitHub Copilot CLI | — | MCP | not exercised: `copilot` not installed on this machine. Config shape unit-tested against GitHub's current docs |
+| Copilot coding agent | — | MCP | not exercised: needs the setup workflow on the default branch and a real agent run |
 
 Findings fixed during that pass: Codex 0.154 ignores a `hooks.json` without
 the top-level `hooks` key (the adapter wrote the flat shape; now migrated on

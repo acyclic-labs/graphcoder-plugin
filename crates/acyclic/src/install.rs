@@ -15,7 +15,7 @@
 //! README's per-host table is the user-facing version of the same list,
 //! with how far each adapter has been verified.
 
-use acyclic_engine::product::{self, NAME};
+use acyclic_engine::product::{self, NAME, NPM_PACKAGE};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -37,6 +37,8 @@ pub enum Host {
     VsCode,
     #[value(name = "opencode")]
     OpenCode,
+    Copilot,
+    CopilotAgent,
 }
 
 // TODO(more hosts): the two shapes this file already covers — lifecycle
@@ -66,15 +68,61 @@ pub enum Host {
 //   config location/shape unverified — do not assume any of them match
 //   Claude Desktop/Cursor's shape without checking.
 pub fn run(repo: &Path, host: Host) -> Result<(), String> {
+    let adapter = adapter(host);
+    adapter
+        .install(repo)
+        .map_err(|error| format!("{}: {error}", adapter.id()))
+}
+
+/// What every host's adapter does: name itself, and wire itself into a repo.
+/// `id` is the kebab-case CLI name; `host_names_match_their_adapter_ids`
+/// asserts it against clap's own name for the variant, so the two can't
+/// drift and the documented id list can't go stale.
+trait HostAdapter {
+    fn id(&self) -> &'static str;
+    fn install(&self, repo: &Path) -> Result<(), String>;
+}
+
+/// The registry. Exhaustive, so a new `Host` variant without an adapter is a
+/// compile error rather than a runtime "unknown host".
+fn adapter(host: Host) -> &'static dyn HostAdapter {
     match host {
-        Host::ClaudeCode => claude_code(repo),
-        Host::Codex => codex(repo),
-        Host::Cursor => cursor(repo),
-        Host::AgentsMd => agents_md(repo),
-        Host::ClaudeDesktop => claude_desktop(repo),
-        Host::VsCode => vscode(repo),
-        Host::OpenCode => opencode(repo),
+        Host::ClaudeCode => &ClaudeCode,
+        Host::Codex => &Codex,
+        Host::Cursor => &Cursor,
+        Host::AgentsMd => &AgentsMd,
+        Host::ClaudeDesktop => &CLAUDE_DESKTOP,
+        Host::VsCode => &VSCODE,
+        Host::OpenCode => &OpenCode,
+        Host::Copilot => &COPILOT_CLI,
+        Host::CopilotAgent => &CopilotAgent,
     }
+}
+
+/// The hosts whose work is a free function below, because what they write
+/// (hooks, commands, skills, rules, a cheatsheet, or a mix) is host-shaped
+/// enough that there is nothing to share but the dispatch. Contrast
+/// `McpHost`, where a host that only registers an MCP server is data.
+macro_rules! fn_adapters {
+    ($($adapter:ident => $id:literal, $install:ident;)*) => {$(
+        struct $adapter;
+        impl HostAdapter for $adapter {
+            fn id(&self) -> &'static str {
+                $id
+            }
+            fn install(&self, repo: &Path) -> Result<(), String> {
+                $install(repo)
+            }
+        }
+    )*};
+}
+
+fn_adapters! {
+    ClaudeCode => "claude-code", claude_code;
+    Codex => "codex", codex;
+    Cursor => "cursor", cursor;
+    AgentsMd => "agents-md", agents_md;
+    OpenCode => "opencode", opencode;
 }
 
 fn claude_code(repo: &Path) -> Result<(), String> {
@@ -376,6 +424,12 @@ fn is_our_cursor_entry(entry: &Value) -> bool {
 /// - VS Code (Copilot agent mode): `{"servers": {"<name>": {type, command,
 ///   args}}}` — different top-level key, and `type` must be explicit
 ///   (`"stdio"`); VS Code does not infer it the way the other two do.
+/// - GitHub Copilot CLI: `{"mcpServers": {"<name>": {type, command, args}}}`
+///   — the `mcpServers` key like Claude Desktop/Cursor, but `type` *is*
+///   required, so it matches neither existing shape. `"local"` and
+///   `"stdio"` are both accepted and mean the same thing; we write
+///   `"stdio"`, the standard MCP name, which GitHub recommends for configs
+///   meant to be portable across VS Code and the cloud agent.
 ///
 /// Codex is deliberately absent: its MCP config is TOML
 /// (`[mcp_servers.<name>]` in `config.toml`), not JSON, so it needs its own
@@ -383,9 +437,10 @@ fn is_our_cursor_entry(entry: &Value) -> bool {
 struct McpConfigShape {
     /// "mcpServers" (Claude Desktop, Cursor) or "servers" (VS Code).
     servers_key: &'static str,
-    /// The `type` field, where the host requires one: VS Code wants
-    /// `stdio`, `OpenCode` wants `local`. Claude Desktop and Cursor neither
-    /// accept nor need it.
+    /// The `type` field, where the host requires one: VS Code and Copilot
+    /// CLI want `stdio`, `OpenCode` wants `local`. Claude Desktop and Cursor
+    /// neither accept nor need it. It is independent of `servers_key`:
+    /// Copilot CLI pairs an explicit type with the `mcpServers` key.
     explicit_type: Option<&'static str>,
     /// `OpenCode` takes the binary and its arguments as ONE `command` array
     /// rather than separate `command` + `args` fields.
@@ -418,6 +473,17 @@ const VSCODE_MCP_SHAPE: McpConfigShape = McpConfigShape {
     enabled_flag: false,
     schema_url: None,
     workspace_cwd: true,
+};
+/// Copilot CLI: `mcpServers` like Claude Desktop, explicit type like VS
+/// Code, and no `cwd` — its config is global, so there is no workspace to
+/// resolve `${workspaceFolder}` against.
+const COPILOT_CLI_SHAPE: McpConfigShape = McpConfigShape {
+    servers_key: "mcpServers",
+    explicit_type: Some("stdio"),
+    command_as_array: false,
+    enabled_flag: false,
+    schema_url: None,
+    workspace_cwd: false,
 };
 
 /// `OpenCode`'s `opencode.json`: its own top-level key, `type: "local"`,
@@ -502,6 +568,16 @@ impl McpEntry {
         match &self.repo {
             Some(repo) => json!(["mcp", "--repo", repo]),
             None => json!(["mcp"]),
+        }
+    }
+
+    /// The same args as a command line, for the install summary — the line a
+    /// user copies to reproduce the server by hand, so it must not disagree
+    /// with what was written.
+    fn args_display(&self) -> String {
+        match &self.repo {
+            Some(repo) => format!("mcp --repo {repo}"),
+            None => "mcp".to_owned(),
         }
     }
 }
@@ -619,35 +695,143 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(stringify)
 }
 
-/// Claude Desktop: unlike the repo-local adapters, there is no hook config
-/// to drop — Desktop has no lifecycle-hook API, so `acyclic mcp` (an MCP
-/// stdio server) is registered instead, in the user's *global*
-/// `claude_desktop_config.json`. That file is per-machine, not something a
-/// team can check in: each teammate who wants Desktop support runs this
-/// locally once.
-fn claude_desktop(repo: &Path) -> Result<(), String> {
-    let config_path = claude_desktop_config_path()?;
-    let exe = std::env::current_exe().map_err(stringify)?;
-    let repo = repo.canonicalize().map_err(stringify)?;
-    let taken = existing_servers(&config_path, &MCP_SERVERS_SHAPE);
-    let entry = McpEntry::per_machine(&exe, &repo, &taken);
-    merge_mcp_server_json(&config_path, &MCP_SERVERS_SHAPE, &entry)?;
+/// Where a host reads its MCP config. This decides both the path and the
+/// entry flavour, because the two kinds of file have different readers —
+/// see `McpEntry`.
+enum McpConfigLocation {
+    /// Repo-relative (`.vscode/mcp.json`): checked in, so it must stay
+    /// portable — no absolute paths, no machine-specific keys.
+    Project(&'static str),
+    /// Resolved from this user's environment at install time: per-machine,
+    /// one file serving every repo they register.
+    PerMachine(fn() -> Result<PathBuf, String>),
+}
 
-    println!(
-        "claude-desktop adapter registered in {}",
-        config_path.display()
-    );
-    println!(
-        "  server: {} = {NAME} mcp --repo {}",
-        entry.key,
-        repo.display()
-    );
-    println!("  one entry per repo, keyed by directory name (a second repo with the same name");
-    println!("  gets a short suffix): re-run this in another repo to add it alongside.");
-    println!("per-machine, not checked into the repo: each teammate who wants");
-    println!("Desktop support runs `{NAME} install claude-desktop` locally once.");
-    println!("restart Claude Desktop for it to pick up the new server.");
-    Ok(())
+/// A host whose entire adapter is "register `acyclic mcp` in one JSON
+/// config": where the file lives, what shape it wants, and what to print.
+/// Adding another host that fits this mould is a `static` below plus a
+/// `Host` variant and its registry arm — no new logic.
+struct McpHost {
+    id: &'static str,
+    shape: &'static McpConfigShape,
+    location: McpConfigLocation,
+    /// Printed after the standard summary; `{{name}}` is substituted.
+    notes: &'static [&'static str],
+}
+
+impl HostAdapter for McpHost {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        let (config_path, entry) = match self.location {
+            McpConfigLocation::Project(relative) => (repo.join(relative), McpEntry::portable()),
+            McpConfigLocation::PerMachine(resolve) => {
+                let config_path = resolve()?;
+                let exe = std::env::current_exe().map_err(stringify)?;
+                let repo = repo.canonicalize().map_err(stringify)?;
+                let taken = existing_servers(&config_path, self.shape);
+                let entry = McpEntry::per_machine(&exe, &repo, &taken);
+                (config_path, entry)
+            }
+        };
+        merge_mcp_server_json(&config_path, self.shape, &entry)?;
+
+        println!(
+            "{} adapter registered in {}",
+            self.id(),
+            config_path.display()
+        );
+        println!(
+            "  server: {} = {} {}",
+            entry.key,
+            entry.command,
+            entry.args_display()
+        );
+        for note in self.notes {
+            println!("{}", product::render(note));
+        }
+        Ok(())
+    }
+}
+
+static CLAUDE_DESKTOP: McpHost = McpHost {
+    id: "claude-desktop",
+    shape: &MCP_SERVERS_SHAPE,
+    location: McpConfigLocation::PerMachine(claude_desktop_config_path),
+    notes: &[
+        "  one entry per repo, keyed by directory name (a second repo with the same name",
+        "  gets a short suffix): re-run this in another repo to add it alongside.",
+        "per-machine, not checked into the repo: each teammate who wants",
+        "Desktop support runs `{{name}} install claude-desktop` locally once.",
+        "restart Claude Desktop for it to pick up the new server.",
+    ],
+};
+
+/// VS Code (GitHub Copilot's agent mode): like Claude Desktop, there is no
+/// lifecycle-hook API to drop repo-local config into — MCP is the only
+/// extension point. Unlike Desktop, VS Code supports a workspace-local
+/// config file (`.vscode/mcp.json`), so this one *is* checked-in, team-
+/// shared config, same as the hook-based adapters.
+///
+/// TODO(verify): the schema (`servers` key, explicit `"type": "stdio"`) is
+/// confirmed against VS Code's current MCP docs but has not been exercised
+/// against a real VS Code + Copilot agent-mode session. Test that before
+/// calling this adapter "supported" rather than "built."
+static VSCODE: McpHost = McpHost {
+    id: "vscode",
+    shape: &VSCODE_MCP_SHAPE,
+    location: McpConfigLocation::Project(".vscode/mcp.json"),
+    notes: &["check this file in so the whole team inherits it."],
+};
+
+/// GitHub Copilot CLI (`copilot`): a global, per-machine config, so this is
+/// the Claude Desktop story rather than the VS Code one — nothing is checked
+/// in and each teammate runs it once. Verified against GitHub's current
+/// Copilot CLI MCP docs (2026): `~/.copilot/mcp-config.json`, `mcpServers`
+/// key, explicit `type` required.
+///
+/// TODO(verify): the schema is from the docs; not yet exercised against a
+/// real `copilot` session (the CLI is not installed on the machine this was
+/// written on). `tests/acceptance/mcp-clients-e2e.sh` runs it when `copilot`
+/// is on PATH.
+static COPILOT_CLI: McpHost = McpHost {
+    id: "copilot",
+    shape: &COPILOT_CLI_SHAPE,
+    location: McpConfigLocation::PerMachine(copilot_cli_config_path),
+    notes: &[
+        "  one entry per repo, keyed by directory name, same as claude-desktop.",
+        "per-machine, not checked into the repo: each teammate who wants",
+        "Copilot CLI support runs `{{name}} install copilot` locally once.",
+        "check it with `copilot`, then `/mcp list`.",
+    ],
+};
+
+/// `$COPILOT_HOME/mcp-config.json`, falling back to `~/.copilot/...`.
+/// GitHub documents `COPILOT_HOME` as the override for that whole directory,
+/// so honour it rather than hardcoding the home-relative path — it is also
+/// what lets the acceptance test point the CLI at a scratch dir.
+fn copilot_cli_config_path() -> Result<PathBuf, String> {
+    copilot_cli_config_path_from(
+        std::env::var("COPILOT_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// The resolution itself, taking the two variables rather than reading them,
+/// so it is testable without mutating process env (which races the other
+/// tests in this binary).
+fn copilot_cli_config_path_from(
+    copilot_home: Option<String>,
+    home: Option<String>,
+) -> Result<PathBuf, String> {
+    copilot_home
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".copilot")))
+        .map(|base| base.join("mcp-config.json"))
+        .ok_or_else(|| "neither COPILOT_HOME nor HOME is set".to_owned())
 }
 
 /// macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`.
@@ -681,30 +865,9 @@ fn claude_desktop_config_path() -> Result<PathBuf, String> {
     }
 }
 
-/// VS Code (GitHub Copilot's agent mode): like Claude Desktop, there is no
-/// lifecycle-hook API to drop repo-local config into — MCP is the only
-/// extension point. Unlike Desktop, VS Code supports a workspace-local
-/// config file (`.vscode/mcp.json`), so this one *is* checked-in, team-
-/// shared config, same as the hook-based adapters.
-///
-/// TODO(verify): the schema below (`servers` key, explicit `"type":
-/// "stdio"`) is confirmed against VS Code's current MCP docs but has not
-/// been exercised against a real VS Code + Copilot agent-mode session. Test
-/// that before calling this adapter "supported" rather than "built."
-fn vscode(repo: &Path) -> Result<(), String> {
-    let vscode_dir = repo.join(".vscode");
-    merge_mcp_server_json(
-        &vscode_dir.join("mcp.json"),
-        &VSCODE_MCP_SHAPE,
-        &McpEntry::portable(),
-    )?;
-
-    println!("vscode adapter installed into {}", vscode_dir.display());
-    println!("  mcp: .vscode/mcp.json ({NAME} tools, project-scoped)");
-    println!("check this file in so the whole team inherits it.");
-    Ok(())
-}
-
+/// `OpenCode` is MCP *plus* a cheatsheet, so unlike the pure-MCP hosts it
+/// does not collapse into an `McpHost` constant — it stays a function and is
+/// registered through `fn_adapters!`.
 fn opencode(repo: &Path) -> Result<(), String> {
     // Project-scoped, checked in, and portable: a bare `acyclic` from PATH,
     // with the server locating the repo from its working directory.
@@ -741,6 +904,104 @@ fn agents_md(repo: &Path) -> Result<(), String> {
     println!("{NAME} block appended to {}", path.display());
     Ok(())
 }
+
+/// GitHub Copilot's *cloud* coding agent, which is a different animal from
+/// every other host here and does not get parity:
+///
+/// - Its MCP servers are configured in the repository's GitHub settings
+///   (Copilot → coding agent → MCP configuration), not in any file this
+///   command could merge. So `install` prints the JSON to paste rather than
+///   writing it, which is the honest thing to do — there is no file.
+/// - It runs in a GitHub-hosted sandbox, not on the developer's machine, so
+///   `{{name}} mcp` there talks to a checkout in that sandbox. Checkpoints the
+///   agent makes are that sandbox's timeline; they are not the local
+///   timeline and do not survive the run unless they reach a branch.
+///
+/// What this adapter *can* do is make the sandbox capable: the
+/// `copilot-setup-steps.yml` it writes installs the binary and initializes
+/// the repo before the agent starts, which is the documented hook for
+/// preparing that environment.
+///
+/// TODO(verify): not exercised against a real coding-agent run. The workflow
+/// only takes effect once it is on the default branch.
+struct CopilotAgent;
+
+impl HostAdapter for CopilotAgent {
+    fn id(&self) -> &'static str {
+        "copilot-agent"
+    }
+
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        let workflow = repo.join(".github/workflows/copilot-setup-steps.yml");
+        if let Some(parent) = workflow.parent() {
+            std::fs::create_dir_all(parent).map_err(stringify)?;
+        }
+        // Someone else's setup workflow is theirs: a coding-agent sandbox
+        // gets exactly one, so silently overwriting it would take away
+        // whatever setup they depend on. Print the steps instead.
+        let existing = std::fs::read_to_string(&workflow).unwrap_or_default();
+        let ours = existing.contains(&format!("{NAME} install copilot-agent"));
+        if existing.is_empty() || ours {
+            let yaml = product::render(COPILOT_SETUP_STEPS).replace("{{npm_package}}", NPM_PACKAGE);
+            std::fs::write(&workflow, yaml).map_err(stringify)?;
+            println!("copilot-agent setup written to {}", workflow.display());
+        } else {
+            println!(
+                "{} already exists and isn't ours — left alone.",
+                workflow.display()
+            );
+            println!("add a step to its copilot-setup-steps job that installs {NAME}.");
+        }
+
+        // The server the agent should be pointed at. Same portable entry the
+        // project-scoped hosts get: the sandbox resolves `{{name}}` on PATH
+        // and finds the repo root from its working directory.
+        let entry = McpEntry::portable();
+        let config = json!({
+            "mcpServers": {
+                entry.key.clone(): {
+                    "type": "stdio",
+                    "command": entry.command,
+                    "args": entry.args(),
+                    "tools": ["*"],
+                }
+            }
+        });
+        let config = serde_json::to_string_pretty(&config).map_err(stringify)?;
+        println!();
+        println!("paste this into the repo's Copilot coding agent MCP configuration");
+        println!("(Settings → Code & automation → Copilot → Coding agent):");
+        println!();
+        println!("{config}");
+        println!();
+        println!("note: the coding agent runs in a GitHub-hosted sandbox, so its");
+        println!("checkpoints are that sandbox's timeline — not your local one.");
+        println!("the workflow only takes effect once it is on the default branch.");
+        Ok(())
+    }
+}
+
+/// Minimal `copilot-setup-steps.yml`: the job name is load-bearing — GitHub
+/// only picks up a job called `copilot-setup-steps` — and the workflow has to
+/// sit on the default branch before it runs at all.
+const COPILOT_SETUP_STEPS: &str = r#"# Prepares the Copilot coding agent's sandbox.
+# Written by `{{name}} install copilot-agent`; re-running updates it.
+# The job name is required: GitHub only picks up `copilot-setup-steps`.
+name: "Copilot Setup Steps"
+on:
+  workflow_dispatch:
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install {{name}}
+        run: npm install -g {{npm_package}}
+      - name: Initialize {{name}}
+        run: {{name}} init
+"#;
 
 fn stringify<E: std::fmt::Display>(error: E) -> String {
     error.to_string()
@@ -1359,8 +1620,10 @@ mod tests {
     #[test]
     fn vscode_install_writes_project_scoped_mcp_config() {
         let dir = tempfile::tempdir().expect("tempdir");
-        vscode(dir.path()).expect("first install");
-        vscode(dir.path()).expect("second install (idempotent)");
+        VSCODE.install(dir.path()).expect("first install");
+        VSCODE
+            .install(dir.path())
+            .expect("second install (idempotent)");
 
         let value: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".vscode/mcp.json")).expect("read"),
@@ -1379,14 +1642,14 @@ mod tests {
     #[test]
     fn reinstall_keeps_user_added_fields_on_our_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
-        vscode(dir.path()).expect("first install");
+        VSCODE.install(dir.path()).expect("first install");
         let path = dir.path().join(".vscode/mcp.json");
         let mut value: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
         value["servers"][NAME]["env"] = json!({ "ACYCLIC_TRACE": "1" });
         std::fs::write(&path, value.to_string()).expect("seed user field");
 
-        vscode(dir.path()).expect("second install");
+        VSCODE.install(dir.path()).expect("second install");
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
         assert_eq!(value["servers"][NAME]["env"]["ACYCLIC_TRACE"], "1");
@@ -1396,42 +1659,69 @@ mod tests {
     #[test]
     fn every_host_installs_into_a_fresh_repo() {
         use clap::ValueEnum;
-        // claude-desktop is exercised separately (below): its install writes
-        // to a global, per-machine config path, not anything under `repo`.
+        // The per-machine hosts are exercised separately (below): their
+        // installs write to a global config path outside `repo`, so running
+        // them here would touch the developer's real Desktop/Copilot config.
         for host in Host::value_variants()
             .iter()
             .copied()
-            .filter(|host| *host != Host::ClaudeDesktop)
+            .filter(|host| !matches!(host, Host::ClaudeDesktop | Host::Copilot))
         {
             let dir = tempfile::tempdir().expect("tempdir");
             run(dir.path(), host).unwrap_or_else(|error| panic!("{host:?}: {error}"));
         }
     }
 
+    /// Every host's CLI name is kebab-case and is exactly the id its adapter
+    /// reports. Driven off the registry rather than a hardcoded list, so
+    /// adding a host can't leave this test asserting a stale set — the thing
+    /// worth protecting is that the two names agree, not what they are.
     #[test]
-    fn host_names_are_the_documented_kebab_case_ids() {
+    fn host_names_match_their_adapter_ids() {
         use clap::ValueEnum;
-        let names: Vec<String> = Host::value_variants()
+        for host in Host::value_variants() {
+            let clap_name = host
+                .to_possible_value()
+                .expect("named")
+                .get_name()
+                .to_owned();
+            assert_eq!(
+                clap_name,
+                adapter(*host).id(),
+                "{host:?}: clap name and adapter id disagree"
+            );
+            assert!(
+                clap_name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{clap_name} is not kebab-case"
+            );
+        }
+    }
+
+    /// The names are a public interface — they appear in the README, the
+    /// install docs and users' shell history — so a rename should be a
+    /// deliberate edit here, not a silent side effect of touching the enum.
+    #[test]
+    fn the_documented_hosts_are_all_present() {
+        use clap::ValueEnum;
+        let names: Vec<&str> = Host::value_variants()
             .iter()
-            .map(|host| {
-                host.to_possible_value()
-                    .expect("named")
-                    .get_name()
-                    .to_owned()
-            })
+            .map(|host| adapter(*host).id())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "claude-code",
-                "codex",
-                "cursor",
-                "agents-md",
-                "claude-desktop",
-                "vscode",
-                "opencode"
-            ]
-        );
+        for documented in [
+            "claude-code",
+            "codex",
+            "cursor",
+            "agents-md",
+            "claude-desktop",
+            "vscode",
+            "opencode",
+            "copilot",
+            "copilot-agent",
+        ] {
+            assert!(names.contains(&documented), "{documented} went missing");
+        }
     }
 
     #[test]
@@ -1528,6 +1818,187 @@ mod tests {
         );
         // other-tool, my-repo, other-repo, twin, planted, fourth.
         assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(6));
+    }
+
+    /// Copilot CLI's shape is the one that matches neither existing host:
+    /// Claude Desktop's `mcpServers` key *and* VS Code's explicit `type`.
+    /// Getting either half wrong yields a config the CLI silently ignores,
+    /// so pin both, plus the absence of the fields it does not take.
+    #[test]
+    fn copilot_cli_config_pairs_the_mcp_servers_key_with_an_explicit_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("mcp-config.json");
+        let exe_path = format!("/usr/local/bin/{NAME}");
+        let exe = std::path::Path::new(&exe_path);
+        let repo = std::path::Path::new("/Users/dev/my-repo");
+
+        let taken = existing_servers(&config_path, &COPILOT_CLI_SHAPE);
+        let entry = McpEntry::per_machine(exe, repo, &taken);
+        merge_mcp_server_json(&config_path, &COPILOT_CLI_SHAPE, &entry).expect("merge");
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
+                .expect("json");
+        let server = &value["mcpServers"][&entry.key];
+        assert_eq!(server["type"], "stdio");
+        assert_eq!(server["command"], exe.display().to_string());
+        assert_eq!(
+            server["args"],
+            json!(["mcp", "--repo", repo.display().to_string()])
+        );
+        // VS Code's key and its workspace placeholder both belong to VS Code:
+        // Copilot CLI's config is global, so there is no workspace to expand.
+        assert!(value.get("servers").is_none());
+        assert!(server.get("cwd").is_none());
+    }
+
+    /// The same read-modify-write contract the other MCP hosts get, asserted
+    /// against Copilot CLI's shape: a second install changes nothing, a
+    /// hand-written server survives, and `tools` — a field Copilot CLI has
+    /// and the others don't — is preserved on our own entry.
+    #[test]
+    fn copilot_cli_reinstall_is_idempotent_and_preserves_neighbours_and_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("mcp-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+              "mcpServers": {
+                "playwright": {
+                  "type": "local",
+                  "command": "npx",
+                  "args": ["@playwright/mcp@latest"],
+                  "tools": ["*"]
+                }
+              }
+            }"#,
+        )
+        .expect("seed");
+
+        let exe_path = format!("/usr/local/bin/{NAME}");
+        let exe = std::path::Path::new(&exe_path);
+        let repo = std::path::Path::new("/Users/dev/my-repo");
+        let register = || {
+            let taken = existing_servers(&config_path, &COPILOT_CLI_SHAPE);
+            let entry = McpEntry::per_machine(exe, repo, &taken);
+            merge_mcp_server_json(&config_path, &COPILOT_CLI_SHAPE, &entry).expect("merge");
+            entry.key
+        };
+        let key = register();
+
+        // A user narrows our entry's tool allowlist by hand; re-installing
+        // must not silently widen it back.
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
+                .expect("json");
+        value["mcpServers"][&key]["tools"] = json!(["checkpoint", "timeline"]);
+        std::fs::write(&config_path, value.to_string()).expect("seed tools");
+
+        assert_eq!(register(), key, "the key is stable across installs");
+        let after = std::fs::read_to_string(&config_path).expect("read");
+        assert_eq!(register(), key);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read"),
+            after,
+            "a second install is byte-identical"
+        );
+
+        let value: Value = serde_json::from_str(&after).expect("json");
+        assert_eq!(
+            value["mcpServers"][&key]["tools"],
+            json!(["checkpoint", "timeline"]),
+            "user-narrowed tool allowlist survives"
+        );
+        assert_eq!(value["mcpServers"]["playwright"]["command"], "npx");
+        assert_eq!(
+            value["mcpServers"]["playwright"]["args"],
+            json!(["@playwright/mcp@latest"])
+        );
+        assert_eq!(value["mcpServers"].as_object().map(|m| m.len()), Some(2));
+    }
+
+    /// `COPILOT_HOME` moves the whole `.copilot` directory, so it replaces
+    /// the home-relative path rather than being appended to it — and an
+    /// empty value is treated as unset, the way an exported-but-blank shell
+    /// variable is meant to be.
+    #[test]
+    fn copilot_cli_config_path_honours_copilot_home() {
+        let home = Some("/Users/dev".to_owned());
+        assert_eq!(
+            copilot_cli_config_path_from(None, home.clone()).expect("path"),
+            PathBuf::from("/Users/dev/.copilot/mcp-config.json")
+        );
+        assert_eq!(
+            copilot_cli_config_path_from(Some("/opt/copilot".to_owned()), home.clone())
+                .expect("path"),
+            PathBuf::from("/opt/copilot/mcp-config.json")
+        );
+        assert_eq!(
+            copilot_cli_config_path_from(Some(String::new()), home).expect("path"),
+            PathBuf::from("/Users/dev/.copilot/mcp-config.json"),
+            "empty COPILOT_HOME falls back to HOME"
+        );
+        assert!(copilot_cli_config_path_from(None, None).is_err());
+    }
+
+    /// The cloud agent's adapter writes a workflow and prints the config it
+    /// cannot write. The job name is load-bearing — GitHub only picks up a
+    /// job called `copilot-setup-steps` — so pin it.
+    #[test]
+    fn copilot_agent_writes_a_setup_workflow_with_the_required_job_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        CopilotAgent.install(dir.path()).expect("first install");
+        CopilotAgent.install(dir.path()).expect("second install");
+
+        let path = dir.path().join(".github/workflows/copilot-setup-steps.yml");
+        let workflow = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            workflow.contains("\n  copilot-setup-steps:\n"),
+            "the job must be named copilot-setup-steps:\n{workflow}"
+        );
+        assert!(workflow.contains(&format!("{NAME} init")), "{workflow}");
+        // The npm package is not the CLI name (`@acyclic-labs/plugin` vs
+        // `acyclic`), and the sandbox has no other way to get the binary, so
+        // an install line built from the wrong one fails every agent run.
+        assert!(
+            workflow.contains(&format!("npm install -g {NPM_PACKAGE}")),
+            "the workflow must install the real npm package:\n{workflow}"
+        );
+        assert!(
+            !workflow.contains("{{"),
+            "placeholders must be rendered:\n{workflow}"
+        );
+    }
+
+    /// Somebody else's setup workflow is theirs: a coding-agent sandbox gets
+    /// exactly one, so overwriting it would silently drop whatever setup the
+    /// repo depends on.
+    #[test]
+    fn copilot_agent_leaves_a_foreign_setup_workflow_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".github/workflows/copilot-setup-steps.yml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let theirs = "name: theirs\njobs:\n  copilot-setup-steps:\n    steps: []\n";
+        std::fs::write(&path, theirs).expect("seed");
+
+        CopilotAgent.install(dir.path()).expect("install");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            theirs,
+            "a workflow we didn't write must survive untouched"
+        );
+    }
+
+    /// The cloud agent is a remote sandbox with no access to this machine,
+    /// so the config it is handed must be the portable one — a bare command
+    /// resolved on PATH and no `--repo` pointing at a local absolute path.
+    #[test]
+    fn copilot_agent_is_handed_a_portable_entry_not_a_local_path() {
+        let entry = McpEntry::portable();
+        assert_eq!(entry.command, NAME);
+        assert_eq!(entry.args(), json!(["mcp"]));
+        assert!(entry.repo.is_none(), "no machine-local path may leak");
     }
 
     #[test]

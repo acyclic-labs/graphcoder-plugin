@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The MCP adapter driven by every real MCP client CLI on this machine, not a
 # scripted client (that is mcp-e2e.sh). For each of claude, codex,
-# cursor-agent and opencode that is on PATH: register `acyclic mcp` the way
-# that host expects, run one headless session that calls brief, checkpoint
-# and timeline, and assert the checkpoint landed in the daemon. A host that
-# is not installed is reported and skipped; nothing here is required.
+# cursor-agent, copilot and opencode that is on PATH: register `acyclic mcp`
+# the way that host expects, run one headless session that calls brief,
+# checkpoint and timeline, and assert the checkpoint landed in the daemon. A
+# host that is not installed is reported and skipped; nothing here is
+# required.
 #
 # Needs the host CLIs and their credentials; skips (exit 0) when none is
 # present unless ACYCLIC_E2E_REQUIRED=1. Costs one short model session per
@@ -33,6 +34,12 @@ if command -v codex >/dev/null 2>&1; then
   CODEX_HELP="$(codex exec --help 2>&1 || true)"
   for flag in --skip-git-repo-check --json --output-last-message --config; do
     require_flag "$CODEX_HELP" "$flag" codex
+  done
+fi
+if command -v copilot >/dev/null 2>&1; then
+  COPILOT_HELP="$(copilot --help 2>&1 || true)"
+  for flag in --prompt --allow-all-tools; do
+    require_flag "$COPILOT_HELP" "$flag" copilot
   done
 fi
 if command -v cursor-agent >/dev/null 2>&1; then
@@ -116,6 +123,36 @@ if command -v cursor-agent >/dev/null 2>&1; then
   assert_landed mcp-from-cursor-agent cursor-agent
 else
   echo "skip: cursor-agent CLI not on PATH"
+fi
+
+# GitHub Copilot CLI: the only host here whose adapter writes a *global*
+# config, so point COPILOT_HOME at the scratch dir first — `install copilot`
+# resolves it, and without it this test would rewrite the developer's real
+# ~/.copilot/mcp-config.json. Asserting the file lands there is also the
+# check that COPILOT_HOME is honoured at all.
+#
+# --allow-all-tools rather than --allow-tool: the tool-name patterns for MCP
+# servers are not documented well enough to pin (github/copilot-cli#1482),
+# and this runs against a throwaway repo under $WORK, same trust posture as
+# the cursor-agent block's --force --trust.
+if command -v copilot >/dev/null 2>&1; then
+  export COPILOT_HOME="$WORK/copilot-home"
+  mkdir -p "$COPILOT_HOME"
+  acy install copilot >/dev/null || fail "install copilot"
+  COPILOT_CONFIG="$COPILOT_HOME/mcp-config.json"
+  [ -f "$COPILOT_CONFIG" ] || fail "install copilot wrote nothing to COPILOT_HOME ($COPILOT_HOME)"
+  # The shape that matches neither other host: mcpServers key, explicit type.
+  grep -q '"mcpServers"' "$COPILOT_CONFIG" || fail "copilot config lacks mcpServers: $(cat "$COPILOT_CONFIG")"
+  grep -q '"stdio"' "$COPILOT_CONFIG" || fail "copilot config lacks explicit stdio type: $(cat "$COPILOT_CONFIG")"
+  # The CLI's own view of the config, before spending a model session on it.
+  listing="$(cd "$R" && copilot mcp list 2>&1 || true)"
+  printf '%s' "$listing" | grep -q "$NAME" || fail "copilot does not list the $NAME server: $listing"
+  (cd "$R" && with_timeout 180 copilot -p "$(prompt_for mcp-from-copilot)" \
+    --allow-all-tools >"$WORK/copilot.out" 2>"$WORK/copilot.err") \
+    || fail "copilot session failed: $(tail -c 300 "$WORK/copilot.err")"
+  assert_landed mcp-from-copilot copilot
+else
+  echo "skip: copilot CLI not on PATH"
 fi
 
 # OpenCode: project-scoped opencode.json, `mcp.<name>` with a command
