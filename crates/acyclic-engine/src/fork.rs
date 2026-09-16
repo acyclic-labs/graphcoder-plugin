@@ -68,6 +68,17 @@ impl MountCapability {
 }
 
 /// Live probe of the native mount provider.
+///
+/// Windows is held to copy forks whatever the probe says. `ProjFS` mounts
+/// and projects correctly there — a fork's tree appears and reads back fine —
+/// but writes into the projection stop at the `ProjFS` local cache and never
+/// reach the overlay checkout, so `fork-diff` reports no changes and
+/// `promote` lands nothing. Silently discarding a fork's work is far worse
+/// than copying it, and copy forks are verified on Windows: write, diff and
+/// promote all behave.
+///
+/// Revisit when the sdk's `ProjFS` provider carries writes back. The probe
+/// still runs so `status` can name the provider it found.
 pub fn mount_capability() -> MountCapability {
     let probe = probe_native_mount();
     let provider = match probe.kind {
@@ -76,6 +87,20 @@ pub fn mount_capability() -> MountCapability {
         Some(NativeMountKind::WindowsProjFs) => "projfs",
         None => "none",
     };
+    #[cfg(windows)]
+    {
+        let _ = probe.available;
+        MountCapability {
+            provider,
+            available: false,
+            reason: Some(
+                "ProjFS projects a fork but does not carry writes back to the store, \
+                 so forks use full copies (promote works the same)"
+                    .to_owned(),
+            ),
+        }
+    }
+    #[cfg(not(windows))]
     MountCapability {
         provider,
         available: probe.available,
@@ -101,6 +126,14 @@ pub fn mount_setup_hint() -> &'static str {
             "are missing or blocked by policy. No extra software is needed on macOS;\n",
             "ask your administrator to allow loopback NFS mounts.\n",
             "Safe Mode (dry_run) needs mounts and refuses to start without them.",
+        )
+    } else if cfg!(windows) {
+        concat!(
+            "forks use full copies on Windows. ProjFS can project a fork, but it does\n",
+            "not carry writes back to the store, so a mounted fork would silently lose\n",
+            "your work; copies land correctly through `promote`. Nothing to install.\n",
+            "Safe Mode (dry_run) needs mounts, so it is unavailable on Windows for the\n",
+            "same reason.",
         )
     } else {
         "native mounts are not supported on this platform; forks use full copies \
@@ -247,6 +280,12 @@ pub fn sweep_stale_dry_session(repo_root: &Path) {
             .arg(repo_root)
             .status();
     }
+    // A ProjFS virtualization root stops with the process that owned it, so
+    // a dead daemon leaves nothing mounted over the repo to reap.
+    #[cfg(windows)]
+    {
+        let _ = repo_root;
+    }
 }
 
 /// Reaps a Safe Mode shadow left by a *crashed* daemon before the caller
@@ -295,6 +334,12 @@ pub fn reap_dead_shadow(repo: &Path) {
                 .arg(&target)
                 .status();
         }
+    }
+    // A ProjFS shadow dies with the daemon that projected it, so there is no
+    // wedged mountpoint to probe for and nothing to force-unmount.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = repo;
     }
 }
 

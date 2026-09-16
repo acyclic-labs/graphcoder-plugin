@@ -2059,7 +2059,10 @@ mod tests {
     /// A repo can commit the workflow path as a symlink. Reading it fails
     /// with `NotFound` when the target is missing, which must not be read as
     /// "no workflow here, safe to write" — a plain `fs::write` would follow
-    /// the link and create the attacker's chosen file.
+    /// the link and create the attacker's chosen file. POSIX-only: planting
+    /// the symlink needs a privileged account on Windows. The code under test
+    /// is platform-neutral.
+    #[cfg(unix)]
     #[test]
     fn copilot_agent_replaces_a_symlinked_workflow_not_its_target() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2099,6 +2102,10 @@ mod tests {
         assert!(entry.repo.is_none(), "no machine-local path may leak");
     }
 
+    /// POSIX-only by construction: it asserts a preserved `chmod` mode, and
+    /// plants the symlink with an API that needs a privileged account on
+    /// Windows. `write_atomic` itself is platform-neutral.
+    #[cfg(unix)]
     #[test]
     fn write_atomic_refuses_a_planted_symlink_and_keeps_the_mode() {
         use std::os::unix::fs::PermissionsExt;

@@ -30,7 +30,8 @@ cat > "${dir}/package.json" <<JSON
     "${pkg}-darwin-arm64": "${version}",
     "${pkg}-darwin-x64": "${version}",
     "${pkg}-linux-x64": "${version}",
-    "${pkg}-linux-arm64": "${version}"
+    "${pkg}-linux-arm64": "${version}",
+    "${pkg}-win32-x64": "${version}"
   },
   "publishConfig": { "access": "public", "provenance": true }
 }
@@ -50,7 +51,12 @@ const PLATFORMS = {
   "darwin x64": "${pkg}-darwin-x64",
   "linux x64": "${pkg}-linux-x64",
   "linux arm64": "${pkg}-linux-arm64",
+  "win32 x64": "${pkg}-win32-x64",
 };
+
+// The Windows platform package ships acyclic.exe; every other target ships a
+// suffixless binary.
+const EXE = process.platform === "win32" ? ".exe" : "";
 
 const key = \`\${process.platform} \${process.arch}\`;
 const pkg = PLATFORMS[key];
@@ -61,7 +67,7 @@ if (!pkg) {
 
 let binary;
 try {
-  binary = require.resolve(\`\${pkg}/bin/\${NAME}\`);
+  binary = require.resolve(\`\${pkg}/bin/\${NAME}\${EXE}\`);
 } catch {
   console.error(
     \`\${NAME}: platform package \${pkg} is not installed.\\n\` +

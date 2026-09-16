@@ -17,6 +17,7 @@ mod brief;
 mod client;
 mod hook;
 mod install;
+mod ipc;
 mod mcp;
 mod server;
 mod spec_runner;
@@ -347,6 +348,24 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         }
     }
 }
+
+/// Steps the client out of the working tree, ahead of a whole-tree swap.
+///
+/// A process's current directory is an open handle to that directory on
+/// Windows, so a client standing in the repo blocks the very rename it just
+/// asked the daemon to perform -- the rewind comes back as a sharing
+/// violation, having changed nothing. Everything after this point is a
+/// daemon round-trip and some printing; no relative path is resolved again.
+///
+/// Unix renames a directory out from under a process's cwd without
+/// complaint, so there is nothing to step out of there.
+#[cfg(windows)]
+fn step_aside() {
+    let _ = std::env::set_current_dir(std::env::temp_dir());
+}
+
+#[cfg(not(windows))]
+fn step_aside() {}
 
 fn store_paths(repo: &Path) -> Result<acyclic_engine::store::StorePaths, String> {
     let config = acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
@@ -761,6 +780,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     return Ok(());
                 }
             }
+            step_aside();
             let reply = client.call(proto::Op::Rewind { target, path: None })?;
             let proto::Reply::Rewind(info) = reply else {
                 return Err("unexpected reply".into());
@@ -855,6 +875,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Promote { id } => {
+            step_aside();
             let reply = client.call(proto::Op::Promote { id: id.clone() })?;
             let proto::Reply::Promote(info) = reply else {
                 return Err("unexpected reply".into());
@@ -1001,6 +1022,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::SessionApply { session_id } => {
+            step_aside();
             let reply = client.call(proto::Op::SessionApply { session_id })?;
             let proto::Reply::Promote(info) = reply else {
                 return Err("unexpected reply".into());

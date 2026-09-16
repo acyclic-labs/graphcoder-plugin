@@ -27,6 +27,12 @@ Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
   checked-in repo config. Adds the `summary` verb and MCP tool, a line in `acyclic status`, and
   a summary line in the session brief. See `docs/design/08-speculation.md`.
 - Published to npm as `@acyclic-labs/plugin`.
+- **Windows x64 support** — the daemon transport gains a named-pipe implementation alongside the
+  Unix domain socket, and host names are encoded per platform (UTF-16LE on Windows) so capture,
+  diff, exclusions and the Safe Mode guard agree with the filesystem. Verified on Windows 11 and
+  covered by a `windows-2022` CI job. Two caveats: forks are always full copies there (ProjFS
+  projects a fork but does not carry writes back, so a mounted fork would silently lose work) and
+  Safe Mode needs a real mount, so it is unavailable. See `docs/windows-verification.md`.
 
 ### Fixed
 

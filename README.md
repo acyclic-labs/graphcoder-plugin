@@ -11,8 +11,8 @@ Checkpoint every agent action, rewind exactly, see the blast radius. The store c
 Get the binary, start the daemon in your repo, then wire in each coding tool you use:
 
 ```sh
-npm i -g @acyclic-labs/plugin                                                       # prebuilt binary, macOS + Linux
-curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh   # or: verified download into ~/.local/bin
+npm i -g @acyclic-labs/plugin                                                       # prebuilt binary, macOS + Linux + Windows x64
+curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh   # or, on macOS/Linux: verified download into ~/.local/bin
 cd your-repo
 acyclic init                       # starts the daemon, builds the first snapshot
 acyclic install <host>             # one of the hosts below; repeat per tool you use

@@ -2,10 +2,10 @@
 //! Interactive verbs may spawn a dead daemon; hook-invoked calls never do.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::ipc::ClientStream;
 use acyclic_engine::product::NAME;
 use acyclic_proto as proto;
 
@@ -18,7 +18,7 @@ pub enum Spawn {
 }
 
 pub struct Client {
-    stream: BufReader<UnixStream>,
+    stream: BufReader<ClientStream>,
     next_id: u64,
 }
 
@@ -36,11 +36,11 @@ impl Client {
         spawn: Spawn,
     ) -> Result<Self, ConnectError> {
         let started = std::time::Instant::now();
-        if let Ok(stream) = UnixStream::connect(socket) {
+        if let Ok(stream) = ClientStream::connect(socket) {
             acyclic_engine::trace!(
                 "client",
                 "connected to running daemon at {} in {:.1}ms",
-                socket.display(),
+                crate::ipc::endpoint_display(socket),
                 acyclic_engine::trace::ms(started)
             );
             return Self::from_stream(stream);
@@ -50,12 +50,16 @@ impl Client {
                 acyclic_engine::trace!(
                     "client",
                     "no daemon at {} and spawning is not allowed here",
-                    socket.display()
+                    crate::ipc::endpoint_display(socket)
                 );
                 Err(ConnectError::NoDaemon)
             }
             Spawn::Allowed => {
-                acyclic_engine::trace!("client", "no daemon at {}: spawning one", socket.display());
+                acyclic_engine::trace!(
+                    "client",
+                    "no daemon at {}: spawning one",
+                    crate::ipc::endpoint_display(socket)
+                );
                 let child = spawn_daemon(repo_root, log_path)?;
                 let client = wait_for_socket(socket, child, log_path);
                 acyclic_engine::trace!(
@@ -68,7 +72,7 @@ impl Client {
         }
     }
 
-    fn from_stream(stream: UnixStream) -> Result<Self, ConnectError> {
+    fn from_stream(stream: ClientStream) -> Result<Self, ConnectError> {
         stream
             .set_read_timeout(None)
             .map_err(|error| ConnectError::Other(error.to_string()))?;
@@ -142,14 +146,128 @@ fn spawn_daemon(repo_root: &Path, log_path: &Path) -> Result<std::process::Child
     let exe = std::env::current_exe().map_err(|error| ConnectError::Other(error.to_string()))?;
     let log = std::fs::File::create(log_path)
         .map_err(|error| ConnectError::Other(format!("daemon log: {error}")))?;
-    std::process::Command::new(exe)
+    let _detached = detach_stdio();
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("__daemon")
         .arg(repo_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(log)
+        .stderr(log);
+    // The daemon must not stand in the repo it manages. A process's working
+    // directory is an open handle to that directory on Windows, and a rewind
+    // renames the repo root — with the daemon sitting there (it inherits our
+    // cwd, and we are usually inside the repo), every rewind and promote
+    // fails with a sharing violation. The daemon takes the repo as an
+    // absolute argument and never resolves a relative path, so the store
+    // directory — which no swap touches — is a safe place to stand.
+    //
+    // Windows-only to keep this branch's invariant that Unix behaviour is
+    // unchanged. Unix would arguably benefit too (the daemon's cwd follows
+    // the old tree into the trash after a rewind), but that is a separate
+    // change with its own acceptance run.
+    #[cfg(windows)]
+    if let Some(store_root) = log_path.parent() {
+        command.current_dir(store_root);
+    }
+    command
         .spawn()
         .map_err(|error| ConnectError::Other(format!("spawn daemon: {error}")))
+}
+
+/// Keeps the daemon from inheriting *this* process's stdio.
+///
+/// Redirecting the child's three standard handles is not enough on Windows.
+/// `CreateProcess` is called with `bInheritHandles = TRUE`, which duplicates
+/// every inheritable handle in the parent — our own stdout among them — into
+/// a daemon that then outlives us. A caller reading our output through a
+/// pipe (which is what a host hook does) never sees EOF, because the daemon
+/// is still holding the write end: `acyclic init | cat` hangs forever while
+/// `acyclic init > file` returns at once.
+///
+/// Clearing the inherit flag for the duration of the spawn is the fix. The
+/// child gets the explicit `Stdio` handles set above and nothing else; the
+/// guard restores our flags so later spawns and our own output are unharmed.
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "reads and clears HANDLE_FLAG_INHERIT on this process's own live standard handles"
+)]
+fn detach_stdio() -> StdioInheritance {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    let mut restore = Vec::new();
+    for handle in handles {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE.cast() {
+            continue;
+        }
+        let mut flags = 0_u32;
+        // SAFETY: `handle` is a live standard handle owned by this process
+        // and checked non-null above; both calls only read or write its
+        // inherit flag and borrow nothing past the call.
+        let inheritable = unsafe {
+            windows_sys::Win32::Foundation::GetHandleInformation(handle.cast(), &raw mut flags) != 0
+                && flags & HANDLE_FLAG_INHERIT != 0
+        };
+        if !inheritable {
+            continue;
+        }
+        // SAFETY: as above; clears exactly the inherit bit.
+        let cleared = unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(
+                handle.cast(),
+                HANDLE_FLAG_INHERIT,
+                0,
+            ) != 0
+        };
+        if cleared {
+            restore.push(handle);
+        }
+    }
+    StdioInheritance { restore }
+}
+
+/// Guard held across the spawn, restoring the inherit flags [`detach_stdio`]
+/// cleared. Carries nothing on Unix, where nothing was cleared; it exists
+/// there so the call site reads the same on both platforms.
+pub(crate) struct StdioInheritance {
+    #[cfg(windows)]
+    restore: Vec<std::os::windows::io::RawHandle>,
+}
+
+#[cfg(windows)]
+impl Drop for StdioInheritance {
+    #[allow(
+        unsafe_code,
+        reason = "restores HANDLE_FLAG_INHERIT on the same handles detach_stdio cleared it on"
+    )]
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+        for handle in self.restore.drain(..) {
+            // SAFETY: each handle was live and inheritable a moment ago in
+            // `detach_stdio`; this puts back exactly the bit it cleared.
+            unsafe {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    handle.cast(),
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+            }
+        }
+    }
+}
+
+/// Unix inherits only what `Command` is told to pass, so there is nothing to
+/// detach and nothing to restore.
+#[cfg(not(windows))]
+const fn detach_stdio() -> StdioInheritance {
+    StdioInheritance {}
 }
 
 /// Waits for the daemon socket. The first baseline of a big repo can take a
@@ -164,7 +282,7 @@ fn wait_for_socket(
     let deadline = Duration::from_secs(30 * 60);
     let mut reported = false;
     loop {
-        if let Ok(stream) = UnixStream::connect(socket) {
+        if let Ok(stream) = ClientStream::connect(socket) {
             if let Ok(mut client) = Client::from_stream(stream) {
                 if client.call(proto::Op::Ping).is_ok() {
                     return Ok(client);

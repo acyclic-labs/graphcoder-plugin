@@ -2018,7 +2018,7 @@ impl Pipeline {
 #[cfg(test)]
 mod root_hint_tests {
     use super::*;
-    use acyclic_fs::kernel::{LogicalName, NameEncoding, NamespacePath};
+    use acyclic_fs::kernel::{LogicalName, NamespacePath};
     use acyclic_fs::{WatchEpoch, WatchSequence};
 
     fn root() -> NamespacePath {
@@ -2028,8 +2028,8 @@ mod root_hint_tests {
     fn file(name: &str) -> NamespacePath {
         let limits = VolumeLimits::default();
         let name = LogicalName::new(
-            NameEncoding::PosixBytes,
-            name.as_bytes().to_vec(),
+            crate::names::encoding(),
+            crate::names::str_to_bytes(name),
             limits.maximum_component_bytes,
         )
         .unwrap();

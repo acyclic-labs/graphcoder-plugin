@@ -11,15 +11,19 @@ source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/product.sh"
 
 os="$1"; cpu="$2"; version="$3"; binary="$4"; out="$5"
 
-case "$os" in darwin|linux) ;; *) echo "unsupported os: $os" >&2; exit 1 ;; esac
+case "$os" in darwin|linux|win32) ;; *) echo "unsupported os: $os" >&2; exit 1 ;; esac
 case "$cpu" in x64|arm64) ;; *) echo "unsupported cpu: $cpu" >&2; exit 1 ;; esac
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad version: $version" >&2; exit 1; }
 [ -f "$binary" ] || { echo "binary not found: $binary" >&2; exit 1; }
 
+# Windows needs the .exe suffix for the shim npm writes to resolve the target.
+exe=""
+[ "$os" = "win32" ] && exe=".exe"
+
 name="${PRODUCT_NPM_PACKAGE}-${os}-${cpu}"
 dir="${out}/${name}"
 mkdir -p "${dir}/bin"
-install -m 0755 "$binary" "${dir}/bin/${PRODUCT_NAME}"
+install -m 0755 "$binary" "${dir}/bin/${PRODUCT_NAME}${exe}"
 
 cat > "${dir}/package.json" <<JSON
 {
@@ -33,7 +37,7 @@ cat > "${dir}/package.json" <<JSON
   },
   "os": ["${os}"],
   "cpu": ["${cpu}"],
-  "bin": { "${PRODUCT_NAME}": "bin/${PRODUCT_NAME}" },
+  "bin": { "${PRODUCT_NAME}": "bin/${PRODUCT_NAME}${exe}" },
   "files": ["bin/"],
   "publishConfig": { "access": "public", "provenance": true }
 }

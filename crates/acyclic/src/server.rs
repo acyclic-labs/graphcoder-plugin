@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ipc;
 use acyclic_engine::config::Config;
 use acyclic_engine::fork::{
     self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
@@ -23,7 +24,6 @@ use acyclic_fs::{
 };
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 
 /// One live fork: the shared checkout its route serves plus wire facts.
@@ -111,10 +111,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
     // Socket + pidfile. A stale socket from a dead daemon is removed; a live
     // one refuses the second daemon via bind failure after removal race.
-    let _ = std::fs::remove_file(paths.socket());
-    let listener = runtime
-        .block_on(async { UnixListener::bind(paths.socket()) })
-        .map_err(|error| format!("bind {}: {error}", paths.socket().display()))?;
+    ipc::cleanup(&paths.socket());
+    let mut listener = runtime
+        .block_on(async { ipc::Listener::bind(&paths.socket()) })
+        .map_err(|error| format!("bind {}: {error}", ipc::endpoint_display(&paths.socket())))?;
     std::fs::write(paths.pidfile(), std::process::id().to_string())
         .map_err(|error| error.to_string())?;
 
@@ -183,7 +183,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { continue };
+                    let Ok(stream) = accepted else { continue };
                     let server = server.clone();
                     tokio::spawn(async move { server.serve(stream).await });
                 }
@@ -198,7 +198,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     if let Some(thread) = spec_thread {
         let _ = thread.join();
     }
-    let _ = std::fs::remove_file(paths.socket());
+    ipc::cleanup(&paths.socket());
     let _ = std::fs::remove_file(paths.pidfile());
     Ok(())
 }
@@ -225,8 +225,8 @@ struct Server {
 }
 
 impl Server {
-    async fn serve(&self, stream: UnixStream) {
-        let (read, mut write) = stream.into_split();
+    async fn serve(&self, stream: ipc::ServerStream) {
+        let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let response = match serde_json::from_str::<proto::Request>(&line) {
@@ -1205,7 +1205,7 @@ impl Server {
         let mut mount = self.fork_mount.lock().await;
         mount
             .router
-            .add_route(id.to_owned().into_bytes(), source)
+            .add_route(route_name(id), source)
             .map_err(|error| format!("route: {error:?}"))?;
         // The ONE session, mounted lazily on the first fork. A route
         // insert is all later forks pay.
@@ -1229,7 +1229,7 @@ impl Server {
             match session {
                 Ok(session) => mount.session = Some(session),
                 Err(error) => {
-                    tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+                    tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
                     return Err(error);
                 }
             }
@@ -1603,11 +1603,12 @@ impl Server {
         let mut mount = self.fork_mount.lock().await;
         // Dropping a route drops its CheckoutMountSource, which owns a tokio
         // runtime — runtimes must never be dropped on an async worker.
-        tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+        tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
         // The kernel may hold a positive entry cache for the removed name
         // (FSKit caches until told otherwise): invalidate it eagerly.
         if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes())) {
+            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(&route_name(id)))
+            {
                 eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
             }
         }
@@ -2023,6 +2024,17 @@ fn content_changes(
 
 fn err(message: String) -> proto::Payload {
     proto::Payload::Err { message }
+}
+
+/// A fork id as the router's route name.
+///
+/// The router projects a route as a directory entry, so the name crosses the
+/// same boundary as any captured name and has to carry the same encoding —
+/// the `ProjFS` provider decodes every entry name it is handed as UTF-16LE,
+/// and hands an id passed as raw ASCII back to the user as mojibake. Ids are
+/// hex, so this is a widening on Windows and a copy everywhere else.
+fn route_name(id: &str) -> Vec<u8> {
+    acyclic_engine::names::str_to_bytes(id)
 }
 
 fn short_id() -> String {

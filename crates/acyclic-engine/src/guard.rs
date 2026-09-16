@@ -41,12 +41,20 @@ impl GuardedPrefix {
     }
 }
 
+/// Splits a configured guarded path into the component bytes a
+/// [`MountPath`] carries.
+///
+/// The encoding has to be the host's (see [`crate::names`]), not UTF-8: these
+/// components are compared byte-for-byte against the names the mount layer
+/// hands us. Comparing UTF-8 against a host that speaks UTF-16LE never
+/// matches, and a guard that never matches fails *open* — every guarded path
+/// would silently accept writes.
 fn parse_guarded_path(path: &str) -> Vec<Vec<u8>> {
     path.trim()
         .trim_matches('/')
         .split('/')
         .filter(|component| !component.is_empty())
-        .map(|component| component.as_bytes().to_vec())
+        .map(crate::names::str_to_bytes)
         .collect()
 }
 
@@ -110,10 +118,16 @@ impl GuardedMountFilesystem {
 }
 
 /// A path whose final component is a macOS `AppleDouble` sidecar (`._name`).
+///
+/// The `._` prefix is matched in the host's name encoding rather than as
+/// ASCII, for the same reason [`parse_guarded_path`] is: these are the raw
+/// bytes the mount layer carries, and on a UTF-16LE host an ASCII literal
+/// matches nothing.
 fn is_appledouble(path: &MountPath) -> bool {
+    let prefix = crate::names::str_to_bytes("._");
     path.components()
         .last()
-        .is_some_and(|leaf| leaf.starts_with(b"._"))
+        .is_some_and(|leaf| leaf.starts_with(&prefix))
 }
 
 /// Wraps one open file handle so writes through it are still checked, even
@@ -470,7 +484,7 @@ mod tests {
     fn test_path(components: &[&str]) -> MountPath {
         let mut path = MountPath::root();
         for component in components {
-            path = path.child(component.as_bytes().to_vec());
+            path = path.child(crate::names::str_to_bytes(component));
         }
         path
     }

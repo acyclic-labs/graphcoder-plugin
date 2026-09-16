@@ -22,6 +22,20 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Handle-inheritance control for the daemon spawn (`client::spawn_daemon`),
+# the security descriptor that keeps the daemon's named pipe to this user
+# (`ipc::Listener::bind`), and the job object that makes a speculative run's
+# timeout reach the child's own children (`spec_runner::RunGroup`).
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_JobObjects",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 

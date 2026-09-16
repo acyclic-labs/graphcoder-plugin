@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use acyclic_fs::kernel::{FileKind, NamespacePath};
-use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{CancellationToken, GenerationId, ObjectId, WorkCounters};
 
 use crate::store::{LocalCheckout, Store};
@@ -124,7 +123,11 @@ pub(crate) async fn summaries(
 /// Directories themselves are included (metadata-only changes are visible).
 async fn walk(checkout: &mut LocalCheckout) -> Result<BTreeMap<PathBuf, RecordSummary>> {
     let cancel = CancellationToken::new();
-    let limits = VolumeLimits::default();
+    // The volume's own limits, not the defaults: a store raises the
+    // per-component byte budget on hosts whose names cost more than one
+    // byte per character (see `names::maximum_component_bytes`), and a walk
+    // built on the default would refuse paths the store happily holds.
+    let limits = checkout.volume_config().limits;
     let mut result = BTreeMap::new();
     // (namespace components, os path) work queue, starting at the root.
     let mut queue: Vec<(Vec<acyclic_fs::kernel::LogicalName>, PathBuf)> =
@@ -176,15 +179,8 @@ async fn walk(checkout: &mut LocalCheckout) -> Result<BTreeMap<PathBuf, RecordSu
     Ok(result)
 }
 
-#[cfg(unix)]
 fn logical_to_os(name: &acyclic_fs::kernel::LogicalName) -> std::ffi::OsString {
-    use std::os::unix::ffi::OsStringExt;
-    std::ffi::OsString::from_vec(name.as_bytes().to_vec())
-}
-
-#[cfg(not(unix))]
-fn logical_to_os(name: &acyclic_fs::kernel::LogicalName) -> std::ffi::OsString {
-    String::from_utf8_lossy(name.as_bytes()).into_owned().into()
+    crate::names::bytes_to_os(name.as_bytes())
 }
 
 #[cfg(test)]

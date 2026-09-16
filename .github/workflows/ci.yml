@@ -150,6 +150,61 @@ jobs:
           name: lcov
           path: lcov.info
 
+  # Windows, which nothing else in this file covers. The lint job runs on
+  # Linux, so every `#[cfg(windows)]` block in the tree is invisible to it —
+  # a Windows-only arm can stop compiling and no other check notices. This
+  # job builds and lints those arms, runs the workspace tests, and drives
+  # the parts of the product whose behaviour genuinely differs there
+  # (named-pipe transport, UTF-16LE names, renaming the repo root, copy
+  # forks). The POSIX acceptance suite is not run: it assumes mount tooling,
+  # symlinks and modes that Windows does not have.
+  windows:
+    needs: [changes, deny, lint]
+    if: >-
+      always()
+      && needs.deny.result == 'success'
+      && needs.lint.result == 'success'
+      && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # The point of the job: lint the cfg(windows) arms the Linux lint job
+      # never compiles.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Unit and integration tests
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release --locked -p acyclic
+
+      - name: Windows end-to-end smoke
+        shell: bash
+        env:
+          ACYCLIC_BIN: ${{ github.workspace }}/target/release/acyclic.exe
+        run: bash tests/acceptance/windows-smoke.sh
+
   test:
     needs: [changes, deny, lint]
     # Fail closed: run when the change filter says code moved, and also
