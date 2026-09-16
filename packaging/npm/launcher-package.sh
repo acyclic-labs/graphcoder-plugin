@@ -40,8 +40,9 @@ JSON
 cat > "${dir}/bin/${name}.js" <<JS
 #!/usr/bin/env node
 // Thin launcher: resolves the platform package that carries the real static
-// binary (fs engine compiled in) and exec-replaces into it. The npm layer
-// adds no runtime; node exits as soon as the binary takes over.
+// binary (fs engine compiled in) and runs it with this process's stdio, then
+// exits with whatever it exited with. Node has no execve, so it stays as an
+// idle parent for the child's lifetime; it adds no runtime of its own.
 "use strict";
 const { spawnSync } = require("node:child_process");
 
@@ -81,6 +82,12 @@ const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
 if (result.error) {
   console.error(\`\${NAME}: \${result.error.message}\`);
   process.exit(1);
+}
+// A signalled child reports status null; shells encode that as 128+signum, so
+// reporting it the same way makes a Ctrl-C through the launcher look to the
+// calling shell exactly like a Ctrl-C straight into the binary.
+if (result.signal) {
+  process.exit(128 + (require("node:os").constants.signals[result.signal] ?? 0));
 }
 process.exit(result.status ?? 1);
 JS

@@ -80,6 +80,11 @@ expected. Retry before assuming the publish failed.
    from it at publish time (`packaging/npm/launcher-package.sh`,
    `platform-package.sh`). The public name and npm package name come from
    `product.toml`; the `verify` job runs `scripts/check-product-name.sh`.
+
+   The bump is not optional. `Cargo.toml` still reads `0.0.1` and
+   `@acyclic-labs/plugin@0.0.1` is already on npm, so tagging `v0.0.1` would
+   cut a GitHub release whose npm half is silently skipped as
+   already-published. Go to `0.0.2` or later.
 2. Merge that change to `main` and wait for `ci` to pass.
 3. Dry run first. Actions, release, Run workflow, leave `dry_run` checked.
    This builds all four binaries, attests them, verifies the attestations,
@@ -88,8 +93,8 @@ expected. Retry before assuming the publish failed.
 4. Tag and push:
 
    ```sh
-   git tag -a v0.0.1 -m "v0.0.1"
-   git push origin v0.0.1
+   git tag -a v0.0.2 -m "v0.0.2"   # must match Cargo.toml exactly
+   git push origin v0.0.2
    ```
 
 5. Approve the `npm` environment deployment when the workflow pauses.
@@ -97,10 +102,16 @@ expected. Retry before assuming the publish failed.
    public registry and runs `acyclic --version`. If that step is green, the
    release is live.
 7. `scripts/install.sh` resolves `releases/latest/download/` by default, so
-   the curl installer picks the new release up with no further step. Rehearse
-   it offline first: `scripts/install-smoke.sh dist/bin` runs the installer on
-   a bare Debian container against a local copy of the release assets and
-   drives init → checkpoint → rewind.
+   the curl installer picks the new release up with no further step. Until a
+   release exists it has nothing to resolve and exits telling the user to use
+   npm — the first tag is what turns that path on. Rehearse it offline first:
+   `scripts/install-smoke.sh dist/bin` runs the installer on a bare Debian
+   container against a local copy of the release assets and drives init →
+   checkpoint → rewind. Afterwards, confirm the live path end to end:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh
+   ```
 
 ## What the workflow enforces
 
