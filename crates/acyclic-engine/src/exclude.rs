@@ -21,7 +21,7 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use acyclic_fs::kernel::{FileKind, LogicalName, NameEncoding, NamespacePath};
+use acyclic_fs::kernel::{FileKind, LogicalName, NamespacePath};
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{CancellationToken, WatchBatch, WatchChange, WorkCounters};
 
@@ -269,7 +269,7 @@ fn logical_names(components: &[Vec<u8>], limits: VolumeLimits) -> Result<Vec<Log
         .iter()
         .map(|bytes| {
             LogicalName::new(
-                NameEncoding::PosixBytes,
+                crate::names::encoding(),
                 bytes.clone(),
                 limits.maximum_component_bytes,
             )
@@ -291,26 +291,12 @@ fn host_path(components: &[Vec<u8>]) -> PathBuf {
     path
 }
 
-#[cfg(unix)]
 fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    name.as_bytes().to_vec()
+    crate::names::os_to_bytes(name)
 }
 
-#[cfg(not(unix))]
-fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
-    name.to_string_lossy().into_owned().into_bytes()
-}
-
-#[cfg(unix)]
 fn bytes_to_os(bytes: &[u8]) -> OsString {
-    use std::os::unix::ffi::OsStringExt;
-    OsString::from_vec(bytes.to_vec())
-}
-
-#[cfg(not(unix))]
-fn bytes_to_os(bytes: &[u8]) -> OsString {
-    String::from_utf8_lossy(bytes).into_owned().into()
+    crate::names::bytes_to_os(bytes)
 }
 
 #[cfg(test)]
@@ -329,8 +315,8 @@ mod tests {
             .filter(|part| !part.is_empty())
             .map(|part| {
                 LogicalName::new(
-                    NameEncoding::PosixBytes,
-                    part.as_bytes().to_vec(),
+                    crate::names::encoding(),
+                    crate::names::str_to_bytes(part),
                     limits.maximum_component_bytes,
                 )
                 .expect("name")

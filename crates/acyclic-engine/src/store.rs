@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use acyclic_fs::model::{
-    AccessMode, CheckoutMode, ConsistencyMode, FilesystemProfile, GenerationSelector, Lifecycle,
-    MutationMode, VolumeConfig,
+    AccessMode, CheckoutMode, ConsistencyMode, GenerationSelector, Lifecycle, MutationMode,
+    VolumeConfig,
 };
 use acyclic_fs::{
     CancellationToken, Checkout, LocalAuthorityBackend, LocalFs, LocalObjectBackend,
@@ -115,13 +115,21 @@ pub struct Store {
     pub repo_root: PathBuf,
 }
 
-fn volume_config() -> VolumeConfig {
+/// The volume every store opens with.
+///
+/// The profile is per-platform and decides how names are encoded on the way
+/// in and out — see [`crate::names`], which every caller that mints a name
+/// must go through. It is fixed for the life of a volume: a store created
+/// under one profile cannot be reopened under another, so this must never
+/// become a runtime choice.
+pub(crate) fn volume_config() -> VolumeConfig {
     let mut config = VolumeConfig {
-        profile: FilesystemProfile::Posix,
+        profile: crate::names::profile(),
         ..VolumeConfig::portable(Lifecycle::Durable)
     };
     config.limits.maximum_mutations_per_batch = MUTATIONS_PER_BATCH;
     config.limits.maximum_paths_per_batch = MUTATIONS_PER_BATCH;
+    config.limits.maximum_component_bytes = crate::names::maximum_component_bytes();
     config
 }
 

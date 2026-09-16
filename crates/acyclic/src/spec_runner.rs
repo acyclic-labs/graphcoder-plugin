@@ -22,6 +22,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// Only the Unix sweep names the product; on Windows there is no sweep.
+#[cfg(unix)]
 use acyclic_engine::product::NAME;
 use acyclic_engine::spec::RunOutcome;
 use tokio::io::AsyncWriteExt;

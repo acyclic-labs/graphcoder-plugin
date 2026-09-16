@@ -22,7 +22,7 @@ use acyclic_engine::merge::{self, ConflictKind, Entry, Reason};
 use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::store::{Store, StorePaths};
 use acyclic_engine::GenerationId;
-use acyclic_fs::kernel::{LogicalName, NameEncoding, NamespacePath};
+use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{CancellationToken, WorkCounters};
 
@@ -124,8 +124,8 @@ fn namespace(path: &str) -> NamespacePath {
         .split('/')
         .map(|component| {
             LogicalName::new(
-                NameEncoding::PosixBytes,
-                component.as_bytes().to_vec(),
+                acyclic_engine::names::encoding(),
+                acyclic_engine::names::str_to_bytes(component),
                 limits.maximum_component_bytes,
             )
             .expect("logical name")
@@ -511,7 +511,11 @@ fn refusals_name_paths_and_reasons() {
         );
         assert_eq!(refusals[2], (p("src/same.txt"), Reason::KindChange));
         assert!(plan.conflicted.is_empty());
-        assert!(format!("{}", refusals[1].1).contains("d/new.txt"));
+        // Rendered with the host's separator: `Path` compares component-wise,
+        // so the assertion above passes on Windows even though the display
+        // form there uses a backslash.
+        let named = Path::new("d").join("new.txt");
+        assert!(format!("{}", refusals[1].1).contains(&named.display().to_string()));
     });
     rig.finish();
 }

@@ -8,7 +8,7 @@
     reason = "test code: a failed expectation should panic with its message"
 )]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use acyclic_engine::config::Config;
@@ -118,13 +118,15 @@ fn checkpoint_rewind_journey() {
     let changes = runtime
         .block_on(diff::diff(&store, pre_generation, post_generation))
         .expect("diff");
-    let by_name: Vec<(String, ChangeKind)> = changes
+    // Compared as paths, not strings: `Path` equality is component-wise, so
+    // this holds whichever separator the host renders.
+    let by_name: Vec<(PathBuf, ChangeKind)> = changes
         .iter()
-        .map(|change| (change.path.to_string_lossy().into_owned(), change.change))
+        .map(|change| (change.path.clone(), change.change))
         .collect();
-    assert!(by_name.contains(&("src/main.rs".into(), ChangeKind::Modified)));
-    assert!(by_name.contains(&("generated.bin".into(), ChangeKind::Added)));
-    assert!(by_name.contains(&(".env".into(), ChangeKind::Removed)));
+    assert!(by_name.contains(&(PathBuf::from("src/main.rs"), ChangeKind::Modified)));
+    assert!(by_name.contains(&(PathBuf::from("generated.bin"), ChangeKind::Added)));
+    assert!(by_name.contains(&(PathBuf::from(".env"), ChangeKind::Removed)));
 }
 
 /// The safety net for hosts with no lifecycle-hook API (Claude Desktop over

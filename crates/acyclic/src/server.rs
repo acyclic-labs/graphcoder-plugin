@@ -1205,7 +1205,7 @@ impl Server {
         let mut mount = self.fork_mount.lock().await;
         mount
             .router
-            .add_route(id.to_owned().into_bytes(), source)
+            .add_route(route_name(id), source)
             .map_err(|error| format!("route: {error:?}"))?;
         // The ONE session, mounted lazily on the first fork. A route
         // insert is all later forks pay.
@@ -1229,7 +1229,7 @@ impl Server {
             match session {
                 Ok(session) => mount.session = Some(session),
                 Err(error) => {
-                    tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+                    tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
                     return Err(error);
                 }
             }
@@ -1603,11 +1603,12 @@ impl Server {
         let mut mount = self.fork_mount.lock().await;
         // Dropping a route drops its CheckoutMountSource, which owns a tokio
         // runtime — runtimes must never be dropped on an async worker.
-        tokio::task::block_in_place(|| mount.router.remove_route(id.as_bytes()));
+        tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
         // The kernel may hold a positive entry cache for the removed name
         // (FSKit caches until told otherwise): invalidate it eagerly.
         if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(id.as_bytes())) {
+            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(&route_name(id)))
+            {
                 eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
             }
         }
@@ -2023,6 +2024,17 @@ fn content_changes(
 
 fn err(message: String) -> proto::Payload {
     proto::Payload::Err { message }
+}
+
+/// A fork id as the router's route name.
+///
+/// The router projects a route as a directory entry, so the name crosses the
+/// same boundary as any captured name and has to carry the same encoding —
+/// the `ProjFS` provider decodes every entry name it is handed as UTF-16LE,
+/// and hands an id passed as raw ASCII back to the user as mojibake. Ids are
+/// hex, so this is a widening on Windows and a copy everywhere else.
+fn route_name(id: &str) -> Vec<u8> {
+    acyclic_engine::names::str_to_bytes(id)
 }
 
 fn short_id() -> String {
