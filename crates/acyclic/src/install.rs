@@ -1346,6 +1346,8 @@ included) is snapshotted by a local daemon. Useful commands:
     {{name}} diff --turn N                what one conversation turn changed
     {{name}} restore <id> <path>          bring back one file, leave the rest
     {{name}} brief                        where the previous session ended
+    {{name}} summary --turn N             what one turn did, in prose (only
+                                          when speculation is on; see README)
 
 Before a risky change, checkpoint. After a failed attempt, rewind instead
 of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
@@ -1410,6 +1412,8 @@ included) is snapshotted by a local daemon. Useful commands:
     {{name}} diff --turn N                what one conversation turn changed
     {{name}} restore <id> <path>          bring back one file, leave the rest
     {{name}} brief                        where the previous session ended
+    {{name}} summary --turn N             what one turn did, in prose (only
+                                          when speculation is on; see README)
 
 Before a risky change, checkpoint. After a failed attempt, rewind instead
 of hand-reverting. Before finishing, review `{{name}} diff`. Paths under
