@@ -29,12 +29,16 @@ if command -v claude >/dev/null 2>&1; then
   for flag in --mcp-config --strict-mcp-config --allowedTools --output-format; do
     require_flag "$CLAUDE_HELP" "$flag" claude
   done
+  if [ -n "$E2E_CLAUDE_MODEL" ]; then require_flag "$CLAUDE_HELP" --model claude; fi
+  e2e_model_note claude "$E2E_CLAUDE_MODEL"
 fi
 if command -v codex >/dev/null 2>&1; then
   CODEX_HELP="$(codex exec --help 2>&1 || true)"
   for flag in --skip-git-repo-check --json --output-last-message --config; do
     require_flag "$CODEX_HELP" "$flag" codex
   done
+  if [ -n "$E2E_CODEX_MODEL" ]; then require_flag "$CODEX_HELP" --model codex; fi
+  e2e_model_note codex "$E2E_CODEX_MODEL"
 fi
 if command -v copilot >/dev/null 2>&1; then
   COPILOT_HELP="$(copilot --help 2>&1 || true)"
@@ -47,6 +51,8 @@ if command -v cursor-agent >/dev/null 2>&1; then
   for flag in --approve-mcps --force --trust --output-format; do
     require_flag "$CURSOR_HELP" "$flag" cursor-agent
   done
+  if [ -n "$E2E_CURSOR_MODEL" ]; then require_flag "$CURSOR_HELP" --model cursor-agent; fi
+  e2e_model_note cursor-agent "$E2E_CURSOR_MODEL"
   CURSOR_MCP_HELP="$(cursor-agent mcp --help 2>&1 || true)"
   require_flag "$CURSOR_MCP_HELP" list-tools cursor-agent
   require_flag "$CURSOR_MCP_HELP" enable cursor-agent
@@ -82,6 +88,7 @@ assert_landed() {
 if command -v claude >/dev/null 2>&1; then
   printf '{"mcpServers":{"%s":{"command":"%s","args":["mcp","--repo","%s"]}}}\n' "$NAME" "$BIN" "$R" > "$WORK/claude-mcp.json"
   (cd "$R" && with_timeout 180 claude -p "$(prompt_for mcp-from-claude-code)" \
+    ${CLAUDE_MODEL_ARGS[@]+"${CLAUDE_MODEL_ARGS[@]}"} \
     --mcp-config "$WORK/claude-mcp.json" --strict-mcp-config \
     --allowedTools "mcp__${NAME}__brief,mcp__${NAME}__checkpoint,mcp__${NAME}__timeline" \
     --output-format json >"$WORK/claude.out" 2>"$WORK/claude.err") \
@@ -97,6 +104,7 @@ fi
 # all — without it every call fails with "requires approval".
 if command -v codex >/dev/null 2>&1; then
   (cd "$R" && with_timeout 180 codex exec "$(prompt_for mcp-from-codex)" \
+    ${CODEX_MODEL_ARGS[@]+"${CODEX_MODEL_ARGS[@]}"} \
     --skip-git-repo-check --json --output-last-message "$WORK/codex.last" \
     -c "mcp_servers.${NAME}.command=\"$BIN\"" \
     -c "mcp_servers.${NAME}.args=[\"mcp\",\"--repo\",\"$R\"]" \
@@ -117,6 +125,7 @@ if command -v cursor-agent >/dev/null 2>&1; then
   tools="$(cd "$R" && cursor-agent mcp list-tools "$NAME" 2>&1 || true)"
   printf '%s' "$tools" | grep -q "checkpoint" || fail "cursor-agent does not list the checkpoint tool: $tools"
   (cd "$R" && with_timeout 180 cursor-agent -p "$(prompt_for mcp-from-cursor-agent)" \
+    ${CURSOR_MODEL_ARGS[@]+"${CURSOR_MODEL_ARGS[@]}"} \
     --output-format json --approve-mcps --force --trust \
     >"$WORK/cursor.out" 2>"$WORK/cursor.err") \
     || fail "cursor-agent session failed: $(tail -c 300 "$WORK/cursor.err")"

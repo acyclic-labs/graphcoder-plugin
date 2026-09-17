@@ -121,6 +121,51 @@ with_timeout() {
   return "$code"
 }
 
+# --- Model pinning for the live host-session tests -------------------------
+# claude-e2e.sh, claude-merge-e2e.sh, codex-e2e.sh, cursor-e2e.sh and
+# mcp-clients-e2e.sh all assert on model-driven behavior: that the agent
+# calls the MCP tool instead of shelling out, that it performs the steps in
+# the order given, that a checkpoint lands with the right attribution. The
+# model is therefore a test INPUT, not an ambient setting. Left unpinned,
+# these scripts run on whatever default the installed CLI happens to have,
+# so a vendor moving that default silently changes what a paid session
+# measures and a real regression is indistinguishable from a flake. Each
+# host gets its own override so one can be re-pointed without disturbing
+# the others; set a var empty to fall back to that CLI's own default.
+#
+# Where the pinned ids come from: each was RUN, not read off a list. Claude
+# is pinned to claude-opus-5 because that is what this gate is green on —
+# claude-e2e.sh passes on Opus 5 and fails on claude-sonnet-5, three runs
+# out of three, with src/main.rs never written (the model does not complete
+# step 1 of the three-step prompt). That is a real behavioral difference,
+# not a bad id: a direct session confirms claude-sonnet-5 resolves and
+# bills normally. Until the prompt is hardened enough for a mid-tier model
+# to drive it, pinning to Sonnet would ship a red gate. Cursor comes from
+# `cursor-agent models`, which marks composer-2.5 as current. Codex ships
+# no offline way to enumerate valid ids (`codex exec --help` documents the
+# flag but lists no values) and rejects a wrong one outright, so it stays
+# on the CLI default until someone pins a value they have actually run.
+E2E_CLAUDE_MODEL="${ACYCLIC_E2E_CLAUDE_MODEL-claude-opus-5}"
+E2E_CURSOR_MODEL="${ACYCLIC_E2E_CURSOR_MODEL-composer-2.5}"
+E2E_CODEX_MODEL="${ACYCLIC_E2E_CODEX_MODEL-}"
+
+# `--model X` per host, or nothing when that host is unpinned. Stock macOS
+# bash 3.2 treats "${ARR[@]}" on an EMPTY array as an unbound variable under
+# `set -u`, so every expansion of these at a call site must use the
+# ${ARR[@]+"${ARR[@]}"} guard, not a bare "${ARR[@]}".
+CLAUDE_MODEL_ARGS=()
+CURSOR_MODEL_ARGS=()
+CODEX_MODEL_ARGS=()
+if [ -n "$E2E_CLAUDE_MODEL" ]; then CLAUDE_MODEL_ARGS=(--model "$E2E_CLAUDE_MODEL"); fi
+if [ -n "$E2E_CURSOR_MODEL" ]; then CURSOR_MODEL_ARGS=(--model "$E2E_CURSOR_MODEL"); fi
+if [ -n "$E2E_CODEX_MODEL" ]; then CODEX_MODEL_ARGS=(--model "$E2E_CODEX_MODEL"); fi
+
+# One line in the log naming the model a paid session actually ran on, so a
+# stored transcript is still interpretable after the defaults move on.
+e2e_model_note() {
+  echo "  $1 model: ${2:-<CLI default, unpinned>}"
+}
+
 # Fails the calling script's skip() path (must be defined by the caller)
 # with a clear reason when an installed host CLI's --help output doesn't
 # mention a flag the test depends on, rather than letting a stale flag

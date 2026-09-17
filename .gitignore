@@ -6,3 +6,4 @@ dist/
 target/
 build/
 .infisical.json
+.claude/worktrees/

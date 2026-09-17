@@ -29,6 +29,10 @@ require_flag "$EXEC_HELP" --skip-git-repo-check codex
 require_flag "$EXEC_HELP" --dangerously-bypass-approvals-and-sandbox codex
 require_flag "$EXEC_HELP" --dangerously-bypass-hook-trust codex
 require_flag "$EXEC_HELP" --json codex
+if [ -n "$E2E_CODEX_MODEL" ]; then
+  require_flag "$EXEC_HELP" --model codex
+fi
+e2e_model_note codex "$E2E_CODEX_MODEL"
 
 setup_repo
 acy init >/dev/null || fail "init"
@@ -52,6 +56,7 @@ PROMPT='Do exactly these three steps, in order, with no other file or shell oper
 # trust prompt. with_timeout (common.sh) stands in for GNU `timeout`, which
 # stock macOS ships neither as `timeout` nor `gtimeout`.
 OUT="$(cd "$R" && PATH="$BIN_DIR:$PATH" with_timeout 180 codex exec "$PROMPT" \
+  ${CODEX_MODEL_ARGS[@]+"${CODEX_MODEL_ARGS[@]}"} \
   --skip-git-repo-check \
   --dangerously-bypass-approvals-and-sandbox \
   --dangerously-bypass-hook-trust \

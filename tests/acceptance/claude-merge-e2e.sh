@@ -90,6 +90,7 @@ run_claude() {
   # $1: prompt. Prints the session id; the transcript lands in $WORK.
   local prompt="$1" out
   out="$(cd "$R" && PATH="$BIN_DIR:$PATH" claude -p "$prompt" \
+    ${CLAUDE_MODEL_ARGS[@]+"${CLAUDE_MODEL_ARGS[@]}"} \
     --settings .claude/settings.json \
     --dangerously-skip-permissions \
     --output-format json 2>"$WORK/claude.stderr")" \

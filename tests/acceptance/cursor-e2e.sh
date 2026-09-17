@@ -36,6 +36,10 @@ AGENT_HELP="$(cursor-agent --help 2>&1 || true)"
 require_flag "$AGENT_HELP" --output-format cursor-agent
 require_flag "$AGENT_HELP" --force cursor-agent
 require_flag "$AGENT_HELP" --trust cursor-agent
+if [ -n "$E2E_CURSOR_MODEL" ]; then
+  require_flag "$AGENT_HELP" --model cursor-agent
+fi
+e2e_model_note cursor-agent "$E2E_CURSOR_MODEL"
 
 setup_repo
 acy init >/dev/null || fail "init"
@@ -58,6 +62,7 @@ PROMPT='Do exactly these three steps, in order, with no other file or shell oper
 # (common.sh) stands in for GNU `timeout`, which stock macOS ships neither
 # as `timeout` nor `gtimeout`.
 OUT="$(cd "$R" && PATH="$BIN_DIR:$PATH" with_timeout 180 cursor-agent -p "$PROMPT" \
+  ${CURSOR_MODEL_ARGS[@]+"${CURSOR_MODEL_ARGS[@]}"} \
   --output-format json \
   --force \
   --trust 2>"$WORK/cursor.stderr")" \

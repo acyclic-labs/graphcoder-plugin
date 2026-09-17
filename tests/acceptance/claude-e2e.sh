@@ -19,6 +19,10 @@ skip() {
 }
 
 command -v claude >/dev/null 2>&1 || skip "claude CLI not on PATH"
+if [ -n "$E2E_CLAUDE_MODEL" ]; then
+  require_flag "$(claude --help 2>&1 || true)" --model claude
+fi
+e2e_model_note claude "$E2E_CLAUDE_MODEL"
 
 setup_repo
 acy init >/dev/null || fail "init"
@@ -39,6 +43,7 @@ PROMPT='Do exactly these three steps, in order, with no other file or shell oper
 # dependence); --output-format json hands us the session id for attribution
 # and rewind targeting.
 OUT="$(cd "$R" && PATH="$BIN_DIR:$PATH" claude -p "$PROMPT" \
+  ${CLAUDE_MODEL_ARGS[@]+"${CLAUDE_MODEL_ARGS[@]}"} \
   --settings .claude/settings.json \
   --dangerously-skip-permissions \
   --output-format json 2>"$WORK/claude.stderr")" \
