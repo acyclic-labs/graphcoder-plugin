@@ -7,6 +7,11 @@ All notable changes to this project are documented here. Format loosely follows
 
 Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
 
+## [0.0.2] - 2026-09-17
+
+Everything below shipped in 0.0.2 except Rewind and the npm launcher, which
+were 0.0.1. Host coverage, Speculation and Windows are what this release adds.
+
 ### Added
 
 - **Rewind** (Launch 1) — Merkle snapshot store with per-host hooks (Claude Code, Codex,
