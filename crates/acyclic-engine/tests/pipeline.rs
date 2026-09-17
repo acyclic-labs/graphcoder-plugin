@@ -160,13 +160,37 @@ fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
         // A round trip first, so baseline capture is guaranteed done before
         // the edit — otherwise the edit can race into the baseline itself
         // and leave nothing pending for the idle timer to find.
-        handle.status().await.expect("status");
+        let baseline_row = handle.status().await.expect("status").last_checkpoint;
 
         // No hook, no explicit checkpoint call — just an edit, like a host
         // with no lifecycle-hook API would produce.
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
-        // Long enough for the idle timer to notice and fire at least once.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Wait for the row, not for a duration. Landing an auto checkpoint
+        // takes TWO idle ticks — the first drains the watcher and marks the
+        // changes pending, the second fires once they have been quiet for
+        // `auto_checkpoint_idle_ms` — and each drain may itself spend up to
+        // `quiesce_cap_ms` waiting for the watcher to settle. Add the
+        // watcher's delivery latency, which on Windows
+        // (ReadDirectoryChangesW) is far larger than on kqueue or inotify,
+        // and a fixed sleep that is generous on a developer's Mac becomes
+        // marginal on a loaded CI runner: at 500ms this failed on the
+        // Windows runner with the row still `Baseline`. Polling `status`
+        // cannot starve the timer — the run loop's `next_tick` is a fixed
+        // deadline that incoming requests deliberately do not push out.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = handle.status().await.expect("status");
+            if status.last_checkpoint != baseline_row {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "idle timer never recorded a checkpoint: still at row \
+                 {baseline_row:?} after 15s with auto_checkpoint_idle_ms=50"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         handle.shutdown().await.expect("shutdown");
     });
     thread.join().expect("pipeline thread");
