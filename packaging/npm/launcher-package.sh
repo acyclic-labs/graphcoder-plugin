@@ -6,6 +6,18 @@
 #   packaging/npm/launcher-package.sh <version> <out-dir>
 #
 # Produces <out-dir>/<npm_package>/{package.json,bin/<name>.js}.
+#
+# The platform list is READ FROM <out-dir>, not hardcoded: whichever
+# <npm_package>-<os>-<cpu> directories platform-package.sh has already
+# assembled there become both the optionalDependencies and the launcher's
+# runtime PLATFORMS map. A hardcoded list is wrong in two directions. Naming a
+# package that was never built publishes a launcher whose optional dependency
+# 404s — npm fails optional deps soft, so the user installs "successfully" and
+# the binary is simply missing at runtime. Omitting one that was built leaves a
+# published package nothing resolves to. CI assembles all five targets before
+# calling this, so it still emits all five; a local release that skips Windows
+# (no MSVC toolchain off a Windows runner) emits four, and a Windows user gets
+# an honest "unsupported platform" instead of a broken install.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/product.sh"
 
@@ -14,6 +26,28 @@ version="$1"; out="$2"
 
 name="$PRODUCT_NAME"; pkg="$PRODUCT_NPM_PACKAGE"; repo="$PRODUCT_GITHUB_REPO"
 dir="${out}/${pkg}"
+
+# <out-dir>/<pkg>-<os>-<cpu> -> "<os> <cpu>", in a stable order.
+platforms=()
+for d in "${out}/${pkg}"-*-*/; do
+  [ -d "$d" ] || continue
+  suffix="$(basename "$d")"; suffix="${suffix#"$(basename "$pkg")"-}"
+  platforms+=("${suffix%-*} ${suffix##*-}")
+done
+[ "${#platforms[@]}" -gt 0 ] || {
+  echo "no platform packages in ${out}; run platform-package.sh first" >&2
+  exit 1
+}
+IFS=$'\n' platforms=($(printf '%s\n' "${platforms[@]}" | sort)); unset IFS
+
+opt_deps=""; plat_map=""
+for p in "${platforms[@]}"; do
+  os="${p% *}"; cpu="${p#* }"
+  opt_deps+="$(printf '\n    "%s-%s-%s": "%s",' "$pkg" "$os" "$cpu" "$version")"
+  plat_map+="$(printf '\n  "%s %s": "%s-%s-%s",' "$os" "$cpu" "$pkg" "$os" "$cpu")"
+done
+opt_deps="${opt_deps%,}"; plat_map="${plat_map%,}"
+
 mkdir -p "${dir}/bin"
 
 cat > "${dir}/package.json" <<JSON
@@ -26,12 +60,7 @@ cat > "${dir}/package.json" <<JSON
   "bin": { "${name}": "bin/${name}.js" },
   "files": ["bin/"],
   "engines": { "node": ">=18" },
-  "optionalDependencies": {
-    "${pkg}-darwin-arm64": "${version}",
-    "${pkg}-darwin-x64": "${version}",
-    "${pkg}-linux-x64": "${version}",
-    "${pkg}-linux-arm64": "${version}",
-    "${pkg}-win32-x64": "${version}"
+  "optionalDependencies": {${opt_deps}
   },
   "publishConfig": { "access": "public", "provenance": true }
 }
@@ -47,12 +76,7 @@ cat > "${dir}/bin/${name}.js" <<JS
 const { spawnSync } = require("node:child_process");
 
 const NAME = "${name}";
-const PLATFORMS = {
-  "darwin arm64": "${pkg}-darwin-arm64",
-  "darwin x64": "${pkg}-darwin-x64",
-  "linux x64": "${pkg}-linux-x64",
-  "linux arm64": "${pkg}-linux-arm64",
-  "win32 x64": "${pkg}-win32-x64",
+const PLATFORMS = {${plat_map}
 };
 
 // The Windows platform package ships acyclic.exe; every other target ships a
