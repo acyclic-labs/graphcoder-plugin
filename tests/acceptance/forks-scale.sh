@@ -1,36 +1,28 @@
 #!/usr/bin/env bash
 # Fork scale measurement (docs/design/03-forks.md, spec-forks.md).
 #
-# forks.sh proves the CONTRACT at N=3. This script asks the question the
-# contract does not answer: does the routed design actually hold as N grows
-# to the hundreds? Three claims are on trial, all of them load-bearing for
-# the fan-out story (N subagents on N forks):
+# forks.sh proves the contract at N=3; this asks whether the routed design
+# holds into the hundreds. Three claims, all load-bearing for the fan-out
+# story (N subagents on N forks):
 #
-#   C1 (one mount)   — "One kernel mount total, regardless of N; forks are
-#                      route inserts" (spec-forks.md). The mount table must
-#                      show exactly 1 at every rung.
-#   C2 (O(1) store)  — a fork copies nothing, so store growth per fork is a
-#                      small fixed overhead, not a function of tree size.
-#   C3 (flat cost)   — per-fork creation time must not degrade as the route
-#                      table fills. Route insert #256 should cost about what
-#                      insert #1 did.
+#   C1 (one mount)  — exactly 1 kernel mount at every rung; forks are route
+#                     inserts, not mounts (spec-forks.md).
+#   C2 (O(1) store) — per-fork store growth is fixed overhead, not a
+#                     function of tree size.
+#   C3 (flat cost)  — route insert #256 costs about what #1 did.
 #
-# It is a measurement tool first and a pass/fail test second: the rung table
-# prints on every run, because the numbers are the point. The budgets only
-# catch a blowup, so they are deliberately loose — C3 allows a 4x drift
-# before failing, which is superlinear-detection, not benchmarking.
+# A measurement tool first, a pass/fail test second: the rung table prints
+# on every run because the numbers are the point, and the budgets are loose
+# enough to catch only a blowup (C3 allows 4x drift).
 #
-# Batching: `fork -n` is capped at 16 (crates/acyclic/src/server.rs:590), so
-# N forks are built from ceil(N/16) calls. Each call publishes its own base
-# row, so the rungs are NOT a single-base fan-out; the content is identical
-# across bases (nothing edits the mainline during the ladder), so isolation
-# and cost are measured faithfully, but a true 400-way race off ONE base
-# needs that cap raised. Once it is, set ACYCLIC_SCALE_BATCH to measure the
-# single-call path with no other change.
+# `fork -n` is capped at 16 (crates/acyclic/src/server.rs), so N forks come
+# from ceil(N/16) calls, each publishing its own base. The rungs are
+# therefore not a single-base fan-out, though nothing edits the mainline
+# during the ladder so cost and isolation still measure faithfully. Raising
+# that cap and setting ACYCLIC_SCALE_BATCH measures the single-call path.
 #
-#   ACYCLIC_SCALE_RUNGS    ladder (default "16 64 256"; add 1024 for the
-#                          full run — slow, and the first place fd limits
-#                          and the FUSE-T helper are likely to complain)
+#   ACYCLIC_SCALE_RUNGS    ladder (default "16 64 256"; 1024 for the full
+#                          run, where fd limits complain first)
 #   ACYCLIC_SCALE_BATCH    forks per `fork -n` call (default 16 = the cap)
 #   ACYCLIC_SCALE_REQUIRED 1 = fail instead of skip when mounts are absent
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -141,7 +133,11 @@ for RUNG in $RUNGS; do
   GROWTH=$(( $(store_bytes) - BASE_STORE ))
   PER_FORK=$((GROWTH / CREATED))
   MOUNTS="$(mount_count)"
-  REPORT="$REPORT  N=$(printf '%5d' "$CREATED")  +${MADE} in $(secs "$RUNG_START" "$RUNG_END")s ($CALLS calls)  ${MS} ms/fork  store +$((GROWTH / 1024)) KiB ($((PER_FORK / 1024)) KiB/fork)  mounts=$MOUNTS
+  RUNG_SECS="$(secs "$RUNG_START" "$RUNG_END")"
+  REPORT="$REPORT  N=$(printf '%5d' "$CREATED")  +${MADE} in ${RUNG_SECS}s"
+  REPORT="$REPORT ($CALLS calls)  ${MS} ms/fork"
+  REPORT="$REPORT  store +$((GROWTH / 1024)) KiB ($((PER_FORK / 1024)) KiB/fork)"
+  REPORT="$REPORT  mounts=$MOUNTS
 "
 
   # C1, checked at every rung rather than only at the top: a design that
