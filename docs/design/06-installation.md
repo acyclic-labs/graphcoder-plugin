@@ -253,12 +253,15 @@ of them, so they come first.
    gates below become the priority. *Measured: npm already serves the binaries
    publicly and integrity-checked, so "npm or the installer" may be a false
    choice — both can serve the same artifacts. Current lean: canonical for now.*
-2. **Do we make this repo public?** It gates the curl installer, the release
-   assets, browsing the source, and the "verifiable open source" claim in
-   `07-compliance.md`. *Measured: it does not block distribution — the binaries
-   are already public via npm. What it still blocks is reading the source, the
-   attestations, and the open-source claim. No lean: this is a business call,
-   not a technical one.*
+2. ~~**Do we make this repo public?**~~ **Settled 2026-09-17: yes.** This
+   unblocks questions 1, 4, 5 and 8, the curl installer's script URL, the SLSA
+   and SBOM attestations, and the "verifiable open source" claim in
+   `07-compliance.md`. Two things to do before flipping it, neither a
+   distribution concern: the git history becomes public along with the tree,
+   and `scripts/check-no-secrets.sh` guards the current state rather than
+   history; and the compliance claims had to be corrected first, which they now
+   are. Distribution was never blocked on this — the binaries have been public
+   via npm since 0.0.1.
 3. **What version does the first release carry?** `0.0.1` is burned on npm and
    the publish job skips versions already on the registry. *Current lean: 0.0.2
    if the release is a mechanical proof, 0.1.0 if it is the first one anyone is

@@ -127,10 +127,12 @@ as a silent default — and the engine remains fully usable with the cloud off.
 
 ## Open questions (not yet settled)
 
-1. **Is "open source" claimable today?** This repo is private; the `acyclic-fs`
-   dependency repo is public. The README and this doc have both claimed
-   verifiable open source. *This is the same decision as question 2 in
-   `06-installation.md`, and it is a business call.*
+1. ~~**Is "open source" claimable today?**~~ **Settled 2026-09-17: the repo
+   goes public**, so the claim becomes true once it does — until then it is
+   still false on both surfaces. The sequencing matters: the claims in the
+   table above were corrected before the history becomes readable, which is the
+   right order. A public repo whose compliance doc overstates is worse than a
+   private one, because now anyone can check.
 2. **Which of the unbuilt controls are commitments and which are deleted?**
    Encryption at rest, secret scanning, telemetry controls and audit export were
    all written as shipped. Each needs to become either a dated commitment or a
