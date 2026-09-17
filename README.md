@@ -8,14 +8,24 @@ Checkpoint every agent action, rewind exactly, see the blast radius. The store c
 
 ## Install
 
-Get the binary, start the daemon in your repo, then wire in each coding tool you use:
+**Step 1 — get the binary.** Pick one of these; they are alternatives, not a sequence.
 
 ```sh
-npm i -g @acyclic-labs/plugin                                                       # prebuilt binary, macOS + Linux + Windows x64
-curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh   # or, on macOS/Linux: verified download into ~/.local/bin
+npm i -g @acyclic-labs/plugin
+```
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh
+```
+
+npm ships prebuilt binaries for macOS, Linux, and Windows x64, and is the path that works today. The installer script, which covers macOS and Linux only, downloads the binary for your machine from a GitHub release, checks it against that release's `SHA256SUMS`, and drops it in `~/.local/bin` — no sudo, no package manager. **No release is cut yet, so the script currently exits with a 404 and points you back at npm**; it goes live with the first tag. Set `ACYCLIC_VERSION` to pin a release and `ACYCLIC_INSTALL_DIR` to install elsewhere.
+
+**Step 2 — wire it into your repo.**
+
+```sh
 cd your-repo
-acyclic init                       # starts the daemon, builds the first snapshot
-acyclic install <host>             # one of the hosts below; repeat per tool you use
+acyclic init            # starts the daemon, builds the first snapshot
+acyclic install <host>  # one of the hosts below; repeat per tool you use
 ```
 
 Releases are built natively per target, carry SLSA build-provenance and SBOM attestations, and ship a `SHA256SUMS` the installer verifies. Cutting one is described in `packaging/npm/RELEASING.md`.
@@ -44,7 +54,7 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 
 ## The public name
 
-`product.toml` at the repo root holds the public name once. The CLI command, `.<name>/config.toml`, the state and config directories, hook commands, skill names, message prefixes, the `<NAME>_TRACE` and `<NAME>_HOOK` variables, release asset names, and the npm bin all derive from it at build or packaging time (`crates/acyclic-engine/build.rs`, `scripts/product.sh`, the workflows). Crate names stay `acyclic*` because they are internal. `scripts/install.sh` is fetched standalone and mirrors the name; `scripts/check-product-name.sh` fails CI if it drifts or if any user-facing Rust string spells the name out. Renaming is: change `product.toml`, update the two mirror lines in `install.sh`, rebuild.
+`product.toml` at the repo root holds the public name once. The CLI command, `.<name>/config.toml`, the state and config directories, hook commands, skill names, message prefixes, the `<NAME>_TRACE` and `<NAME>_HOOK` variables, release asset names, and the npm bin all derive from it at build or packaging time (`crates/acyclic-engine/build.rs`, `scripts/product.sh`, the workflows). Crate names stay `acyclic*` because they are internal. `scripts/install.sh` is fetched standalone and mirrors the name, repo, and npm package; `scripts/check-product-name.sh` fails CI if any of them drifts or if any user-facing Rust string spells the name out. Renaming is: change `product.toml`, update the three mirror lines in `install.sh`, rebuild.
 
 ## Configuration
 
@@ -129,9 +139,11 @@ Full feature lists, user journeys, and technical requirements per launch: [docs/
 
 ## Compliance posture
 
-Local-first (no code leaves the machine in v1), verifiable open source (signed reproducible releases, SBOM, SLSA provenance), and first-class controls on the snapshot store (encryption at rest, snapshot exclusions, purge-through-history, team-enforced retention). See the compliance section of the docs page.
+**Local-first, and stronger than "no code leaves the machine":** there is no network code in the product at all. No HTTP client is compiled into any crate, so there is no telemetry, no update check, and no egress to enumerate or firewall. Security review is of a local binary, not a vendor.
 
-Note for Launch 1 design: purge-through-history and snapshot exclusions must be designed into the Merkle store from the start — content-addressed stores make retroactive deletion hard to retrofit.
+Releases carry a SLSA build-provenance attestation and an SPDX SBOM per binary, and every push is scanned for licences, advisories and sources against `deny.toml`. Builds are native per target rather than reproducible, and macOS binaries are not notarized.
+
+**The shipped control on the snapshot store is `exclude`.** Encryption at rest, purge-through-history, secret scanning and enforced retention have been described as controls but are **not built**; purge and GC are blocked on an upstream retention-release fact, so store retention is currently unbounded. [`docs/design/07-compliance.md`](docs/design/07-compliance.md) separates what is true today from what is intended, claim by claim — read it before making a compliance commitment to anyone.
 
 ## License
 

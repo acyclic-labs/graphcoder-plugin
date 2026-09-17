@@ -176,8 +176,8 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------
-  # GitHub release with the raw binaries and a SHA256SUMS file. The future
-  # curl installer and Homebrew formula consume these.
+  # GitHub release with the raw binaries and a SHA256SUMS file. scripts/install.sh
+  # consumes these, and a future Homebrew formula will too.
   # ---------------------------------------------------------------------
   github-release:
     needs: [verify, build]
@@ -199,9 +199,13 @@ jobs:
           set -euo pipefail
           cd dist
           # One SBOM ships with the release (the per-target ones are identical
-          # and each stays attested against its own binary).
+          # and each stays attested against its own binary). Drop the others by
+          # name: a glob like *-*-*.spdx.json also matches the release SBOM once
+          # VERSION carries a prerelease suffix (acyclic-0.1.0-rc.1.spdx.json).
           mv "${NAME}-linux-x64.spdx.json" "${NAME}-${VERSION}.spdx.json"
-          rm -f ./*-*-*.spdx.json
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            rm -f "${NAME}-${t}.spdx.json"
+          done
           cat ./*.sha256 > SHA256SUMS
           rm ./*.sha256
           shasum -a 256 "${NAME}-${VERSION}.spdx.json" >> SHA256SUMS

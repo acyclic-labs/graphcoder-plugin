@@ -14,9 +14,10 @@
 set -eu
 
 # This script is fetched on its own, so it cannot read product.toml. These
-# two lines mirror it; scripts/check-product-name.sh fails CI if they drift.
+# three lines mirror it; scripts/check-product-name.sh fails CI if they drift.
 NAME="acyclic"
 REPO="acyclic-labs/graphcoder-plugin"
+NPM_PACKAGE="@acyclic-labs/plugin"
 INSTALL_DIR="${ACYCLIC_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '%s\n' "$*" >&2; }
@@ -66,9 +67,24 @@ sha256_of() {
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/$NAME-install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
+# A failure here is nearly always a missing release rather than a broken
+# network: no release cut yet, or ACYCLIC_VERSION naming one that does not
+# exist. Say which, and name the install path that does not need a release.
+missing() {
+  say "install.sh: cannot fetch $1"
+  say ""
+  say "No release asset at that URL. See which releases exist:"
+  say "  https://github.com/$REPO/releases"
+  say "A release must carry both $asset and SHA256SUMS."
+  say ""
+  say "To install without a GitHub release:"
+  say "  npm i -g $NPM_PACKAGE"
+  exit 1
+}
+
 say "downloading $asset from $base"
-fetch "$base/$asset" "$tmp/$asset" || die "download failed: $base/$asset"
-fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "download failed: $base/SHA256SUMS"
+fetch "$base/$asset" "$tmp/$asset" || missing "$base/$asset"
+fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || missing "$base/SHA256SUMS"
 
 want="$(awk -v a="$asset" '$2 == a || $2 == "*" a || $2 == "./" a {print $1; exit}' "$tmp/SHA256SUMS")"
 [ -n "$want" ] || die "SHA256SUMS has no entry for $asset"
