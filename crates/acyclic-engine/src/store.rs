@@ -230,14 +230,19 @@ impl Store {
         }
 
         let cancel = CancellationToken::new();
+        let phase = std::time::Instant::now();
         let fs = LocalFs::local(local_options(paths.object_store()))
             .await
             .map_err(EngineError::fs("open object store"))?;
+        let objects_ms = crate::trace::ms(phase);
+        let phase = std::time::Instant::now();
         let volume = fs
             .open_volume(meta.volume_id, WorkCounters::UNBOUNDED, &cancel)
             .await
             .map_err(EngineError::fs("open volume"))?
             .value;
+        let volume_ms = crate::trace::ms(phase);
+        let phase = std::time::Instant::now();
         let checkout = volume
             .checkout(
                 GenerationSelector::Head,
@@ -248,6 +253,11 @@ impl Store {
             .await
             .map_err(EngineError::fs("checkout head"))?
             .value;
+        crate::trace!(
+            "store",
+            "open: object store {objects_ms:.1}ms, volume {volume_ms:.1}ms, head checkout {:.1}ms",
+            crate::trace::ms(phase)
+        );
         Ok(Self {
             fs,
             volume,

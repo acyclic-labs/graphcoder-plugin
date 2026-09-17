@@ -170,8 +170,13 @@ enum Command {
     Forks,
     /// Discard a fork (its changes evaporate).
     ForkDrop { id: String },
-    /// Land a fork's changes in the real working tree.
-    Promote { id: String },
+    /// Land one or more forks' changes in the real working tree, in the
+    /// order given. Each fork is reported on its own line; a conflict in one
+    /// does not stop the rest.
+    Promote {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+    },
     /// Blast radius of a live fork against its base, without landing it.
     ForkDiff { id: String },
     /// Print the fork-decomposition parameters ([decompose] in
@@ -406,6 +411,75 @@ fn print_mount_capability() {
 /// can spend money, the second says whether speculating is working. A claim
 /// rate near zero, or a median lead near zero, means the triggers are firing
 /// too late to be worth anything — which is the point of measuring it.
+/// Lands one fork and returns the text to print, or the conflict/refusal
+/// report as the error.
+fn promote_one(client: &mut Client, id: &str) -> Result<String, String> {
+    let reply = client.call(proto::Op::Promote { id: id.to_owned() })?;
+    let proto::Reply::Promote(info) = reply else {
+        return Err("unexpected reply".into());
+    };
+    let kept_note = if info.kept_mainline.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "kept the mainline's copy of {} gitignored path(s) both sides changed: {}\n",
+            info.kept_mainline.len(),
+            info.kept_mainline.join(", ")
+        )
+    };
+    if !info.conflicts.is_empty() {
+        let mut report = format!(
+            "promote fork {id}: {} file(s) conflict; markers written into the fork, nothing landed\n",
+            info.conflicts.len()
+        );
+        for conflict in &info.conflicts {
+            report.push_str(&format!("  {}: {}\n", conflict.path, conflict.detail));
+        }
+        report.push_str(&format!(
+            "Resolve the markers in {} and run `{NAME} promote {id}` again (the fork now sits on {})",
+            info.fork_path.as_deref().unwrap_or("the fork"),
+            short_hex(&info.generation)
+        ));
+        if !kept_note.is_empty() {
+            report.push('\n');
+            report.push_str(kept_note.trim_end());
+        }
+        return Err(report);
+    }
+    let mut out = kept_note;
+    match (info.old_tree, info.replayed_paths, info.merged_files) {
+        (Some(old_tree), _, _) => {
+            out.push_str(&format!(
+                "promoted: working tree now at {}\nold tree kept at {old_tree}\nnote: {}\n",
+                short_hex(&info.generation),
+                info.warning
+            ));
+        }
+        (None, paths, merged) if merged > 0 => {
+            out.push_str(&format!(
+                "promoted by merge: {merged} file(s) merged, {paths} path(s) written in place, tree now at {}\nnote: {}\n",
+                short_hex(&info.generation),
+                info.warning
+            ));
+        }
+        (None, paths, _) if paths > 0 && info.mainline_moved => {
+            out.push_str(&format!(
+                "promoted by replay: {paths} path(s) written in place, tree now at {}\nnote: {}\n",
+                short_hex(&info.generation),
+                info.warning
+            ));
+        }
+        (None, paths, _) if paths > 0 => {
+            out.push_str(&format!(
+                "promoted: {paths} path(s) written in place, tree now at {}\n",
+                short_hex(&info.generation)
+            ));
+        }
+        (None, _, _) => out.push_str("fork had no changes; nothing to land\n"),
+    }
+    Ok(out)
+}
+
 fn print_speculation(spec: &proto::SpecStatus) {
     let mode = if spec.spends_tokens {
         format!("precompute + model runs ({})", spec.command)
@@ -874,73 +948,38 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             println!("fork dropped; its changes evaporated");
             Ok(())
         }
-        Command::Promote { id } => {
+        Command::Promote { ids } => {
             step_aside();
-            let reply = client.call(proto::Op::Promote { id: id.clone() })?;
-            let proto::Reply::Promote(info) = reply else {
-                return Err("unexpected reply".into());
-            };
-            let kept_note = if info.kept_mainline.is_empty() {
-                String::new()
+            let total = ids.len();
+            let several = total > 1;
+            let mut failures = Vec::new();
+            for id in ids {
+                match promote_one(client, &id) {
+                    Ok(report) => {
+                        if several {
+                            print!("{id} -> ");
+                        }
+                        print!("{report}");
+                    }
+                    Err(report) => {
+                        if several {
+                            eprintln!("{id} -> {report}");
+                        } else {
+                            return Err(report);
+                        }
+                        failures.push(id);
+                    }
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
             } else {
-                format!(
-                    "kept the mainline's copy of {} gitignored path(s) both sides changed: {}\n",
-                    info.kept_mainline.len(),
-                    info.kept_mainline.join(", ")
-                )
-            };
-            if !info.conflicts.is_empty() {
-                let mut report = format!(
-                    "promote fork {id}: {} file(s) conflict; markers written into the fork, nothing landed\n",
-                    info.conflicts.len()
-                );
-                for conflict in &info.conflicts {
-                    report.push_str(&format!("  {}: {}\n", conflict.path, conflict.detail));
-                }
-                report.push_str(&format!(
-                    "Resolve the markers in {} and run `{NAME} promote {id}` again (the fork now sits on {})",
-                    info.fork_path.as_deref().unwrap_or("the fork"),
-                    short_hex(&info.generation)
-                ));
-                if !kept_note.is_empty() {
-                    report.push('\n');
-                    report.push_str(kept_note.trim_end());
-                }
-                return Err(report);
+                Err(format!(
+                    "{} of {total} fork(s) did not land: {}",
+                    failures.len(),
+                    failures.join(", ")
+                ))
             }
-            print!("{kept_note}");
-            match (info.old_tree, info.replayed_paths, info.merged_files) {
-                (Some(old_tree), _, _) => {
-                    println!(
-                        "promoted: working tree now at {}",
-                        short_hex(&info.generation)
-                    );
-                    println!("old tree kept at {old_tree}");
-                    println!("note: {}", info.warning);
-                }
-                (None, paths, merged) if merged > 0 => {
-                    println!(
-                        "promoted by merge: {merged} file(s) merged, {paths} path(s) written in place, tree now at {}",
-                        short_hex(&info.generation)
-                    );
-                    println!("note: {}", info.warning);
-                }
-                (None, paths, _) if paths > 0 && info.mainline_moved => {
-                    println!(
-                        "promoted by replay: {paths} path(s) written in place, tree now at {}",
-                        short_hex(&info.generation)
-                    );
-                    println!("note: {}", info.warning);
-                }
-                (None, paths, _) if paths > 0 => {
-                    println!(
-                        "promoted: {paths} path(s) written in place, tree now at {}",
-                        short_hex(&info.generation)
-                    );
-                }
-                (None, _, _) => println!("fork had no changes; nothing to land"),
-            }
-            Ok(())
         }
         Command::ForkDiff { id } => {
             let reply = client.call(proto::Op::ForkDiff { id })?;
@@ -973,6 +1012,23 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 println!(
                     "mounts:        unavailable ({}) — forks copy, Safe Mode off",
                     info.mount_reason.as_deref().unwrap_or("unknown reason")
+                );
+            }
+            // Printed only when the watcher has lost its epoch at least
+            // once: a clean daemon prints exactly what it printed before
+            // this line existed.
+            if let Some(watcher) = info.watcher.filter(|w| w.invalidations > 0) {
+                println!(
+                    "watcher:       {} invalidation(s), {} full rescan(s) costing {:.1}s total, \
+                     last {:.0}ms{}",
+                    watcher.invalidations,
+                    watcher.recovery_rescans,
+                    watcher.recovery_ms_total / 1000.0,
+                    watcher.last_recovery_ms,
+                    watcher
+                        .last_reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" ({reason})"))
                 );
             }
             // Printed only when speculation is configured: the default

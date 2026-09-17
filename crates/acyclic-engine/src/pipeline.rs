@@ -12,7 +12,8 @@ use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
-    NativeWatchOptions, OperationId, WatchBatch, WatchChange, WorkCounters,
+    NativeWatchOptions, OperationId, WatchBatch, WatchChange, WatchEpoch, WatchSequence,
+    WorkCounters,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -48,6 +49,14 @@ pub struct CheckpointOutcome {
     pub kind: CheckpointKind,
 }
 
+/// What one batched restore landed, and the row that records it.
+#[derive(Clone, Debug)]
+pub struct RestoredPaths {
+    pub outcomes: Vec<RestoreOutcome>,
+    pub generation: GenerationId,
+    pub row: i64,
+}
+
 /// Snapshot of pipeline health.
 #[derive(Clone, Debug)]
 pub struct StatusReport {
@@ -55,6 +64,25 @@ pub struct StatusReport {
     pub last_checkpoint: Option<i64>,
     pub unpublished: u64,
     pub checkpoints_since_commit: u32,
+    pub watcher: WatcherHealth,
+}
+
+/// How often the native watcher has lost its epoch since the daemon
+/// started, and what each recovery cost. An invalidation forces a full-tree
+/// recovery baseline, so this is the number to read when checkpoints or
+/// promotes are slow.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WatcherHealth {
+    /// Times the watcher reported that its hints could no longer be trusted.
+    pub invalidations: u32,
+    /// The reason the last invalidation gave.
+    pub last_reason: Option<String>,
+    /// Full-tree recovery baselines run because of an invalidation.
+    pub recovery_rescans: u32,
+    /// Wall time spent in those recovery baselines, in milliseconds.
+    pub recovery_ms_total: f64,
+    /// Wall time of the most recent recovery baseline, in milliseconds.
+    pub last_recovery_ms: f64,
 }
 
 /// A path paired with its regular-file contents, or `None` when the path is
@@ -78,6 +106,13 @@ enum Request {
         target: CheckpointRow,
         path: PathBuf,
         reply: oneshot::Sender<Result<RestoreOutcome>>,
+    },
+    RestorePaths {
+        target: CheckpointRow,
+        paths: Vec<PathBuf>,
+        safety: bool,
+        label: Option<String>,
+        reply: oneshot::Sender<Result<RestoredPaths>>,
     },
     TurnStarted {
         session_id: String,
@@ -108,6 +143,7 @@ enum Request {
     /// it can be a `restore_path` target.
     RecordGeneration {
         generation: GenerationId,
+        kind: CheckpointKind,
         label: String,
         reply: oneshot::Sender<Result<CheckpointRow>>,
     },
@@ -286,6 +322,34 @@ impl PipelineHandle {
         )?
     }
 
+    /// Restores several paths from `target` as ONE timeline event: one
+    /// safety row if the tree had pending changes, every path written, one
+    /// watcher drain, one recorded row. Promote lands a fork this way; the
+    /// per-path form costs a drain and a row per path.
+    ///
+    /// `safety` asks for a safety row first when the tree holds changes the
+    /// timeline has not seen; a caller that captured the tree moments ago
+    /// (promote, right after publishing the head) passes `false` and skips
+    /// that drain. `label` names the recorded row; `None` gets
+    /// `restore <what>`.
+    pub async fn restore_paths(
+        &self,
+        target: CheckpointRow,
+        paths: Vec<PathBuf>,
+        safety: bool,
+        label: Option<String>,
+    ) -> Result<RestoredPaths> {
+        request!(
+            self,
+            RestorePaths {
+                target: target,
+                paths: paths,
+                safety: safety,
+                label: label
+            }
+        )?
+    }
+
     /// Records a conversation turn; returns its 1-based number. Later
     /// checkpoints in the session inherit it.
     pub async fn turn_started(&self, session_id: String, prompt: String) -> Result<i64> {
@@ -355,10 +419,25 @@ impl PipelineHandle {
         generation: GenerationId,
         label: String,
     ) -> Result<CheckpointRow> {
+        self.record_generation_as(generation, CheckpointKind::Manual, label)
+            .await
+    }
+
+    /// [`Self::record_generation`] with an explicit row kind. Records a
+    /// generation the caller already holds: no drain, no capture, so it is
+    /// the way to mark a "before" point when the tree was captured moments
+    /// ago and nothing has been written since.
+    pub async fn record_generation_as(
+        &self,
+        generation: GenerationId,
+        kind: CheckpointKind,
+        label: String,
+    ) -> Result<CheckpointRow> {
         request!(
             self,
             RecordGeneration {
                 generation: generation,
+                kind: kind,
                 label: label
             }
         )?
@@ -693,6 +772,9 @@ struct Pipeline {
     /// A Safe Mode session's fork is shadow-mounted over the repo root:
     /// mainline capture is suspended until `resolve_session`/`apply_session`.
     shadowed: bool,
+    /// Watcher invalidations and recovery rescans since start; see
+    /// [`WatcherHealth`].
+    watcher_health: WatcherHealth,
     /// Watcher changes an idle tick drained into the checkout that no
     /// checkpoint has recorded yet: the generation that was current when
     /// they were drained, and when the last of them arrived. Cleared once
@@ -780,6 +862,7 @@ fn fail_request(request: Request, message: &str) {
         Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePath { reply, .. } => drop(reply.send(Err(error()))),
+        Request::RestorePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::TurnStarted { reply, .. } => drop(reply.send(Err(error()))),
         Request::SetShadowed { reply, .. } => drop(reply.send(Err(error()))),
         Request::Status { reply } => drop(reply.send(StatusReport {
@@ -787,6 +870,7 @@ fn fail_request(request: Request, message: &str) {
             last_checkpoint: None,
             unpublished: 0,
             checkpoints_since_commit: 0,
+            watcher: WatcherHealth::default(),
         })),
         Request::SessionStarted { reply, .. } | Request::SessionEnded { reply, .. } => {
             drop(reply.send(Err(error())));
@@ -836,6 +920,7 @@ impl Pipeline {
             checkpoints_since_commit: 0,
             last_activity: Instant::now(),
             shadowed: false,
+            watcher_health: WatcherHealth::default(),
             auto_pending: None,
         };
         pipeline.baseline(CheckpointKind::Baseline).await?;
@@ -854,7 +939,10 @@ impl Pipeline {
         // A baseline requires a clean checkout. Mid-session (watcher
         // invalidation, rewind) the overlay holds uncommitted captures:
         // publish them first. At startup this is a no-op.
+        let phase = Instant::now();
         self.commit_engine().await?;
+        let precommit_ms = crate::trace::ms(phase);
+        let phase = Instant::now();
         capture_baseline(
             &mut self.store.checkout,
             &self.options,
@@ -863,8 +951,11 @@ impl Pipeline {
         )
         .await
         .map_err(EngineError::fs("capture baseline"))?;
+        let capture_ms = crate::trace::ms(phase);
+        let phase = Instant::now();
         self.scrub_exclusions().await?;
         let generation = self.checkpoint_engine().await?;
+        let snapshot_ms = crate::trace::ms(phase);
         let row = self
             .index
             .record(generation, kind, &Attribution::default())?;
@@ -899,8 +990,21 @@ impl Pipeline {
                 self.scrub_exclusions().await?;
             }
         }
+        let phase = Instant::now();
         self.commit_engine().await?;
+        let postcommit_ms = crate::trace::ms(phase);
         self.state = State::Ready;
+        if kind == CheckpointKind::Recovered {
+            let ms = crate::trace::ms(baseline_started);
+            self.watcher_health.recovery_rescans += 1;
+            self.watcher_health.recovery_ms_total += ms;
+            self.watcher_health.last_recovery_ms = ms;
+        }
+        crate::trace!(
+            "pipeline",
+            "baseline phases: pre-commit {precommit_ms:.1}ms, full capture {capture_ms:.1}ms, \
+             scrub+snapshot {snapshot_ms:.1}ms, rescan tail+post-commit {postcommit_ms:.1}ms"
+        );
         crate::trace!(
             "pipeline",
             "baseline done in {:.1}ms; state Ready",
@@ -957,6 +1061,16 @@ impl Pipeline {
                 let _ = reply.send(self.restore_path(target, &path).await);
                 false
             }
+            Request::RestorePaths {
+                target,
+                paths,
+                safety,
+                label,
+                reply,
+            } => {
+                let _ = reply.send(self.restore_paths(target, &paths, safety, label).await);
+                false
+            }
             Request::TurnStarted {
                 session_id,
                 prompt,
@@ -987,6 +1101,7 @@ impl Pipeline {
             }
             Request::RecordGeneration {
                 generation,
+                kind,
                 label,
                 reply,
             } => {
@@ -994,7 +1109,7 @@ impl Pipeline {
                     .index
                     .record(
                         generation,
-                        CheckpointKind::Manual,
+                        kind,
                         &Attribution {
                             label: Some(label),
                             ..Attribution::default()
@@ -1151,6 +1266,7 @@ impl Pipeline {
                     last_checkpoint: self.last_checkpoint_row,
                     unpublished: self.index.unpublished_count().unwrap_or(0),
                     checkpoints_since_commit: self.checkpoints_since_commit,
+                    watcher: self.watcher_health.clone(),
                 });
                 false
             }
@@ -1355,11 +1471,20 @@ impl Pipeline {
                     }
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
-                WatchBatch::RescanRequired { .. } => {
+                WatchBatch::RescanRequired { epoch, reason } => {
                     // Watcher overflow or invalidation: rebuild from scratch
                     // with a FRESH watcher. Reusing the invalidated one is a
                     // trap — if the baseline fails after begin_rescan, the
                     // old watcher stays wedged in RescanInProgress forever.
+                    crate::trace!(
+                        "pipeline",
+                        "drain: watcher INVALIDATED after {:.1}ms ({polls} polls, {batches} \
+                         batch(es), {hints} hint(s) captured first): epoch {epoch:?}, reason: \
+                         {reason}; fresh watcher + full recovery baseline",
+                        crate::trace::ms(started)
+                    );
+                    self.watcher_health.invalidations += 1;
+                    self.watcher_health.last_reason = Some(reason.to_string());
                     self.reset_watch().await?;
                     self.baseline(CheckpointKind::Recovered).await?;
                     return Ok(true);
@@ -1585,59 +1710,169 @@ impl Pipeline {
         target: CheckpointRow,
         path: &std::path::Path,
     ) -> Result<RestoreOutcome> {
+        let mut restored = self
+            .restore_paths(target, &[path.to_path_buf()], true, None)
+            .await?;
+        restored
+            .outcomes
+            .pop()
+            .ok_or_else(|| EngineError::Restore("restore produced no outcome".into()))
+    }
+
+    /// Captures `paths` without waiting for the watcher: the caller wrote
+    /// them and knows it. The native echo of those writes, 100ms+ later,
+    /// is harmless: a modified hint on a path whose content already matches
+    /// captures nothing, and a staged sibling's create+rename resolves to an
+    /// absent path.
+    async fn capture_paths_directly(&mut self, paths: &[PathBuf]) -> Result<()> {
+        // One hint per path, plus one per distinct parent directory: the
+        // rename into place changed the parent's metadata, and the native
+        // watcher would have said so. Without it the parent's mtime lands
+        // in a later, spurious row.
+        let mut hints = Vec::with_capacity(paths.len() * 2);
+        let mut parents = std::collections::BTreeSet::new();
+        for path in paths {
+            hints.push(WatchChange::Modified(crate::merge::namespace_of(path)?));
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                parents.insert(parent.to_path_buf());
+            }
+        }
+        for parent in parents {
+            hints.push(WatchChange::Modified(crate::merge::namespace_of(&parent)?));
+        }
+        capture_watch_batch(
+            &mut self.store.checkout,
+            WatchBatch::Changes {
+                epoch: WatchEpoch::from_u64(0),
+                first_sequence: WatchSequence::from_u64(0),
+                next_sequence: WatchSequence::from_u64(0),
+                changes: hints,
+            },
+            &self.options,
+            WorkCounters::UNBOUNDED,
+            &self.cancel,
+        )
+        .await
+        .map_err(EngineError::fs("capture restored paths"))?;
+        self.scrub_exclusions().await
+    }
+
+    /// Restores `paths` from `target` as one event: at most one safety row
+    /// before, one drain and one row after, however many paths land.
+    async fn restore_paths(
+        &mut self,
+        target: CheckpointRow,
+        paths: &[PathBuf],
+        safety: bool,
+        label: Option<String>,
+    ) -> Result<RestoredPaths> {
         if self.shadowed {
             return Err(EngineError::Restore(
                 "a Safe Mode session is shadowing the repo root; resolve it first".into(),
             ));
         }
-        if self.exclusions.covers_host(path) {
-            return Err(EngineError::Restore(format!(
-                "{} is excluded from snapshots (`exclude` in {}); no checkpoint holds it",
-                path.display(),
-                crate::product::repo_config_file()
-            )));
+        for path in paths {
+            if self.exclusions.covers_host(path) {
+                return Err(EngineError::Restore(format!(
+                    "{} is excluded from snapshots (`exclude` in {}); no checkpoint holds it",
+                    path.display(),
+                    crate::product::repo_config_file()
+                )));
+            }
         }
         if self.state != State::Ready {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
-        let pending = self.has_pending_drained_changes();
-        if self.drain_watcher().await? || pending {
-            let safety = self.checkpoint_engine().await?;
-            let row = self.index.record(
-                safety,
-                CheckpointKind::Manual,
-                &Attribution {
-                    label: Some(format!(
-                        "before restore {} from #{}",
-                        path.display(),
-                        target.id
-                    )),
-                    ..Attribution::default()
-                },
-            )?;
-            self.last_generation = safety;
-            self.last_checkpoint_row = Some(row);
-            self.auto_pending = None;
+        let what = match paths {
+            [path] => format!("{} from #{}", path.display(), target.id),
+            _ => format!("{} path(s) from #{}", paths.len(), target.id),
+        };
+        let started = Instant::now();
+        let mut safety_row = None;
+        if safety {
+            let pending = self.has_pending_drained_changes();
+            if self.drain_watcher().await? || pending {
+                let generation = self.checkpoint_engine().await?;
+                let row = self.index.record(
+                    generation,
+                    CheckpointKind::Manual,
+                    &Attribution {
+                        label: Some(format!("before restore {what}")),
+                        ..Attribution::default()
+                    },
+                )?;
+                self.last_generation = generation;
+                self.last_checkpoint_row = Some(row);
+                self.auto_pending = None;
+                safety_row = Some(row);
+            }
         }
+        let pre_ms = crate::trace::ms(started);
 
-        let outcome = rewind::restore_path(&self.store, target.generation, path).await?;
+        let write_started = Instant::now();
+        let mut outcomes = Vec::with_capacity(paths.len());
+        for path in paths {
+            outcomes.push(rewind::restore_path(&self.store, target.generation, path).await?);
+        }
+        let write_ms = crate::trace::ms(write_started);
 
-        // Let the watcher report the restore, then record it.
-        self.drain_watcher().await?;
+        // Capture the written paths directly: the pipeline knows exactly
+        // what it wrote, and the native echo of those writes arrives 100ms+
+        // later. The echo is harmless when it comes: a modified hint on a
+        // path whose content already matches captures nothing, and the
+        // staged sibling's create+rename resolves to an absent path.
+        // Direct capture describes each path with one hint, which is exact
+        // for a regular file or symlink and wrong for a subtree (a removed
+        // or replaced directory needs a hint per descendant). Anything
+        // else waits for the native watcher, which delivers those.
+        let post_started = Instant::now();
+        let all_leaves = paths.iter().all(|path| {
+            std::fs::symlink_metadata(self.store.repo_root.join(path))
+                .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink())
+        });
+        let capture_mode = if all_leaves {
+            self.capture_paths_directly(paths).await?;
+            "direct capture"
+        } else {
+            self.drain_watcher().await?;
+            "watcher drain (a path is a directory or absent)"
+        };
+        let post_ms = crate::trace::ms(post_started);
+        let capture_started = Instant::now();
         let generation = self.checkpoint_engine().await?;
         let row = self.index.record(
             generation,
             CheckpointKind::Manual,
             &Attribution {
-                label: Some(format!("restore {} from #{}", path.display(), target.id)),
+                label: Some(label.unwrap_or_else(|| format!("restore {what}"))),
                 ..Attribution::default()
             },
         )?;
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
         self.checkpoints_since_commit += 1;
-        Ok(outcome)
+        crate::trace!(
+            "pipeline",
+            "restore {what} -> row #{row}: pre-drain {pre_ms:.1}ms ({}), write {} path(s) \
+             {write_ms:.1}ms, {capture_mode} {post_ms:.1}ms, snapshot+index {:.1}ms, total {:.1}ms",
+            match safety_row {
+                Some(row) => format!("safety row #{row}"),
+                None if safety => "no safety row".to_owned(),
+                None => "safety skipped by caller".to_owned(),
+            },
+            outcomes.len(),
+            crate::trace::ms(capture_started),
+            crate::trace::ms(started)
+        );
+        Ok(RestoredPaths {
+            outcomes,
+            generation,
+            row,
+        })
     }
 
     /// Mints one fork: publish the current state (the fork base), then cut a

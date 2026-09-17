@@ -364,8 +364,18 @@ Deliberate divergences:
   output says `original`, not `base` as its doc comment claims. The port
   matches the code; the modify/delete block is built by hand with the
   same label.
-- **Landing.** M = H + entries is built as an unpublished generation and
-  landed with `restore_path` per landing path, as planned. R is built
+- **Landing.** When nothing merged by content and nothing conflicted,
+  every landing path is a fork-only subtree that the fork's snapshot F
+  already holds exactly, so F is the landing source and no M is built
+  (the timeline row reads `fork <id> snapshot (N paths)`). Otherwise
+  M = H + entries is built as an unpublished generation and is the
+  source (`fork <id> merge (a merged, b replayed)`). Either way the
+  landing paths are written by ONE `restore_paths` call: no safety row
+  (publish_head captured the tree moments before), one write pass, and
+  the written paths captured directly when they are all regular files
+  or symlinks (a directory or an absent path falls back to a watcher
+  drain), recorded as the single landed row. The `before promote …`
+  row records the published head without another drain. R is built
   from M with the marker files on top. A rebase writes R − F into the
   fork: through the shared checkout for a mount fork (route detached
   during promote, re-attached after), via `restore_path_into` for a copy

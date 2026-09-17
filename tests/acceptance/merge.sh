@@ -180,7 +180,9 @@ promote_ok "$A" G10 >/dev/null
 TL="$(acy timeline)"
 echo "$TL" | grep -q "merged 0 file(s), replayed 1 path(s) onto moved mainline" || fail "G10: no landed row in timeline: $TL"
 echo "$TL" | grep -q "before promote fork .* (merge)" || fail "G10: no pre-merge safety row: $TL"
-echo "$TL" | grep -q "fork .* merge (0 merged, 1 replayed)" || fail "G10: no merge generation row: $TL"
+# Nothing merged by content, so the landing source is the fork's own
+# snapshot and no merged generation is built.
+echo "$TL" | grep -q "fork .* snapshot (1 paths)" || fail "G10: no landing-source row: $TL"
 SAFETY="$(echo "$TL" | awk '/before promote fork .* \(merge\)/{print $1; exit}' | tr -d '#')"
 acy rewind -y "$SAFETY" >/dev/null || fail "G10: rewind to safety checkpoint"
 [ ! -e "$R/undo.txt" ] || fail "G10: rewind did not undo the replay"
