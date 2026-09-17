@@ -457,7 +457,8 @@ fn promote_one(client: &mut Client, id: &str) -> Result<String, String> {
         }
         (None, paths, merged) if merged > 0 => {
             out.push_str(&format!(
-                "promoted by merge: {merged} file(s) merged, {paths} path(s) written in place, tree now at {}\nnote: {}\n",
+                "promoted by merge: {merged} file(s) merged, {paths} path(s) written in place, \
+                 tree now at {}\nnote: {}\n",
                 short_hex(&info.generation),
                 info.warning
             ));

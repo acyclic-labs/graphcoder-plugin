@@ -79,6 +79,45 @@ struct ForkMount {
     session: Option<NativeMountSession>,
 }
 
+/// Speculation is opt-in, per developer, from a file of its own; a
+/// malformed one disables it and says so rather than failing the daemon.
+fn spawn_speculation(
+    paths: &StorePaths,
+    handle: &pipeline::PipelineHandle,
+) -> (
+    Option<Arc<crate::speculate::SpecHandle>>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    let (speculate_config, speculate_warning) = SpeculateConfig::load();
+    if let Some(warning) = speculate_warning {
+        eprintln!("{NAME} daemon: speculation config: {warning}");
+    }
+    let speculation = crate::speculate::spawn(
+        speculate_config,
+        crate::speculate::SpecDeps {
+            index_db: paths.index_db(),
+            spec_db: paths.spec_db(),
+            spec_runs: paths.spec_runs(),
+            handle: handle.clone(),
+        },
+    );
+    let (spec, spec_thread) = match speculation {
+        Some((handle, thread)) => (Some(Arc::new(handle)), Some(thread)),
+        None => (None, None),
+    };
+    if let Some(spec) = spec.as_ref() {
+        eprintln!(
+            "{NAME} daemon: speculation on ({})",
+            if spec.config().spends_tokens() {
+                "precompute + model runs"
+            } else {
+                "precompute only, no model runs"
+            }
+        );
+    }
+    (spec, spec_thread)
+}
+
 pub fn run(repo_root: &Path) -> Result<(), String> {
     // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
     // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
@@ -154,34 +193,8 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     }
     // Speculation is opt-in, per developer, from a file of its own; a
     // malformed one disables it and says so rather than failing the daemon.
-    let (speculate_config, speculate_warning) = SpeculateConfig::load();
-    if let Some(warning) = speculate_warning {
-        eprintln!("{NAME} daemon: speculation config: {warning}");
-    }
-    let speculation = crate::speculate::spawn(
-        speculate_config,
-        crate::speculate::SpecDeps {
-            index_db: paths.index_db(),
-            spec_db: paths.spec_db(),
-            spec_runs: paths.spec_runs(),
-            handle: handle.clone(),
-        },
-    );
-    let (spec, spec_thread) = match speculation {
-        Some((handle, thread)) => (Some(Arc::new(handle)), Some(thread)),
-        None => (None, None),
-    };
+    let (spec, spec_thread) = spawn_speculation(&paths, &handle);
     lap("speculation spawn");
-    if let Some(spec) = spec.as_ref() {
-        eprintln!(
-            "{NAME} daemon: speculation on ({})",
-            if spec.config().spends_tokens() {
-                "precompute + model runs"
-            } else {
-                "precompute only, no model runs"
-            }
-        );
-    }
 
     let server = Server {
         mounts,
