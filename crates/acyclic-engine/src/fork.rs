@@ -93,11 +93,7 @@ pub fn mount_capability() -> MountCapability {
         MountCapability {
             provider,
             available: false,
-            reason: Some(
-                "ProjFS projects a fork but does not carry writes back to the store, \
-                 so forks use full copies (promote works the same)"
-                    .to_owned(),
-            ),
+            reason: Some("ProjFS does not carry fork writes back to the store".to_owned()),
         }
     }
     #[cfg(not(windows))]
@@ -129,11 +125,8 @@ pub fn mount_setup_hint() -> &'static str {
         )
     } else if cfg!(windows) {
         concat!(
-            "forks use full copies on Windows. ProjFS can project a fork, but it does\n",
-            "not carry writes back to the store, so a mounted fork would silently lose\n",
-            "your work; copies land correctly through `promote`. Nothing to install.\n",
-            "Safe Mode (dry_run) needs mounts, so it is unavailable on Windows for the\n",
-            "same reason.",
+            "forks use full copies on Windows; `promote` captures their changes.\n",
+            "Safe Mode (dry_run) is unavailable. Nothing to install.",
         )
     } else {
         "native mounts are not supported on this platform; forks use full copies \

@@ -636,9 +636,8 @@ impl SpeculateConfig {
         if let Some(explicit) = std::env::var_os(crate::product::SPECULATE_CONFIG_ENV) {
             return Some(std::path::PathBuf::from(explicit));
         }
-        std::env::var_os("HOME").map(|home| {
-            Path::new(&home).join(format!(".config/{}/speculate.toml", crate::product::NAME))
-        })
+        crate::home_dir()
+            .map(|home| home.join(format!(".config/{}/speculate.toml", crate::product::NAME)))
     }
 
     /// Loads the settings, or returns a disabled config.

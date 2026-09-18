@@ -192,6 +192,9 @@ enum Command {
     /// performs the matching engine action. Always exits 0 (never blocks the
     /// agent); a missing daemon is a silent no-op.
     Hook {
+        /// Host adapter invoking this hook (defaults to `ACYCLIC_HOST`, then `claude-code`).
+        #[arg(long)]
+        host: Option<String>,
         /// One of pre-tool, post-tool, user-prompt, session-start,
         /// session-end. Anything else is ignored (exit 0), never a usage
         /// error: a hook must not block the agent.
@@ -304,7 +307,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
         },
         Command::Init => init(repo),
         Command::Policy => policy(repo),
-        Command::Hook { event } => hook::run(repo, &event),
+        Command::Hook { event, host } => hook::run(repo, &event, host),
         Command::Mcp => match mcp::run(if cli.repo.is_none() {
             mcp::find_repo_root(repo)
         } else {

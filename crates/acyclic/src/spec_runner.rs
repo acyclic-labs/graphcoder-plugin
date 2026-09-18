@@ -75,6 +75,19 @@ impl RunSpace {
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_dir_all(&self.scratch);
     }
+
+    async fn clean_after_run(&self) {
+        self.clean();
+        #[cfg(windows)]
+        for _ in 0..20 {
+            if !self.scratch.exists() {
+                break;
+            }
+            // A terminated job can still hold directory handles briefly.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.clean();
+        }
+    }
 }
 
 impl Drop for RunSpace {
@@ -161,7 +174,7 @@ pub async fn run(
             RunOutcome::Cancelled
         }
     };
-    space.clean();
+    space.clean_after_run().await;
     outcome
 }
 
@@ -448,9 +461,12 @@ mod tests {
     #[test]
     fn stdin_reaches_the_child_and_stdout_comes_back() {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let outcome = run_blocking(spec(&["cat"], "the diff"), dir.path());
+        #[cfg(windows)]
+        let outcome = run_blocking(spec(&["cmd", "/c", "more"], "the diff"), dir.path());
         match outcome {
-            RunOutcome::Ready { body } => assert_eq!(body, "the diff"),
+            RunOutcome::Ready { body } => assert_eq!(body.trim(), "the diff"),
             other => panic!("expected a body, got {other:?}"),
         }
     }
@@ -458,7 +474,10 @@ mod tests {
     #[test]
     fn output_over_the_cap_is_refused_rather_than_stored() {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let mut spec = spec(&["cat"], &"x".repeat(2048));
+        #[cfg(windows)]
+        let mut spec = spec(&["cmd", "/c", "more"], &"x".repeat(2048));
         spec.max_output_bytes = 16;
         assert!(matches!(
             run_blocking(spec, dir.path()),
@@ -469,8 +488,14 @@ mod tests {
     #[test]
     fn a_failing_command_reports_its_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let outcome = run_blocking(
             spec(&["sh", "-c", "echo went wrong >&2; exit 3"], ""),
+            dir.path(),
+        );
+        #[cfg(windows)]
+        let outcome = run_blocking(
+            spec(&["cmd", "/c", "echo went wrong 1>&2 & exit /b 3"], ""),
             dir.path(),
         );
         match outcome {
@@ -498,7 +523,10 @@ mod tests {
     #[test]
     fn a_slow_command_times_out_and_leaves_nothing_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let mut spec = spec(&["sleep", "30"], "");
+        #[cfg(windows)]
+        let mut spec = spec(&["cmd", "/c", "ping -n 30 127.0.0.1 >NUL"], "");
         spec.timeout = Duration::from_millis(150);
         assert!(matches!(
             run_blocking(spec, dir.path()),
@@ -512,7 +540,21 @@ mod tests {
     #[test]
     fn the_child_runs_in_an_empty_scratch_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let outcome = run_blocking(spec(&["sh", "-c", "ls -A | wc -l"], ""), dir.path());
+        #[cfg(windows)]
+        let outcome = run_blocking(
+            spec(
+                &[
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-ChildItem -Force | Measure-Object).Count",
+                ],
+                "",
+            ),
+            dir.path(),
+        );
         match outcome {
             RunOutcome::Ready { body } => assert_eq!(body.trim(), "0"),
             other => panic!("expected a body, got {other:?}"),

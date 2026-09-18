@@ -103,4 +103,18 @@ if "$ACYCLIC" __daemon "$REPO" < /dev/null > /dev/null 2>&1; then
   fail "a second daemon started against a live store"
 fi
 
+echo "--- Codex and Cursor hooks run in a Windows shell"
+"$ACYCLIC" install codex < /dev/null > /dev/null || fail "Codex install failed"
+"$ACYCLIC" install cursor < /dev/null > /dev/null || fail "Cursor install failed"
+grep -Fq '"command": "acyclic hook --host codex user-prompt"' .codex/hooks.json \
+  || fail "Codex hook still uses shell-specific syntax"
+grep -Fq '"command": "acyclic hook --host cursor user-prompt"' .cursor/hooks.json \
+  || fail "Cursor hook still uses shell-specific syntax"
+ACYCLIC_WIN="$(cygpath -w "$ACYCLIC")"
+export ACYCLIC_WIN
+powershell -NoProfile -Command '& $env:ACYCLIC_WIN hook --host codex user-prompt' < /dev/null \
+  || fail "Codex hook command failed in PowerShell"
+powershell -NoProfile -Command '& $env:ACYCLIC_WIN hook --host cursor user-prompt' < /dev/null \
+  || fail "Cursor hook command failed in PowerShell"
+
 echo "windows-smoke: green"

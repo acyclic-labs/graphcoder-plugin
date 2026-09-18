@@ -107,8 +107,13 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-111 workspace tests pass. `acyclic-qual` builds and tests on Windows too —
+The workspace tests pass. `acyclic-qual` builds and tests on Windows too —
 an earlier draft of this document claimed it could not, which was wrong.
+
+Codex and Cursor hook commands pass their host with `acyclic hook --host ...`.
+This form runs under Windows and Unix shells without an environment-assignment
+prefix. Re-run `acyclic install codex` or `acyclic install cursor` to replace
+hook commands written by older releases.
 
 ### 3. The daemon serves, including through a pipe
 

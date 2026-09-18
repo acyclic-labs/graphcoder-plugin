@@ -40,9 +40,9 @@ impl StorePaths {
         let base = if let Some(path) = stores_root {
             path.to_path_buf()
         } else {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| EngineError::Store("HOME is not set".into()))?;
-            Path::new(&home).join(format!(".local/share/{}/stores", crate::product::NAME))
+            let home = crate::home_dir()
+                .ok_or_else(|| EngineError::Store("home directory is unavailable".into()))?;
+            home.join(format!(".local/share/{}/stores", crate::product::NAME))
         };
         let canonical = repo_root
             .canonicalize()

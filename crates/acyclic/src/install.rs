@@ -181,7 +181,7 @@ const MUTATING_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch
 /// Code and Codex use the same event names and payload shape; only the
 /// container file's shape around this table differs. `host`, when it's
 /// anything other than `acyclic hook`'s default (`claude-code`), is passed
-/// through `ACYCLIC_HOST` so `session-start` records the right adapter and
+/// through `--host` so `session-start` records the right adapter and
 /// Cursor's permission-controlled hooks get their required JSON reply.
 fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] {
     let cmd = |event: HookEvent| {
@@ -189,7 +189,7 @@ fn hook_events(host: &str) -> [(&'static str, Option<&'static str>, String); 5] 
         if host == "claude-code" {
             format!("{NAME} hook {verb}")
         } else {
-            format!("ACYCLIC_HOST={host} {NAME} hook {verb}")
+            format!("{NAME} hook --host {host} {verb}")
         }
     };
     [
@@ -272,8 +272,8 @@ fn merge_event_hooks(
     Ok(())
 }
 
-/// An entry is ours iff one of its commands invokes `acyclic hook`, with or
-/// without our `ACYCLIC_HOST=<host>` env prefix (Codex/Cursor). Structural,
+/// An entry is ours iff one of its commands invokes `acyclic hook`, with
+/// `--host` or the legacy `ACYCLIC_HOST=<host>` prefix. Structural,
 /// not substring-over-JSON: a user hook that merely mentions the phrase in
 /// an argument is left alone.
 fn is_ours(entry: &Value) -> bool {
@@ -403,7 +403,7 @@ fn merge_cursor_hooks(hooks_path: &Path) -> Result<(), String> {
         entries.retain(|entry| !is_our_cursor_entry(entry));
         entries.push(json!({
             "type": "command",
-            "command": format!("ACYCLIC_HOST=cursor {NAME} hook {verb}"),
+            "command": format!("{NAME} hook --host cursor {verb}"),
         }));
     }
 
@@ -818,8 +818,8 @@ static COPILOT_CLI: McpHost = McpHost {
 /// what lets the acceptance test point the CLI at a scratch dir.
 fn copilot_cli_config_path() -> Result<PathBuf, String> {
     copilot_cli_config_path_from(
-        std::env::var("COPILOT_HOME").ok(),
-        std::env::var("HOME").ok(),
+        std::env::var_os("COPILOT_HOME").map(PathBuf::from),
+        acyclic_engine::home_dir(),
     )
 }
 
@@ -827,15 +827,14 @@ fn copilot_cli_config_path() -> Result<PathBuf, String> {
 /// so it is testable without mutating process env (which races the other
 /// tests in this binary).
 fn copilot_cli_config_path_from(
-    copilot_home: Option<String>,
-    home: Option<String>,
+    copilot_home: Option<PathBuf>,
+    home: Option<PathBuf>,
 ) -> Result<PathBuf, String> {
     copilot_home
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".copilot")))
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| home.map(|home| home.join(".copilot")))
         .map(|base| base.join("mcp-config.json"))
-        .ok_or_else(|| "neither COPILOT_HOME nor HOME is set".to_owned())
+        .ok_or_else(|| "neither COPILOT_HOME nor a home directory is available".to_owned())
 }
 
 /// macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`.
@@ -1568,7 +1567,7 @@ mod tests {
         }
         assert_eq!(
             value["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            format!("ACYCLIC_HOST=codex {NAME} hook session-start")
+            format!("{NAME} hook --host codex session-start")
         );
 
         let agents_md = std::fs::read_to_string(dir.path().join("AGENTS.md")).expect("read");
@@ -1644,7 +1643,7 @@ mod tests {
         }
         assert_eq!(
             value["hooks"]["beforeShellExecution"][0]["command"],
-            format!("ACYCLIC_HOST=cursor {NAME} hook pre-tool")
+            format!("{NAME} hook --host cursor pre-tool")
         );
 
         let rule = std::fs::read_to_string(dir.path().join(format!(".cursor/rules/{NAME}.mdc")))
@@ -1970,18 +1969,18 @@ mod tests {
     /// variable is meant to be.
     #[test]
     fn copilot_cli_config_path_honours_copilot_home() {
-        let home = Some("/Users/dev".to_owned());
+        let home = Some(PathBuf::from("/Users/dev"));
         assert_eq!(
             copilot_cli_config_path_from(None, home.clone()).expect("path"),
             PathBuf::from("/Users/dev/.copilot/mcp-config.json")
         );
         assert_eq!(
-            copilot_cli_config_path_from(Some("/opt/copilot".to_owned()), home.clone())
+            copilot_cli_config_path_from(Some(PathBuf::from("/opt/copilot")), home.clone())
                 .expect("path"),
             PathBuf::from("/opt/copilot/mcp-config.json")
         );
         assert_eq!(
-            copilot_cli_config_path_from(Some(String::new()), home).expect("path"),
+            copilot_cli_config_path_from(Some(PathBuf::new()), home).expect("path"),
             PathBuf::from("/Users/dev/.copilot/mcp-config.json"),
             "empty COPILOT_HOME falls back to HOME"
         );
@@ -2133,6 +2132,9 @@ mod tests {
 
     #[test]
     fn is_our_command_recognizes_host_prefixed_form() {
+        assert!(is_our_command(&format!(
+            "{NAME} hook --host cursor pre-tool"
+        )));
         assert!(is_our_command(&format!(
             "ACYCLIC_HOST=cursor {NAME} hook pre-tool"
         )));

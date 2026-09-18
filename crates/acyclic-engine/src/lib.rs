@@ -34,6 +34,25 @@ pub fn unix_now() -> i64 {
         })
 }
 
+/// Returns the current user's home directory across supported platforms.
+///
+/// Unix shells conventionally provide `HOME`; Windows provides
+/// `USERPROFILE` instead.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        })
+}
+
 /// The first 12 hex digits of a generation id, as every listing prints it.
 /// A shorter (malformed) string is returned whole rather than panicking.
 pub fn short_hex(hex: &str) -> &str {
