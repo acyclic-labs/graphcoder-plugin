@@ -1,8 +1,9 @@
 //! The per-repo daemon: owns the pipeline, serves the unix socket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::ipc;
 use acyclic_engine::config::Config;
@@ -77,6 +78,55 @@ struct PendingSession {
 struct ForkMount {
     router: Arc<RoutedMountSource>,
     session: Option<NativeMountSession>,
+}
+
+/// Accepts connections until a stop, a signal, or the idle-exit clock.
+async fn serve_until_done(
+    server: Server,
+    mut listener: ipc::Listener,
+    shutdown: Arc<Notify>,
+    handle: PipelineHandle,
+) {
+    let idle_exit = Duration::from_millis(server.config.daemon_idle_exit_ms);
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok(stream) = accepted else { continue };
+                let server = server.clone();
+                tokio::spawn(async move { server.serve(stream).await });
+            }
+            _ = idle_tick.tick() => {
+                if !idle_exit.is_zero() && server.idle_for(idle_exit).await {
+                    eprintln!(
+                        "{NAME} daemon: idle for {}s with no session or fork; exiting \
+                         (the next session start brings it back)",
+                        idle_exit.as_secs()
+                    );
+                    break;
+                }
+            }
+            _ = shutdown.notified() => break,
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    let _ = handle.shutdown().await;
+}
+
+/// Binds the daemon socket and writes the pidfile. A stale socket from a
+/// dead daemon is removed; a live one refuses the second daemon via bind
+/// failure after the removal race.
+fn bind_socket(
+    runtime: &tokio::runtime::Runtime,
+    paths: &StorePaths,
+) -> Result<ipc::Listener, String> {
+    ipc::cleanup(&paths.socket());
+    let listener = runtime
+        .block_on(async { ipc::Listener::bind(&paths.socket()) })
+        .map_err(|error| format!("bind {}: {error}", ipc::endpoint_display(&paths.socket())))?;
+    std::fs::write(paths.pidfile(), std::process::id().to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(listener)
 }
 
 /// Speculation is opt-in, per developer, from a file of its own; a
@@ -157,6 +207,13 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     lap("sweep stale spec runs");
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    // Socket + pidfile FIRST, before the store opens: a client can then
+    // connect at once and decide how long to wait for readiness (the
+    // session-start hook waits 300ms), instead of polling a missing socket
+    // through an O(history) store open. A stale socket from a dead daemon
+    // is removed; a live one refuses the second daemon via bind failure.
+    let listener = bind_socket(&runtime, &paths)?;
+    lap("socket bind + pidfile");
     let store = runtime
         .block_on(Store::open(paths.clone()))
         .map_err(|error| error.to_string())?;
@@ -166,16 +223,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     lap("index open");
     let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
     lap("pipeline thread spawn (baseline runs on it)");
-
-    // Socket + pidfile. A stale socket from a dead daemon is removed; a live
-    // one refuses the second daemon via bind failure after removal race.
-    ipc::cleanup(&paths.socket());
-    let mut listener = runtime
-        .block_on(async { ipc::Listener::bind(&paths.socket()) })
-        .map_err(|error| format!("bind {}: {error}", ipc::endpoint_display(&paths.socket())))?;
-    std::fs::write(paths.pidfile(), std::process::id().to_string())
-        .map_err(|error| error.to_string())?;
-    lap("socket bind + pidfile");
 
     let shutdown = Arc::new(Notify::new());
     let mut mounts = fork::mount_capability();
@@ -212,22 +259,12 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         dry_session: Arc::new(Mutex::new(None)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         spec,
+        live_sessions: Arc::new(Mutex::new(HashSet::new())),
+        last_activity: Arc::new(Mutex::new(Instant::now())),
+        store_bytes: Arc::new(Mutex::new(None)),
     };
 
-    runtime.block_on(async move {
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let Ok(stream) = accepted else { continue };
-                    let server = server.clone();
-                    tokio::spawn(async move { server.serve(stream).await });
-                }
-                _ = shutdown.notified() => break,
-                _ = tokio::signal::ctrl_c() => break,
-            }
-        }
-        let _ = handle.shutdown().await;
-    });
+    runtime.block_on(serve_until_done(server, listener, shutdown, handle));
 
     let _ = pipeline_thread.join();
     if let Some(thread) = spec_thread {
@@ -257,6 +294,14 @@ struct Server {
     /// The speculation scheduler, when it is enabled. `None` makes every
     /// call site a no-op, so the default path costs nothing.
     spec: Option<Arc<crate::speculate::SpecHandle>>,
+    /// Sessions that started and have not ended: the daemon does not idle
+    /// out while one is open.
+    live_sessions: Arc<Mutex<HashSet<String>>>,
+    /// When the last request arrived; the idle-exit clock.
+    last_activity: Arc<Mutex<Instant>>,
+    /// `store size` for `status`, refreshed in the background: walking the
+    /// object directory costs ~1s on an aged store.
+    store_bytes: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 impl Server {
@@ -315,12 +360,49 @@ impl Server {
         payload
     }
 
+    /// True when nothing has needed this daemon for `idle`: no request, no
+    /// open session, no live fork, no Safe Mode session, nothing pending.
+    async fn idle_for(&self, idle: Duration) -> bool {
+        self.last_activity.lock().await.elapsed() >= idle
+            && self.live_sessions.lock().await.is_empty()
+            && self.forks.lock().await.is_empty()
+            && self.dry_session.lock().await.is_none()
+            && self.pending.lock().await.is_empty()
+    }
+
+    /// The store's size on disk, from a cache that a background walk
+    /// refreshes once it is a minute old. Only the very first call walks.
+    async fn store_size(&self) -> u64 {
+        const FRESH: Duration = Duration::from_secs(60);
+        let root = self.store_root.join("store");
+        let cached = *self.store_bytes.lock().await;
+        match cached {
+            Some((at, bytes)) if at.elapsed() < FRESH => bytes,
+            Some((_, bytes)) => {
+                let cache = Arc::clone(&self.store_bytes);
+                tokio::task::spawn_blocking(move || {
+                    let fresh = directory_bytes(&root);
+                    if let Ok(mut slot) = cache.try_lock() {
+                        *slot = Some((Instant::now(), fresh));
+                    }
+                });
+                bytes
+            }
+            None => {
+                let bytes = tokio::task::block_in_place(|| directory_bytes(&root));
+                *self.store_bytes.lock().await = Some((Instant::now(), bytes));
+                bytes
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
         reason = "one arm per protocol Op; the wire-to-engine table reads best whole"
     )]
     async fn dispatch_inner(&self, op: proto::Op) -> Result<proto::Reply, String> {
+        *self.last_activity.lock().await = Instant::now();
         match op {
             proto::Op::Ping => Ok(proto::Reply::Pong),
             proto::Op::Status => {
@@ -329,7 +411,7 @@ impl Server {
                     state: format!("{:?}", status.state).to_lowercase(),
                     last_checkpoint: status.last_checkpoint,
                     unpublished: status.unpublished,
-                    store_bytes: directory_bytes(&self.store_root.join("store")),
+                    store_bytes: self.store_size().await,
                     repo_root: self.repo_root.display().to_string(),
                     mount_provider: self.mounts.provider.to_owned(),
                     mount_available: self.mounts.available,
@@ -623,6 +705,7 @@ impl Server {
                 )))
             }
             proto::Op::SessionStart { session_id, host } => {
+                self.live_sessions.lock().await.insert(session_id.clone());
                 self.handle
                     .session_started(session_id.clone(), host)
                     .await
@@ -633,6 +716,7 @@ impl Server {
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionEnd { session_id } => {
+                self.live_sessions.lock().await.remove(&session_id);
                 self.handle
                     .session_ended(session_id.clone())
                     .await
@@ -1588,13 +1672,12 @@ impl Server {
         let restore_ms = acyclic_engine::trace::ms(restore_started);
         let written = u32::try_from(restored.outcomes.len()).unwrap_or(u32::MAX);
         let landed_generation = restored.generation;
-        let commit_started = std::time::Instant::now();
-        self.handle.commit().await.map_err(stringify)?;
+        // No inline publish: the landed row is a checkpoint like any other
+        // and the idle timer publishes it. Authority publish is O(tree).
         acyclic_engine::trace!(
             "daemon",
             "promote {id}: landing {written} path(s): record rows {pre_ms:.1}ms, \
-             restore {restore_ms:.1}ms, commit {:.1}ms, land total {:.1}ms",
-            acyclic_engine::trace::ms(commit_started),
+             restore {restore_ms:.1}ms, land total {:.1}ms",
             acyclic_engine::trace::ms(land_started)
         );
         Ok(Landed::Replayed {

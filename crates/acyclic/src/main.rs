@@ -338,6 +338,13 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                     eprintln!("{}: daemon not running; checkpoint skipped", product::NAME);
                     return EXIT_NO_DAEMON;
                 }
+                Err(ConnectError::Starting) => {
+                    eprintln!(
+                        "{}: daemon still starting; checkpoint skipped",
+                        product::NAME
+                    );
+                    return EXIT_NO_DAEMON;
+                }
                 Err(ConnectError::Other(message)) => {
                     eprintln!("{}: {message}", product::NAME);
                     return 1;
@@ -560,6 +567,7 @@ fn init(repo: &Path) -> i32 {
         // Spawning the daemon builds (or refreshes) the baseline.
         let mut client = connect(repo, Spawn::Allowed).map_err(|error| match error {
             ConnectError::NoDaemon => "daemon failed to start".to_owned(),
+            ConnectError::Starting => "daemon is still starting".to_owned(),
             ConnectError::Other(message) => message,
         })?;
         client.call(proto::Op::Ping)?;

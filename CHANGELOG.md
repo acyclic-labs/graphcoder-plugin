@@ -9,6 +9,24 @@ Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
 
 ### Changed
 
+- **A cold daemon no longer delays the agent's first turn.** The session-start
+  hook waits at most 300ms for the daemon; past that it prints a one-line
+  notice and returns while the first snapshot builds in the background (251s
+  on a 5,000-file tree, previously all of it in front of the first token).
+  The daemon binds its socket before it opens the store, so the wait is bounded
+  even on an aged store. Tool hooks during the build return in under 100ms.
+- **Fork and promote no longer publish inline.** The authority publish is
+  O(tree) (7s per fork and 6s per promote on 5,000 files); it now runs on the
+  existing idle and every-N timers, like every other checkpoint. A fork is cut
+  at its exact base generation, published or not.
+- **The daemon exits after an hour idle** with no session, fork, or Safe Mode
+  session (`daemon_idle_exit_ms`, 0 disables). Twenty daemons were found alive
+  on one machine, eleven for repos that no longer existed.
+- `acyclic status` reports the store size from a cache refreshed in the
+  background instead of walking the object directory on every call.
+
+### Changed
+
 - **Promote is ~50x faster.** An 8-fork partition round measured 18s per
   promote; it is now 0.15–0.35s, and `acyclic promote <id> <id> ...` lands
   several forks in one call (8 forks in 2.5s). Three causes, three fixes:
