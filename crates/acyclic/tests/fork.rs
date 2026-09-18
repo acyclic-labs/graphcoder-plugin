@@ -17,7 +17,7 @@ use std::time::Duration;
 use acyclic::config::Config;
 use acyclic::fork::{PromoteOutcome, SessionResolveOutcome};
 use acyclic::index::{Attribution, CheckpointKind, Index};
-use acyclic::pipeline::{self, PipelineHandle};
+use acyclic::pipeline::{self, PipelineHandle, State};
 use acyclic::store::{Store, StorePaths};
 use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::model::VolumeLimits;
@@ -118,6 +118,23 @@ async fn write_in_fork(seed: &acyclic::fork::ForkSeed, path: &str, bytes: &[u8])
         .expect("create file in fork overlay");
 }
 
+fn assert_watcher_recovers_after_swap(rig: &Rig) {
+    rig.runtime.block_on(async {
+        rig.handle
+            .checkpoint(CheckpointKind::Post, Attribution::default())
+            .await
+            .expect("checkpoint after root swap");
+        let status = rig.handle.status().await.expect("status after root swap");
+        assert_eq!(status.state, State::Ready, "{status:?}");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(status.watcher.invalidations, 0, "{status:?}");
+        // FSEvents can replay a root move after the new watcher opens. A
+        // bounded recovery scan is safe; discarding that hint is not.
+        #[cfg(target_os = "macos")]
+        assert!(status.watcher.invalidations <= 1, "{status:?}");
+    });
+}
+
 /// P1 + P5: promote lands the fork's exact content and records attribution.
 #[test]
 fn promote_lands_fork_changes() {
@@ -162,6 +179,7 @@ fn promote_lands_fork_changes() {
     assert!(rows.iter().any(|row| {
         row.kind == CheckpointKind::Manual && row.label.as_deref() == Some("promote test-fork")
     }));
+    assert_watcher_recovers_after_swap(&rig);
     rig.finish();
 }
 
@@ -207,6 +225,7 @@ fn resolve_then_apply_session_lands_fork_changes() {
         std::fs::read(rig.repo_path().join("fork-note.txt")).expect("landed file"),
         b"written in fork\n"
     );
+    assert_watcher_recovers_after_swap(&rig);
     rig.finish();
 }
 

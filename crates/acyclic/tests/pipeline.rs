@@ -127,8 +127,16 @@ fn checkpoint_rewind_journey() {
         );
 
         // Diff before → after names exactly the changed paths.
+        handle
+            .checkpoint(CheckpointKind::Post, Attribution::default())
+            .await
+            .expect("checkpoint after rewind");
         let status = handle.status().await.expect("status");
         assert_eq!(status.state, pipeline::State::Ready);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(status.watcher.invalidations, 0, "{status:?}");
+        #[cfg(target_os = "macos")]
+        assert!(status.watcher.invalidations <= 1, "{status:?}");
         handle.shutdown().await.expect("shutdown");
         (before.generation, after.generation)
     });

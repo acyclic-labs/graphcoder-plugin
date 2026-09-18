@@ -768,7 +768,7 @@ struct Pipeline {
     store: Store,
     index: Index,
     config: Config,
-    watch: NativeWatch,
+    watch: Option<NativeWatch>,
     options: CaptureOptions,
     /// Paths that never enter a checkpoint (`exclude` in the config).
     exclusions: Exclusions,
@@ -913,7 +913,7 @@ impl Pipeline {
             store,
             index,
             config,
-            watch,
+            watch: Some(watch),
             options,
             exclusions,
             cancel,
@@ -969,6 +969,8 @@ impl Pipeline {
         // batch; fold them in before declaring Ready.
         let batch = self
             .watch
+            .as_mut()
+            .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
             .finish_rescan()
             .map_err(EngineError::fs("finish rescan"))?;
         // A root hint here is already covered by the rescan that just ran.
@@ -1415,6 +1417,8 @@ impl Pipeline {
             polls += 1;
             let batch = self
                 .watch
+                .as_mut()
+                .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
                 .poll(POLL_CHANGES, WorkCounters::UNBOUNDED, &self.cancel)
                 .map_err(EngineError::fs("watch poll"))?
                 .value;
@@ -1685,20 +1689,7 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
-        let outcome = rewind::execute(
-            &self.store,
-            target.generation,
-            self.config.trash_ttl_days,
-            &self.exclusions,
-        )
-        .await;
-
-        // The swap replaced the repo directory's inode: the pinned root
-        // identity and the watcher both point at the old tree. Rebuild both,
-        // then re-baseline.
-        self.reset_watch().await?;
-        self.baseline(CheckpointKind::Recovered).await?;
-        outcome
+        self.swap_root_and_rebaseline(target.generation).await
     }
 
     /// Single-path restore, bracketed by checkpoints: a `manual` safety row
@@ -2097,16 +2088,7 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(
-            &self.store,
-            generation,
-            self.config.trash_ttl_days,
-            &self.exclusions,
-        )
-        .await;
-        self.reset_watch().await?;
-        self.baseline(CheckpointKind::Recovered).await?;
-        let swap = swap?;
+        let swap = self.swap_root_and_rebaseline(generation).await?;
         Ok(PromoteOutcome::Promoted {
             generation,
             old_tree: Some(swap.old_tree),
@@ -2137,6 +2119,8 @@ impl Pipeline {
             self.reset_watch().await?;
             let _ = self
                 .watch
+                .as_mut()
+                .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
                 .finish_rescan()
                 .map_err(EngineError::fs("finish rescan"))?;
             self.state = State::Ready;
@@ -2238,7 +2222,21 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(
+        let swap = self.swap_root_and_rebaseline(generation).await?;
+        Ok(PromoteOutcome::Promoted {
+            generation,
+            old_tree: Some(swap.old_tree),
+        })
+    }
+
+    /// Stops the old event source before the intentional root exchange. An
+    /// old callback must never publish a hint into the new watcher's epoch.
+    async fn swap_root_and_rebaseline(
+        &mut self,
+        generation: GenerationId,
+    ) -> Result<RewindOutcome> {
+        drop(self.watch.take());
+        let outcome = rewind::execute(
             &self.store,
             generation,
             self.config.trash_ttl_days,
@@ -2247,11 +2245,7 @@ impl Pipeline {
         .await;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
-        let swap = swap?;
-        Ok(PromoteOutcome::Promoted {
-            generation,
-            old_tree: Some(swap.old_tree),
-        })
+        outcome
     }
 
     /// Reopens the watcher and recomputes the capture root identity — needed
@@ -2264,16 +2258,20 @@ impl Pipeline {
         let repo_root = self.store.repo_root.clone();
         self.options.expected_root_identity =
             capture_root_identity(&repo_root).map_err(EngineError::fs("root identity"))?;
-        self.watch = NativeWatch::open(
-            &repo_root,
-            NativeWatchOptions {
-                limits: VolumeLimits::default(),
-                maximum_queued_changes: WATCH_QUEUE,
-                recursive: true,
-            },
-        )
-        .map_err(EngineError::fs("reopen watcher"))?;
+        self.watch = Some(
+            NativeWatch::open(
+                &repo_root,
+                NativeWatchOptions {
+                    limits: VolumeLimits::default(),
+                    maximum_queued_changes: WATCH_QUEUE,
+                    recursive: true,
+                },
+            )
+            .map_err(EngineError::fs("reopen watcher"))?,
+        );
         self.watch
+            .as_mut()
+            .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
             .begin_rescan()
             .map_err(EngineError::fs("begin rescan"))?;
         Ok(())
