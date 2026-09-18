@@ -721,16 +721,45 @@ fn ensure_auto_kind_allowed(connection: &Connection) -> Result<()> {
 
 /// Bounded, single-line prompt excerpt: whitespace runs collapsed, cut on a
 /// char boundary at [`PROMPT_EXCERPT_BYTES`] with an ellipsis.
+///
+/// The original prompt is scanned only until the excerpt fills.
 pub fn excerpt(prompt: &str) -> String {
-    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= PROMPT_EXCERPT_BYTES {
-        return collapsed;
+    let mut collapsed = String::with_capacity(PROMPT_EXCERPT_BYTES);
+    let mut words = prompt.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        let separator = usize::from(!collapsed.is_empty());
+        let remaining = PROMPT_EXCERPT_BYTES.saturating_sub(collapsed.len() + separator);
+        if word.len() > remaining {
+            let target = PROMPT_EXCERPT_BYTES - 1;
+            if separator != 0 && collapsed.len() < target {
+                collapsed.push(' ');
+            }
+            if word.len() >= target.saturating_sub(collapsed.len()) {
+                for character in word.chars() {
+                    if collapsed.len() + character.len_utf8() > target {
+                        break;
+                    }
+                    collapsed.push(character);
+                }
+            } else {
+                collapsed.push_str(word);
+            }
+            collapsed.push('…');
+            return collapsed;
+        }
+        if separator != 0 {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+        if collapsed.len() == PROMPT_EXCERPT_BYTES && words.peek().is_some() {
+            if let Some((index, _)) = collapsed.char_indices().next_back() {
+                collapsed.truncate(index);
+            }
+            collapsed.push('…');
+            return collapsed;
+        }
     }
-    let mut cut = PROMPT_EXCERPT_BYTES - 1;
-    while !collapsed.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", collapsed.get(..cut).unwrap_or(&collapsed))
+    collapsed
 }
 
 fn now() -> i64 {
@@ -1050,6 +1079,45 @@ mod tests {
         assert!(cut.len() <= PROMPT_EXCERPT_BYTES + "…".len());
         assert!(cut.ends_with('…'));
         assert_eq!(excerpt("a  b\n\tc"), "a b c");
+        let exact = "x".repeat(PROMPT_EXCERPT_BYTES);
+        assert_eq!(excerpt(&exact), exact);
+        assert_eq!(
+            excerpt(&format!("{exact} tail")),
+            format!("{}…", "x".repeat(PROMPT_EXCERPT_BYTES - 1))
+        );
+        let boundary = format!("{} é", "x".repeat(PROMPT_EXCERPT_BYTES - 2));
+        assert_eq!(
+            excerpt(&boundary),
+            format!("{} …", "x".repeat(PROMPT_EXCERPT_BYTES - 2))
+        );
+    }
+
+    #[test]
+    fn excerpt_matches_the_full_normalization_model() {
+        fn full(prompt: &str) -> String {
+            let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.len() <= PROMPT_EXCERPT_BYTES {
+                return collapsed;
+            }
+            let mut cut = PROMPT_EXCERPT_BYTES - 1;
+            while !collapsed.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}…", collapsed.get(..cut).expect("character boundary"))
+        }
+
+        let atoms = ["a", " ", "\n", "é", "☃", "𐍈", " ", "xyz"];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..1_000 {
+            let mut prompt = String::new();
+            for _ in 0..400 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                prompt.push_str(atoms[(state as usize) % atoms.len()]);
+            }
+            assert_eq!(excerpt(&prompt), full(&prompt));
+        }
     }
 
     #[test]
