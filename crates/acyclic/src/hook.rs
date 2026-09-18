@@ -40,6 +40,19 @@ struct Payload {
     /// run, standing in for `tool_name` when that field is absent.
     #[serde(default)]
     command: Option<String>,
+    /// `PreToolUse`: what the tool is about to touch. Edit/Write/MultiEdit
+    /// name a path here; Bash does not, and a shell command can touch
+    /// anything — which is why a missing path records a wildcard.
+    #[serde(default)]
+    tool_input: Option<ToolInput>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ToolInput {
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 impl Payload {
@@ -131,6 +144,18 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     let _ = std::io::stdin().read_to_string(&mut raw);
     let mut payload = parse_payload(&raw);
     let host = std::env::var("ACYCLIC_HOST").unwrap_or_else(|_| "claude-code".into());
+
+    // Before the connect, deliberately. A lease says what the agent is about
+    // to touch, and that is worth recording whether or not a daemon is up —
+    // the connect returns early when there is none, so recording afterwards
+    // would silently stop working exactly when checkpointing is off.
+    if event == HookEvent::PreTool {
+        let path = payload
+            .tool_input
+            .as_ref()
+            .and_then(|i| i.file_path.as_deref().or(i.path.as_deref()));
+        record_lease(repo, payload.tool_name.as_deref(), path);
+    }
 
     // A session start may spawn the daemon, but never waits for its first
     // snapshot: the agent's first turn is behind this hook.
@@ -237,6 +262,60 @@ pub fn run(repo: &Path, event: &str) -> i32 {
 /// a checkpoint with no session id beats a dropped one.
 fn parse_payload(raw: &str) -> Payload {
     serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Record what the agent is *about* to touch, for anything scheduling work
+/// alongside it.
+///
+/// Two decisions here, both forced by measurement.
+///
+/// **It rides on the pre-tool hook** rather than being a hook of its own. A
+/// separate hook process measured ~10ms at best against this binary's own
+/// ~10ms, so a second hook roughly doubles what every Edit, Write and Bash
+/// pays — to record a path this process is already holding. Here the marginal
+/// cost is one append.
+///
+/// **It writes into the STORE, not the repo.** The obvious placement,
+/// `<repo>/.speculation/leases`, took the pre-tool hook from 65ms to 120ms with
+/// a daemon running: a write inside the tree wakes the watcher, and this very
+/// hook then waits for the resulting checkpoint. The lease write became work
+/// the lease writer waited on. It would also have shown up in every blast
+/// radius as a changed path. Outside the tree, neither happens.
+///
+/// Every failure is swallowed. A hook may not break a tool call, and a missing
+/// lease only means a speculator schedules more conservatively.
+fn record_lease(repo: &Path, tool: Option<&str>, path: Option<&str>) {
+    use std::io::Write;
+
+    // An off switch, because this sits on the agent's critical path. Anything
+    // that runs on every Edit, Write and Bash should be disableable without a
+    // rebuild.
+    if std::env::var_os("ACYCLIC_NO_LEASES").is_some() {
+        return;
+    }
+    let Ok(paths) = crate::store_paths(repo) else {
+        return;
+    };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Repo-relative, and no tab: the file is tab separated and a reader must
+    // never mis-split a line.
+    let path = path
+        .map(|p| {
+            p.trim_start_matches(&*repo.to_string_lossy())
+                .trim_start_matches('/')
+        })
+        .filter(|p| !p.is_empty() && !p.contains('\t'))
+        .unwrap_or("*");
+    let tool = tool.filter(|t| !t.contains('\t')).unwrap_or("?");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.root.join("leases"))
+    {
+        let _ = writeln!(f, "{at}\t{tool}\t{path}");
+    }
 }
 
 fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
