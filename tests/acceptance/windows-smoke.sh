@@ -91,6 +91,13 @@ printf 'edited in fork\n' > "$fork_dir/a.txt"
 grep -q 'FORK WORK' note.txt || fail "promote did not land note.txt"
 grep -q 'edited in fork' a.txt || fail "promote did not land a.txt"
 
+echo "--- daemon restart retains promoted files and timeline"
+"$ACYCLIC" stop < /dev/null > /dev/null || fail "stop failed"
+"$ACYCLIC" timeline < /dev/null | grep -q baseline \
+  || fail "timeline did not recover after restart"
+grep -q 'FORK WORK' note.txt || fail "restart lost promoted note.txt"
+grep -q 'edited in fork' a.txt || fail "restart lost promoted a.txt"
+
 echo "--- a second daemon refuses the store"
 if "$ACYCLIC" __daemon "$REPO" < /dev/null > /dev/null 2>&1; then
   fail "a second daemon started against a live store"
