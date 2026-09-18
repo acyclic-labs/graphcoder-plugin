@@ -54,16 +54,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/windows-pipe-acl.ps1"
   || fail "the daemon pipe is not owner-only"
 
 echo "--- checkpoint and timeline"
-# Wait for the observable baseline, not an assumed startup duration.
-baseline_ready=false
-for _ in {1..100}; do
-  if "$ACYCLIC" timeline < /dev/null 2>/dev/null | grep -q baseline; then
-    baseline_ready=true
-    break
-  fi
-  sleep 0.05
-done
-[ "$baseline_ready" = true ] || fail "baseline did not become ready"
+# `init` pings the pipeline, whose reply is queued behind its baseline.
+"$ACYCLIC" timeline < /dev/null | grep -q baseline \
+  || fail "init returned before the baseline was ready"
 printf 'DIFFERENT AND LONGER CONTENT\n' > src/main.rs
 printf 'extra\n' > added.txt
 "$ACYCLIC" checkpoint < /dev/null > /dev/null || fail "checkpoint failed"
