@@ -405,10 +405,7 @@ impl Server {
         *self.last_activity.lock().await = Instant::now();
         match op {
             proto::Op::Ping => {
-                let status = self.handle.status().await.map_err(stringify)?;
-                if status.state == pipeline::State::Baselining {
-                    return Err("pipeline baseline is still in progress".to_owned());
-                }
+                self.handle.status().await.map_err(stringify)?;
                 Ok(proto::Reply::Pong)
             }
             proto::Op::Status => {

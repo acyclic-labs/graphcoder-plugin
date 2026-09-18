@@ -413,9 +413,17 @@ fn wait_for_socket(
                 // completed its baseline. Ping waits for that pipeline and
                 // carries a startup error back to this caller.
                 client.set_deadline(deadline.saturating_sub(started.elapsed()));
-                if client.call(proto::Op::Ping).is_ok() {
-                    client.set_deadline(Duration::from_secs(24 * 60 * 60));
-                    return Ok(client);
+                match client.call(proto::Op::Ping) {
+                    Ok(_) => {
+                        client.set_deadline(Duration::from_secs(24 * 60 * 60));
+                        return Ok(client);
+                    }
+                    Err(message) if client.usable => {
+                        // A protocol error is the pipeline's completed startup
+                        // result; reconnecting cannot repair that baseline.
+                        return Err(ConnectError::Other(message));
+                    }
+                    Err(_) => {}
                 }
             }
         }
