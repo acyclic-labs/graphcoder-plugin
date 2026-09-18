@@ -37,12 +37,13 @@ pub fn unix_now() -> i64 {
 /// Returns the current user's home directory across supported platforms.
 ///
 /// Unix shells conventionally provide `HOME`; Windows provides
-/// `USERPROFILE` instead.
+/// `USERPROFILE` instead. Keep `HOME` first for existing Windows stores
+/// created by earlier releases.
 pub fn home_dir() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
             .map(std::path::PathBuf::from)
     }
     #[cfg(not(windows))]
