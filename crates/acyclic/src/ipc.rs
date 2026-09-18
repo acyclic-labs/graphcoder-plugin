@@ -68,7 +68,9 @@ pub struct ClientStream {
     #[cfg(unix)]
     inner: std::os::unix::net::UnixStream,
     #[cfg(windows)]
-    inner: std::fs::File,
+    inner: tokio::net::windows::named_pipe::NamedPipeClient,
+    #[cfg(windows)]
+    runtime: tokio::runtime::Runtime,
     #[cfg(windows)]
     read_timeout: std::cell::Cell<Option<std::time::Duration>>,
     #[cfg(windows)]
@@ -87,24 +89,27 @@ impl ClientStream {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+            use tokio::net::windows::named_pipe::ClientOptions;
             // A named pipe is opened like a file. Every server instance being
             // momentarily busy is normal under concurrent hooks, so a short
             // bounded retry stands in for WaitNamedPipe.
             const BUSY: i32 = 231; // ERROR_PIPE_BUSY
             let name = pipe_name(socket);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()?;
             let mut last = None;
             for _ in 0..20 {
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(FILE_FLAG_OVERLAPPED)
-                    .open(&name)
-                {
-                    Ok(file) => {
+                let opened = {
+                    let _entered = runtime.enter();
+                    ClientOptions::new().open(&name)
+                };
+                match opened {
+                    Ok(inner) => {
                         return Ok(Self {
-                            inner: file,
+                            inner,
+                            runtime,
                             read_timeout: std::cell::Cell::new(None),
                             write_timeout: std::cell::Cell::new(None),
                         });
@@ -157,13 +162,16 @@ impl io::Read for ClientStream {
         }
         #[cfg(windows)]
         {
-            pipe_io(
-                &self.inner,
-                buf.as_mut_ptr(),
-                buf.len(),
-                self.read_timeout.get(),
-                true,
-            )
+            use tokio::io::AsyncReadExt as _;
+            match self.read_timeout.get() {
+                Some(timeout) => self
+                    .runtime
+                    .block_on(async { tokio::time::timeout(timeout, self.inner.read(buf)).await })
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "named-pipe read timed out")
+                    })?,
+                None => self.runtime.block_on(async { self.inner.read(buf).await }),
+            }
         }
     }
 }
@@ -176,13 +184,16 @@ impl io::Write for ClientStream {
         }
         #[cfg(windows)]
         {
-            pipe_io(
-                &self.inner,
-                buf.as_ptr().cast_mut(),
-                buf.len(),
-                self.write_timeout.get(),
-                false,
-            )
+            use tokio::io::AsyncWriteExt as _;
+            match self.write_timeout.get() {
+                Some(timeout) => self
+                    .runtime
+                    .block_on(async { tokio::time::timeout(timeout, self.inner.write(buf)).await })
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "named-pipe write timed out")
+                    })?,
+                None => self.runtime.block_on(async { self.inner.write(buf).await }),
+            }
         }
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -195,103 +206,6 @@ impl io::Write for ClientStream {
             Ok(())
         }
     }
-}
-
-#[cfg(windows)]
-#[allow(
-    unsafe_code,
-    reason = "owns the event and waits for completion or cancellation before releasing the caller's buffer and OVERLAPPED"
-)]
-fn pipe_io(
-    file: &std::fs::File,
-    buffer: *mut u8,
-    len: usize,
-    timeout: Option<std::time::Duration>,
-    read: bool,
-) -> io::Result<usize> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, WAIT_TIMEOUT};
-    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-    use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE};
-    use windows_sys::Win32::System::IO::{
-        CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
-    };
-
-    if len == 0 {
-        return Ok(0);
-    }
-    let handle = file.as_raw_handle().cast();
-    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-    if event.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    struct Event(windows_sys::Win32::Foundation::HANDLE);
-    impl Drop for Event {
-        fn drop(&mut self) {
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-    let event = Event(event);
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    overlapped.hEvent = event.0;
-    let count = u32::try_from(len).unwrap_or(u32::MAX);
-    let submitted = if read {
-        unsafe {
-            ReadFile(
-                handle,
-                buffer,
-                count,
-                std::ptr::null_mut(),
-                &raw mut overlapped,
-            )
-        }
-    } else {
-        unsafe {
-            WriteFile(
-                handle,
-                buffer,
-                count,
-                std::ptr::null_mut(),
-                &raw mut overlapped,
-            )
-        }
-    };
-    if submitted == 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_IO_PENDING.cast_signed()) {
-            return Err(error);
-        }
-    }
-    let milliseconds = timeout.map_or(INFINITE, |duration| {
-        u32::try_from(duration.as_millis().max(1)).unwrap_or(INFINITE - 1)
-    });
-    let mut transferred = 0;
-    let completed = unsafe {
-        GetOverlappedResultEx(
-            handle,
-            &raw mut overlapped,
-            &raw mut transferred,
-            milliseconds,
-            0,
-        )
-    };
-    if completed != 0 {
-        return Ok(transferred as usize);
-    }
-    let error = io::Error::last_os_error();
-    // A failed wait may still leave the operation pending. Keep the caller's
-    // buffer, OVERLAPPED, and event alive until cancellation has completed.
-    unsafe {
-        CancelIoEx(handle, &raw mut overlapped);
-        GetOverlappedResult(handle, &raw mut overlapped, &raw mut transferred, 1);
-    }
-    if error.raw_os_error() == Some(WAIT_TIMEOUT.cast_signed()) {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "named-pipe operation timed out",
-        ));
-    }
-    Err(error)
 }
 
 #[cfg(all(test, windows))]

@@ -26,6 +26,7 @@ pub struct Client {
     stream: BufReader<ClientStream>,
     next_id: u64,
     call_timeout: Option<Duration>,
+    usable: bool,
 }
 
 #[derive(Debug)]
@@ -93,6 +94,7 @@ impl Client {
             stream: BufReader::new(stream),
             next_id: 1,
             call_timeout: None,
+            usable: true,
         })
     }
 
@@ -103,13 +105,23 @@ impl Client {
     }
 
     pub fn call(&mut self, op: proto::Op) -> Result<proto::Reply, String> {
+        if !self.usable {
+            return Err("daemon connection requires reconnect after a transport failure".into());
+        }
         let id = self.next_id;
         self.next_id += 1;
         let name = format!("{op:?}");
         let name = name.split([' ', '{', '(']).next().unwrap_or("?").to_owned();
         let started = std::time::Instant::now();
         acyclic_engine::trace!("client", "call #{id} {name}");
-        let result = self.call_inner(id, op);
+        let result = match self.call_inner(id, op) {
+            Ok(proto::Payload::Ok(reply)) => Ok(*reply),
+            Ok(proto::Payload::Err { message }) => Err(message),
+            Err(error) => {
+                self.usable = false;
+                Err(error)
+            }
+        };
         match &result {
             Ok(reply) => {
                 let reply_name = format!("{reply:?}");
@@ -130,7 +142,7 @@ impl Client {
         result
     }
 
-    fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Reply, String> {
+    fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Payload, String> {
         let deadline = self.call_timeout.map(|timeout| Instant::now() + timeout);
         let request = proto::Request {
             v: proto::PROTOCOL_VERSION,
@@ -190,10 +202,7 @@ impl Client {
                 response.id
             ));
         }
-        match response.payload {
-            proto::Payload::Ok(reply) => Ok(*reply),
-            proto::Payload::Err { message } => Err(message),
-        }
+        Ok(response.payload)
     }
 }
 
@@ -249,6 +258,10 @@ mod deadline_tests {
             .expect_err("call should time out");
         assert!(error.contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_millis(180));
+        let retry = client
+            .call(proto::Op::Ping)
+            .expect_err("connection is poisoned");
+        assert!(retry.contains("requires reconnect"), "{retry}");
         server.join().expect("server exit");
     }
 }

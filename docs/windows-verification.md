@@ -189,11 +189,10 @@ correct.
   crash mid-swap is recovered rather than impossible, which is weaker than
   the APFS/`renameat2` guarantee.
 
-- **Client call deadlines.** Windows named-pipe clients use overlapped I/O
-  with a completion wait and cancellation. The call timeout covers the whole
-  request and response, including partial writes and replies. A Windows
-  regression test holds a pipe read past its deadline and verifies that the
-  client returns promptly.
+- **Client call deadlines.** Windows named-pipe clients use Tokio's IOCP
+  transport. The call timeout covers the whole request and response, including
+  partial writes and replies. A timed-out client must reconnect before another
+  call so a late daemon response cannot be paired with the wrong request.
 
 - **A speculative run's timeout kills without a grace period, and a
   descendant can escape the job.** `spec_runner` puts each run in a job
