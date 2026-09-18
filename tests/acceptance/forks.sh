@@ -119,7 +119,15 @@ printf 'WINNER\n' > "$A/src/app.txt" || fail "write winner"
 printf 'LOSER\n' > "$B/src/app.txt" || fail "write loser"
 
 # --- M4: promote journey --------------------------------------------------
+# Timed: a one-path promote is a publish, a plan, one write pass and one
+# direct capture. It regressed to seconds once, when every restored path
+# forced a full-tree rescan (macOS rename -> watcher invalidation), so the
+# bound and the watcher line below are the gate against that coming back.
+P_START="$(python3 -c 'import time; print(int(time.time()*1000))')"
 acy promote "${IDS[0]}" >/dev/null || fail "M4: promote"
+P_MS="$(( $(python3 -c 'import time; print(int(time.time()*1000))') - P_START ))"
+[ "$P_MS" -lt 1500 ] || fail "M4: promote took ${P_MS}ms; a one-path promote must stay well under 1.5s (per-path rescans are back?)"
+acy status | grep -q '^watcher:' && fail "M4: the watcher lost its epoch during the round: $(acy status | grep '^watcher:')"
 [ "$(cat "$R/src/app.txt")" = "WINNER" ] || fail "M4: promoted content missing"
 [ "$(cat "$R/.env")" = "SECRET=1" ] || fail "M4: gitignored state lost"
 TL="$(acy timeline)"

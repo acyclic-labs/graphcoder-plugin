@@ -465,6 +465,22 @@ pub struct StatusInfo {
     /// existed; several acceptance scripts read this output.
     #[serde(default)]
     pub speculate: Option<SpecStatus>,
+    /// Native watcher health since the daemon started. `None` from a daemon
+    /// older than this field.
+    #[serde(default)]
+    pub watcher: Option<WatcherStatus>,
+}
+
+/// How often the native watcher lost its epoch and what the recoveries
+/// cost. Every invalidation is a full-tree rescan, which is where slow
+/// checkpoints and promotes come from.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WatcherStatus {
+    pub invalidations: u32,
+    pub last_reason: Option<String>,
+    pub recovery_rescans: u32,
+    pub recovery_ms_total: f64,
+    pub last_recovery_ms: f64,
 }
 
 /// What speculation has been doing, over the last 24 hours.

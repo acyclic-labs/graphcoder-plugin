@@ -669,7 +669,7 @@ fn merged_mode(base: Option<u32>, ours: Option<u32>, theirs: Option<u32>) -> Opt
     }
 }
 
-fn namespace_of(path: &Path) -> Result<NamespacePath> {
+pub(crate) fn namespace_of(path: &Path) -> Result<NamespacePath> {
     let components = validate_relative(path)?;
     namespace_path(&components, acyclic_fs::model::VolumeLimits::default())
 }

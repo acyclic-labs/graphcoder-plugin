@@ -7,6 +7,33 @@ All notable changes to this project are documented here. Format loosely follows
 
 Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
 
+### Changed
+
+- **Promote is ~50x faster.** An 8-fork partition round measured 18s per
+  promote; it is now 0.15–0.35s, and `acyclic promote <id> <id> ...` lands
+  several forks in one call (8 forks in 2.5s). Three causes, three fixes:
+  every restored path forced a full-tree rescan because macOS FSEvents
+  reports a rename with one path and the watcher treated that as ambiguous
+  (fixed in the sdk: a Darwin rename is now a "modified" hint per path, which
+  also stops editor atomic saves and `git checkout` from costing a rescan);
+  promote landed paths one at a time with a checkpoint pair each (now one
+  restore, one row, the written paths captured directly instead of waiting
+  for the watcher's echo); and a merged generation was built through the
+  store for every promote (now only when a file merged by content or
+  conflicted; otherwise the fork's snapshot is the landing source). A
+  promote now adds four timeline rows, not twenty.
+- The `/fork` skill drops the redundant pre-round checkpoint, skips
+  `fork-diff` in PARTITION mode, and promotes every passing fork in one call.
+
+### Added
+
+- `acyclic status` prints a `watcher:` line once the native watcher has lost
+  its epoch: invalidation count, full-rescan count and cost, and the last
+  reason. `ACYCLIC_TRACE=1` now names the invalidation reason, times each
+  restore's phases, each promote's phases, and each baseline's phases.
+- `forks.sh` gates a one-path promote at 1.5s and requires no watcher
+  invalidation during the round.
+
 ## [0.0.2] - 2026-09-17
 
 Everything below shipped in 0.0.2 except Rewind and the npm launcher, which

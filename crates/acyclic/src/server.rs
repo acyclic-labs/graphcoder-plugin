@@ -79,60 +79,15 @@ struct ForkMount {
     session: Option<NativeMountSession>,
 }
 
-pub fn run(repo_root: &Path) -> Result<(), String> {
-    // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
-    // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
-    // that wedges every stat/open under it (Config::load, canonicalize, ...).
-    // The force-unmount acts on the mountpoint path itself without touching
-    // the dead server, so the real tree reappears before we read the config.
-    fork::sweep_stale_dry_session(repo_root);
-
-    let config = Config::load(repo_root).map_err(|error| error.to_string())?;
-    let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-    let paths = StorePaths::for_repo(repo_root, stores_root.as_deref())
-        .map_err(|error| error.to_string())?;
-
-    // Finish or unwind any rewind that a crash interrupted BEFORE the store
-    // opens and the pipeline baselines; sweep fork dirs a dead daemon left
-    // mounted (fork sessions do not survive the daemon).
-    rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
-    fork::sweep_stale_forks(repo_root);
-    // Same reason as the fork sweep, and the same moment: a model run a
-    // crashed daemon left behind is still running, and still billing.
-    crate::spec_runner::sweep_stale_runs(&paths.spec_runs());
-
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let store = runtime
-        .block_on(Store::open(paths.clone()))
-        .map_err(|error| error.to_string())?;
-    let repo_root = store.repo_root.clone();
-    let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;
-    let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
-
-    // Socket + pidfile. A stale socket from a dead daemon is removed; a live
-    // one refuses the second daemon via bind failure after removal race.
-    ipc::cleanup(&paths.socket());
-    let mut listener = runtime
-        .block_on(async { ipc::Listener::bind(&paths.socket()) })
-        .map_err(|error| format!("bind {}: {error}", ipc::endpoint_display(&paths.socket())))?;
-    std::fs::write(paths.pidfile(), std::process::id().to_string())
-        .map_err(|error| error.to_string())?;
-
-    let shutdown = Arc::new(Notify::new());
-    let mut mounts = fork::mount_capability();
-    // Test hook: exercise the copy-fork paths on a host that has mounts.
-    if std::env::var_os("ACYCLIC_FORCE_COPY_FORKS").is_some() {
-        mounts.available = false;
-        mounts.reason = Some("ACYCLIC_FORCE_COPY_FORKS is set".into());
-    }
-    if !mounts.available {
-        eprintln!(
-            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
-            mounts.reason.as_deref().unwrap_or("unknown reason")
-        );
-    }
-    // Speculation is opt-in, per developer, from a file of its own; a
-    // malformed one disables it and says so rather than failing the daemon.
+/// Speculation is opt-in, per developer, from a file of its own; a
+/// malformed one disables it and says so rather than failing the daemon.
+fn spawn_speculation(
+    paths: &StorePaths,
+    handle: &pipeline::PipelineHandle,
+) -> (
+    Option<Arc<crate::speculate::SpecHandle>>,
+    Option<std::thread::JoinHandle<()>>,
+) {
     let (speculate_config, speculate_warning) = SpeculateConfig::load();
     if let Some(warning) = speculate_warning {
         eprintln!("{NAME} daemon: speculation config: {warning}");
@@ -160,6 +115,86 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
             }
         );
     }
+    (spec, spec_thread)
+}
+
+pub fn run(repo_root: &Path) -> Result<(), String> {
+    // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
+    // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
+    // that wedges every stat/open under it (Config::load, canonicalize, ...).
+    // The force-unmount acts on the mountpoint path itself without touching
+    // the dead server, so the real tree reappears before we read the config.
+    let startup = std::time::Instant::now();
+    let mut phase = std::time::Instant::now();
+    let mut lap = |name: &str| {
+        acyclic_engine::trace!(
+            "daemon",
+            "startup: {name} {:.1}ms (t+{:.1}ms)",
+            acyclic_engine::trace::ms(phase),
+            acyclic_engine::trace::ms(startup)
+        );
+        phase = std::time::Instant::now();
+    };
+    fork::sweep_stale_dry_session(repo_root);
+    lap("sweep stale dry-run session");
+
+    let config = Config::load(repo_root).map_err(|error| error.to_string())?;
+    lap("config load");
+    let stores_root = config.store_dir.as_ref().map(PathBuf::from);
+    let paths = StorePaths::for_repo(repo_root, stores_root.as_deref())
+        .map_err(|error| error.to_string())?;
+
+    // Finish or unwind any rewind that a crash interrupted BEFORE the store
+    // opens and the pipeline baselines; sweep fork dirs a dead daemon left
+    // mounted (fork sessions do not survive the daemon).
+    rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
+    lap("rewind journal recovery");
+    fork::sweep_stale_forks(repo_root);
+    lap("sweep stale forks");
+    // Same reason as the fork sweep, and the same moment: a model run a
+    // crashed daemon left behind is still running, and still billing.
+    crate::spec_runner::sweep_stale_runs(&paths.spec_runs());
+    lap("sweep stale spec runs");
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let store = runtime
+        .block_on(Store::open(paths.clone()))
+        .map_err(|error| error.to_string())?;
+    let repo_root = store.repo_root.clone();
+    lap("store open");
+    let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;
+    lap("index open");
+    let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
+    lap("pipeline thread spawn (baseline runs on it)");
+
+    // Socket + pidfile. A stale socket from a dead daemon is removed; a live
+    // one refuses the second daemon via bind failure after removal race.
+    ipc::cleanup(&paths.socket());
+    let mut listener = runtime
+        .block_on(async { ipc::Listener::bind(&paths.socket()) })
+        .map_err(|error| format!("bind {}: {error}", ipc::endpoint_display(&paths.socket())))?;
+    std::fs::write(paths.pidfile(), std::process::id().to_string())
+        .map_err(|error| error.to_string())?;
+    lap("socket bind + pidfile");
+
+    let shutdown = Arc::new(Notify::new());
+    let mut mounts = fork::mount_capability();
+    lap("native mount probe");
+    // Test hook: exercise the copy-fork paths on a host that has mounts.
+    if std::env::var_os("ACYCLIC_FORCE_COPY_FORKS").is_some() {
+        mounts.available = false;
+        mounts.reason = Some("ACYCLIC_FORCE_COPY_FORKS is set".into());
+    }
+    if !mounts.available {
+        eprintln!(
+            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
+            mounts.reason.as_deref().unwrap_or("unknown reason")
+        );
+    }
+    // Speculation is opt-in, per developer, from a file of its own; a
+    // malformed one disables it and says so rather than failing the daemon.
+    let (spec, spec_thread) = spawn_speculation(&paths, &handle);
+    lap("speculation spawn");
 
     let server = Server {
         mounts,
@@ -300,6 +335,13 @@ impl Server {
                     mount_available: self.mounts.available,
                     mount_reason: self.mounts.reason.clone(),
                     speculate: self.speculation_status(),
+                    watcher: Some(proto::WatcherStatus {
+                        invalidations: status.watcher.invalidations,
+                        last_reason: status.watcher.last_reason,
+                        recovery_rescans: status.watcher.recovery_rescans,
+                        recovery_ms_total: status.watcher.recovery_ms_total,
+                        last_recovery_ms: status.watcher.last_recovery_ms,
+                    }),
                 }))
             }
             proto::Op::Checkpoint {
@@ -1106,10 +1148,12 @@ impl Server {
         if let Some(conflict) = fork.conflict.as_ref() {
             self.refuse_unresolved_markers(&overlay, conflict).await?;
         }
+        let publish_started = std::time::Instant::now();
         let head = self.handle.publish_head().await.map_err(stringify)?;
         acyclic_engine::trace!(
             "daemon",
-            "promote {id}: {} fork, mainline {} since the fork's base",
+            "promote {id}: publish_head {:.1}ms; {} fork, mainline {} since the fork's base",
+            acyclic_engine::trace::ms(publish_started),
             if fork.copy_dir.is_some() {
                 "copy"
             } else {
@@ -1303,16 +1347,24 @@ impl Server {
                 kept: Vec::new(),
             });
         }
+        let snapshot_started = std::time::Instant::now();
         let snapshot = self
             .handle
             .snapshot_overlay(Arc::clone(&overlay))
             .await
             .map_err(stringify)?;
+        let snapshot_ms = acyclic_engine::trace::ms(snapshot_started);
+        let plan_started = std::time::Instant::now();
         let mut plan = self
             .handle
             .merge_plan(base, head, snapshot, format!("fork {id}"))
             .await
             .map_err(stringify)?;
+        acyclic_engine::trace!(
+            "daemon",
+            "promote {id}: snapshot_overlay {snapshot_ms:.1}ms, merge_plan {:.1}ms",
+            acyclic_engine::trace::ms(plan_started)
+        );
         // Gitignored paths (bytecode caches, build output, .env) are not
         // merge payload: a fork's copy never blocks a promote, the
         // mainline keeps its own. Cheap: only the contested paths are asked.
@@ -1322,8 +1374,10 @@ impl Server {
             .map(|refusal| refusal.path.clone())
             .chain(plan.conflicted.iter().map(|file| file.path.clone()))
             .collect();
+        let ignore_started = std::time::Instant::now();
         let ignored =
             tokio::task::block_in_place(|| merge::ignored_paths(&self.repo_root, &contested));
+        let ignore_ms = acyclic_engine::trace::ms(ignore_started);
         let kept: Vec<String> = plan
             .keep_mainline_for(&ignored)
             .iter()
@@ -1367,33 +1421,61 @@ impl Server {
             });
         }
 
-        // M = H + (fork-only subtrees from F) + (content-merged files).
-        let mut entries: Vec<(PathBuf, Entry)> = plan
-            .take_ours
-            .iter()
-            .map(|path| {
+        // The generation the landing paths are restored FROM.
+        //
+        // Nothing merged by content and no conflict: every landing path is a
+        // fork-only subtree, and the fork's own snapshot F already holds each
+        // of them exactly. Restoring them from F is the merge; building
+        // M = H + F-subtrees would copy ten subtrees through the store, each
+        // object behind a barrier fsync, to arrive at the same bytes.
+        //
+        // Content merges or conflicts: build M = H + (fork-only subtrees
+        // from F) + (content-merged files). A conflict needs the real M,
+        // because the rebased fork R = M + markers has to sit on H.
+        let build_started = std::time::Instant::now();
+        let merged = if plan.merged.is_empty() && plan.conflicted.is_empty() {
+            snapshot
+        } else {
+            let mut entries: Vec<(PathBuf, Entry)> = plan
+                .take_ours
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        Entry::FromGeneration {
+                            generation: snapshot,
+                        },
+                    )
+                })
+                .collect();
+            entries.extend(plan.merged.iter().map(|file| {
                 (
-                    path.clone(),
-                    Entry::FromGeneration {
-                        generation: snapshot,
+                    file.path.clone(),
+                    Entry::Regular {
+                        bytes: file.bytes.clone(),
+                        mode: file.mode,
                     },
                 )
-            })
-            .collect();
-        entries.extend(plan.merged.iter().map(|file| {
-            (
-                file.path.clone(),
-                Entry::Regular {
-                    bytes: file.bytes.clone(),
-                    mode: file.mode,
-                },
-            )
-        }));
-        let merged = self
-            .handle
-            .build_generation(head, entries)
-            .await
-            .map_err(stringify)?;
+            }));
+            self.handle
+                .build_generation(head, entries)
+                .await
+                .map_err(stringify)?
+        };
+        acyclic_engine::trace!(
+            "daemon",
+            "promote {id}: gitignore check {ignore_ms:.1}ms ({} contested), landing source {} in \
+             {:.1}ms ({} replayed subtree(s), {} merged file(s))",
+            contested.len(),
+            if merged == snapshot {
+                "= fork snapshot (no build)"
+            } else {
+                "= built merged generation"
+            },
+            acyclic_engine::trace::ms(build_started),
+            plan.take_ours.len(),
+            plan.merged.len()
+        );
 
         if !plan.conflicted.is_empty() {
             // R = M + marker-bearing files; the fork becomes R.
@@ -1444,83 +1526,79 @@ impl Server {
             });
         }
 
+        let land_started = std::time::Instant::now();
         let target = self
             .handle
             .record_generation(
                 merged,
-                if moved {
+                if merged == snapshot {
+                    format!("fork {id} snapshot ({} paths)", plan.take_ours.len())
+                } else {
                     format!(
                         "fork {id} merge ({} merged, {} replayed)",
                         plan.merged.len(),
                         plan.take_ours.len()
                     )
-                } else {
-                    format!("fork {id} snapshot ({} paths)", plan.take_ours.len())
                 },
             )
             .await
             .map_err(stringify)?;
+        // The "before" row: the head was captured and published moments
+        // ago by publish_head, so record that generation rather than
+        // draining the watcher again for a row that would come back noop.
         self.handle
-            .checkpoint(
+            .record_generation_as(
+                head,
                 CheckpointKind::PreRewind,
-                Attribution {
-                    label: Some(if moved {
-                        format!("before {label} (merge)")
-                    } else {
-                        format!("before {label}")
-                    }),
-                    ..Attribution::default()
+                if moved {
+                    format!("before {label} (merge)")
+                } else {
+                    format!("before {label}")
                 },
             )
             .await
             .map_err(stringify)?;
-        let mut written = 0u32;
-        for root in plan.landing_paths() {
-            self.handle
-                .restore_path(target.clone(), root.clone())
-                .await
-                .map_err(|error| {
-                    format!(
-                        "merge stopped at {} after {written} path(s): {error}. The tree is partially \
-                         merged; `{NAME} rewind <id>` of the `before promote ... (merge)` row in \
-                         `{NAME} timeline` returns to the pre-merge tree",
-                        root.display()
-                    )
-                })?;
-            written += 1;
-        }
+        let pre_ms = acyclic_engine::trace::ms(land_started);
+        // One restore for every landing path: one drain, one timeline row
+        // carrying the promote label, however many paths the fork touched.
+        // publish_head captured the tree just now, so no safety row either.
+        let landing = plan.landing_paths();
         let landed_label = if moved {
             format!(
-                "{label} (merged {} file(s), replayed {written} path(s) onto moved mainline)",
-                plan.merged.len()
+                "{label} (merged {} file(s), replayed {} path(s) onto moved mainline)",
+                plan.merged.len(),
+                landing.len()
             )
         } else {
-            format!("{label} ({written} path(s) written in place)")
+            format!("{label} ({} path(s) written in place)", landing.len())
         };
-        let landed = self
+        let restore_started = std::time::Instant::now();
+        let restored = self
             .handle
-            .checkpoint(
-                CheckpointKind::Manual,
-                Attribution {
-                    label: Some(landed_label.clone()),
-                    ..Attribution::default()
-                },
-            )
+            .restore_paths(target.clone(), landing.clone(), false, Some(landed_label))
             .await
-            .map_err(stringify)?;
-        // Each restore_path already captured its write, so the landing
-        // checkpoint above usually finds nothing new and comes back as a
-        // noop row. Promote must be a real rewind target (spec I6): record
-        // the landed generation as a manual row under the same label.
-        if landed.kind == CheckpointKind::Noop {
-            self.handle
-                .record_generation(landed.generation, landed_label)
-                .await
-                .map_err(stringify)?;
-        }
+            .map_err(|error| {
+                format!(
+                    "merge stopped while landing {} path(s): {error}. The tree may be partially \
+                     merged; `{NAME} rewind <id>` of the `before promote ... (merge)` row in \
+                     `{NAME} timeline` returns to the pre-merge tree",
+                    landing.len()
+                )
+            })?;
+        let restore_ms = acyclic_engine::trace::ms(restore_started);
+        let written = u32::try_from(restored.outcomes.len()).unwrap_or(u32::MAX);
+        let landed_generation = restored.generation;
+        let commit_started = std::time::Instant::now();
         self.handle.commit().await.map_err(stringify)?;
+        acyclic_engine::trace!(
+            "daemon",
+            "promote {id}: landing {written} path(s): record rows {pre_ms:.1}ms, \
+             restore {restore_ms:.1}ms, commit {:.1}ms, land total {:.1}ms",
+            acyclic_engine::trace::ms(commit_started),
+            acyclic_engine::trace::ms(land_started)
+        );
         Ok(Landed::Replayed {
-            generation: landed.generation,
+            generation: landed_generation,
             paths: written,
             merged: u32::try_from(plan.merged.len()).unwrap_or(u32::MAX),
             kept,

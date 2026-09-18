@@ -1212,27 +1212,33 @@ effective values in ONE line before the first fork, e.g.
 
 Depth starts at 1 and increases by one per round.
 
-1. `{{name}} checkpoint -m "round <depth>: before <goal>"`.
-2. `{{name}} fork -n <fan_out>`. Note each id and path and whether it says
-   `(mount)` or `(copy)`. Copy forks cost time proportional to the tree:
-   keep them few and short-lived.
-3. Dispatch ALL subagents in one turn, one per fork, using the CHILD
+1. `{{name}} fork -n <fan_out>`. It records the fork base as a checkpoint
+   itself, so do not checkpoint first. Note each id and path and whether
+   it says `(mount)` or `(copy)`. Copy forks cost time proportional to
+   the tree: keep them few and short-lived.
+2. Dispatch ALL subagents in one turn, one per fork, using the CHILD
    PROMPT below. Do not keep one approach for yourself.
-4. **Freeze.** Make NO edits to the real tree while forks are live. A
+3. **Freeze.** Make NO edits to the real tree while forks are live. A
    real-tree edit merges like another fork would: fine when disjoint,
    a conflict to resolve when it touches the same lines.
-5. When all reports are in, `{{name}} fork-diff <id>` for each fork.
-6. RACE: pick the winner by the SELECTION RULE and `{{name}} promote <winner>`.
-   PARTITION: `{{name}} promote <id>` for every fork that passed, in
-   dispatch order. Every promote writes the fork's paths into the real
+4. When all reports are in: RACE only, `{{name}} fork-diff <id>` for each
+   candidate, in ONE shell call, for the SELECTION RULE. PARTITION: skip
+   fork-diff; the child report lists the files and promote prints what
+   landed.
+5. RACE: pick the winner by the SELECTION RULE and `{{name}} promote <winner>`.
+   PARTITION: ONE call, `{{name}} promote <id> <id> ...`, every fork that
+   passed, in dispatch order. It lands them one after another and prints
+   one line per fork. Every promote writes the fork's paths into the real
    tree in place; the repo directory is never replaced.
-7. Read each promote's output: `promoted` / `promoted by merge` landed;
-   `N file(s) conflict` wrote markers into that fork (see section 6).
-8. `{{name}} fork-drop <id>` for every fork you will not land, immediately.
-9. Report the round in the ROUND REPORT shape.
-10. If work remains and depth < max_depth and forks used < max_forks,
-    start the next round from the promoted tree. Otherwise stop and
-    report to the user.
+6. Read each fork's line: `promoted` / `promoted by merge` landed;
+   `N file(s) conflict` wrote markers into that fork (see section 6) and
+   the other forks still landed.
+7. `{{name}} fork-drop <id>` for every fork you will not land, in one
+   shell call, immediately.
+8. Report the round in the ROUND REPORT shape.
+9. If work remains and depth < max_depth and forks used < max_forks,
+   start the next round from the promoted tree. Otherwise stop and
+   report to the user.
 
 ## 3. CHILD PROMPT (copy exactly, fill the angle brackets)
 
@@ -1363,7 +1369,7 @@ tree until you promote it.
     {{name}} policy                  the decomposition limits for this repo
     {{name}} fork -n N               cut N forks; each prints its path
     {{name}} fork-diff <id>          what one fork changed, before landing it
-    {{name}} promote <id>            land that fork into the real tree
+    {{name}} promote <id> [<id>...]  land those forks into the real tree, in order
     {{name}} fork-drop <id>          discard it; its changes evaporate
     {{name}} forks                   what is live right now
 
@@ -1429,7 +1435,7 @@ tree until you promote it.
     {{name}} policy                  the decomposition limits for this repo
     {{name}} fork -n N               cut N forks; each prints its path
     {{name}} fork-diff <id>          what one fork changed, before landing it
-    {{name}} promote <id>            land that fork into the real tree
+    {{name}} promote <id> [<id>...]  land those forks into the real tree, in order
     {{name}} fork-drop <id>          discard it; its changes evaporate
     {{name}} forks                   what is live right now
 
