@@ -1741,7 +1741,9 @@ impl Pipeline {
             }
         }
         for parent in parents {
-            hints.push(WatchChange::Modified(crate::merge::namespace_of(&parent)?));
+            hints.push(WatchChange::MetadataChanged(crate::merge::namespace_of(
+                &parent,
+            )?));
         }
         capture_watch_batch(
             &mut self.store.checkout,
