@@ -25,9 +25,6 @@ WORK="$(mktemp -d)"
 REPO="$WORK/repo"
 cleanup() {
   "$ACYCLIC" --repo "$REPO" stop >/dev/null 2>&1 || true
-  # A daemon that outlives the run holds the store open and fails the next one.
-  powershell -NoProfile -Command \
-    "Stop-Process -Name acyclic -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
   rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -57,15 +54,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/windows-pipe-acl.ps1"
   || fail "the daemon pipe is not owner-only"
 
 echo "--- checkpoint and timeline"
-# Let the baseline settle before editing. `init` returning does not guarantee
-# the baseline predates a write landing microseconds later: the change gets
-# folded into checkpoint #1 rather than appearing as a later one, and the diff
-# below then has nothing to report. That race is not Windows-specific, and is
-# not what this script is here to test.
-sleep 3
+# Wait for the observable baseline, not an assumed startup duration.
+baseline_ready=false
+for _ in {1..100}; do
+  if "$ACYCLIC" timeline < /dev/null 2>/dev/null | grep -q baseline; then
+    baseline_ready=true
+    break
+  fi
+  sleep 0.05
+done
+[ "$baseline_ready" = true ] || fail "baseline did not become ready"
 printf 'DIFFERENT AND LONGER CONTENT\n' > src/main.rs
 printf 'extra\n' > added.txt
-sleep 2
 "$ACYCLIC" checkpoint < /dev/null > /dev/null || fail "checkpoint failed"
 "$ACYCLIC" timeline < /dev/null | grep -q baseline || fail "timeline has no baseline"
 

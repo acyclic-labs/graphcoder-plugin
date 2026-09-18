@@ -33,6 +33,15 @@ const MAXIMUM_EXTENT_SPANS: u32 = 65_536;
 const WATCH_QUEUE: u32 = 65_536;
 const POLL_CHANGES: u32 = 16_384;
 
+fn fork_moved(base: GenerationId) -> PromoteOutcome {
+    PromoteOutcome::Conflict {
+        message: format!(
+            "the working tree moved past the fork's base ({}); promote in v1 requires an unmoved mainline — rewind to the base or re-fork and re-apply",
+            crate::generation_hex(base)
+        ),
+    }
+}
+
 /// Pipeline state reported by `status`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
@@ -2021,6 +2030,13 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
+        // The fork may have been cut from an unpublished checkpoint. Publishing
+        // that same generation advances the authority sequence, so its checkout
+        // must rebase before committing even though the mainline did not move.
+        if self.store.checkout.generation_id() != base {
+            return Ok(fork_moved(base));
+        }
+
         let outcome = {
             let mut guard = shared.lock().await;
             if !guard.has_pending_mutations() {
@@ -2030,6 +2046,17 @@ impl Pipeline {
                     generation: base,
                     old_tree: None,
                 });
+            }
+            let rebased = guard
+                .rebase_head(0, WorkCounters::UNBOUNDED, &self.cancel)
+                .await
+                .map_err(EngineError::fs("fork rebase"))?
+                .value;
+            if matches!(
+                rebased,
+                acyclic_fs::kernel::RebaseDecision::Conflicted { .. }
+            ) {
+                return Ok(fork_moved(base));
             }
             guard
                 .commit(OperationId::new(), WorkCounters::UNBOUNDED, &self.cancel)
@@ -2041,14 +2068,7 @@ impl Pipeline {
             CheckoutCommitOutcome::Committed { generation_id, .. }
             | CheckoutCommitOutcome::AlreadyCommitted { generation_id, .. } => generation_id,
             CheckoutCommitOutcome::Conflict { .. } | CheckoutCommitOutcome::Fenced { .. } => {
-                return Ok(PromoteOutcome::Conflict {
-                    message: format!(
-                        "the working tree moved past the fork's base \
-                         ({}); promote in v1 requires an unmoved mainline — \
-                         rewind to the base or re-fork and re-apply",
-                        crate::generation_hex(base)
-                    ),
-                });
+                return Ok(fork_moved(base));
             }
             other => {
                 return Err(EngineError::Fs(format!(
@@ -2175,6 +2195,17 @@ impl Pipeline {
         label: &str,
     ) -> Result<PromoteOutcome> {
         self.state = State::Rewinding;
+        self.drain_watcher().await?;
+        if self.checkpoint_engine().await? != base {
+            self.state = State::Ready;
+            return Ok(PromoteOutcome::Conflict {
+                message: format!(
+                    "the working tree moved past the session's base ({}); Safe Mode in v1 requires an unmoved mainline",
+                    crate::generation_hex(base)
+                ),
+            });
+        }
+        self.commit_engine().await?;
         self.store.checkout = self
             .store
             .volume

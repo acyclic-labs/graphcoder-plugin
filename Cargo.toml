@@ -15,7 +15,7 @@ repository = "https://github.com/acyclic-labs/graphcoder-plugin"
 homepage = "https://acyclic.dev"
 
 [workspace.dependencies]
-acyclic-fs = { git = "https://github.com/acyclic-labs/sdk.git", rev = "22b4e752f46d8f6db6e024b3137fe520ef64bcc1", features = ["local", "native-watch", "native-mount"] }
+acyclic-fs = { path = "../../../sdk/rust/crates/filesystem", features = ["local", "native-watch", "native-mount"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 
 # Code-quality guards beyond clippy's defaults. CI runs clippy with
@@ -67,4 +67,3 @@ cast_lossless = "warn"
 # function naming the invariant, so a reviewer can find them all.
 unsafe_code = "warn"
 unsafe_op_in_unsafe_fn = "warn"
-

@@ -41,8 +41,7 @@ dependencies = [
 
 [[package]]
 name = "acyclic-fs"
-version = "0.2.0-rc.1"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=22b4e752f46d8f6db6e024b3137fe520ef64bcc1#22b4e752f46d8f6db6e024b3137fe520ef64bcc1"
+version = "0.2.0-rc.5"
 dependencies = [
  "acyclic-objects",
  "acyclic-stream",
@@ -73,8 +72,7 @@ dependencies = [
 
 [[package]]
 name = "acyclic-objects"
-version = "1.0.0-rc.1"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=22b4e752f46d8f6db6e024b3137fe520ef64bcc1#22b4e752f46d8f6db6e024b3137fe520ef64bcc1"
+version = "1.0.0-rc.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -107,8 +105,7 @@ dependencies = [
 
 [[package]]
 name = "acyclic-stream"
-version = "1.0.0-rc.3"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=22b4e752f46d8f6db6e024b3137fe520ef64bcc1#22b4e752f46d8f6db6e024b3137fe520ef64bcc1"
+version = "1.0.0-rc.7"
 dependencies = [
  "async-trait",
  "bytes",
