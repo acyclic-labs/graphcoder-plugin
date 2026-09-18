@@ -257,6 +257,10 @@ fn main() {
     // unless a bounded probe shows the mount is genuinely wedged), so the
     // real tree is back before we read anything.
     acyclic::fork::reap_dead_shadow(&repo_arg);
+    let repo_arg = acyclic::rewind::recover_before_repo_open(&repo_arg).unwrap_or_else(|error| {
+        eprintln!("{}: rewind recovery: {error}", product::NAME);
+        std::process::exit(1);
+    });
     let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
         eprintln!("{}: bad repo path: {error}", product::NAME);
         std::process::exit(1);
@@ -625,14 +629,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             turn,
             limit,
         } => {
-            let reply = client.call(proto::Op::Timeline {
-                session_id: session,
-                turn,
-                limit,
-            })?;
-            let proto::Reply::Timeline(entries) = reply else {
-                return Err("unexpected reply".into());
-            };
+            let entries = client.timeline(session, turn, limit)?;
             if entries.is_empty() {
                 println!("no checkpoints yet");
                 return Ok(());
@@ -818,13 +815,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         }
         Command::Restore { checkpoint, paths } => {
             for path in paths {
-                let reply = client.call(proto::Op::Rewind {
-                    target: proto::RewindTarget::Checkpoint(checkpoint),
-                    path: Some(path),
-                })?;
-                let proto::Reply::Restore(info) = reply else {
-                    return Err("unexpected reply".into());
-                };
+                let info = client.restore(checkpoint, path)?;
                 match info.action {
                     proto::RestoreAction::Removed => {
                         println!("{}: absent at #{}, removed", info.path, info.checkpoint);
@@ -863,10 +854,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 }
             }
             step_aside();
-            let reply = client.call(proto::Op::Rewind { target, path: None })?;
-            let proto::Reply::Rewind(info) = reply else {
-                return Err("unexpected reply".into());
-            };
+            let info = client.rewind(target)?;
             println!("restored checkpoint #{}", info.restored_checkpoint);
             println!("old tree kept at {}", info.old_tree);
             println!("note: {}", info.warning);
@@ -887,15 +875,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 let (after, after_hex) = checkpoint_ref(after.as_deref())?;
                 (before, after, before_hex, after_hex)
             };
-            let reply = client.call(proto::Op::Diff {
-                before,
-                after,
-                before_hex,
-                after_hex,
-            })?;
-            let proto::Reply::Diff(entries) = reply else {
-                return Err("unexpected reply".into());
-            };
+            let entries = client.diff(before, after, before_hex, after_hex)?;
             print_diff(&entries);
             Ok(())
         }

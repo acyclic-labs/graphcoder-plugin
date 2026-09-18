@@ -4,6 +4,7 @@
 //! fully-new — never mixed.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use acyclic_fs::kernel::MetadataField;
@@ -19,6 +20,7 @@ use crate::{EngineError, Result};
 const MAXIMUM_DIRECTORY_ENTRIES: u32 = 1_024;
 const MAXIMUM_EXTENT_SPANS: u32 = 65_536;
 const TRANSFER_BYTES: u64 = 8 * 1024 * 1024;
+static PARK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// What a completed rewind reports back.
 #[derive(Clone, Debug)]
@@ -72,6 +74,7 @@ pub async fn restore_path_into(
 ) -> Result<RestoreOutcome> {
     let components = validate_relative(relative)?;
     let destination = root.join(relative);
+    ensure_real_parents(root, relative)?;
     let parent = destination
         .parent()
         .ok_or_else(|| EngineError::Restore("path has no parent".into()))?;
@@ -118,7 +121,7 @@ pub async fn restore_path_into(
     // Stage next to the destination so the final rename never crosses a
     // filesystem; the parent must exist (it did at the checkpoint, but the
     // tree may have lost it since).
-    std::fs::create_dir_all(parent)?;
+    ensure_real_parents(root, relative)?;
     let staged = parent.join(format!(
         ".{name}.{}-restore-{}",
         crate::product::NAME,
@@ -139,6 +142,7 @@ pub async fn restore_path_into(
         let _ = remove_any(&staged);
         return Err(error);
     }
+    ensure_real_parents(root, relative)?;
 
     // Swap in. An existing destination is exchanged atomically and the old
     // node discarded; an absent one is a plain rename.
@@ -318,6 +322,48 @@ pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
     Ok(components)
 }
 
+/// Create missing ancestors one component at a time, refusing symlinks and
+/// Windows reparse points before a path restore touches its destination.
+fn ensure_real_parents(root: &Path, relative: &Path) -> Result<()> {
+    fn check_real_directory(path: &Path) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+        };
+        #[cfg(not(windows))]
+        let reparse = false;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || reparse {
+            return Err(EngineError::Restore(format!(
+                "restore parent {} is not a real directory",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    check_real_directory(root)?;
+    let mut cursor = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            cursor.push(name);
+            match std::fs::symlink_metadata(&cursor) {
+                Ok(_) => check_real_directory(&cursor)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&cursor)?;
+                    check_real_directory(&cursor)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn namespace_path(
     components: &[Vec<u8>],
     limits: acyclic_fs::model::VolumeLimits,
@@ -400,23 +446,27 @@ fn carry(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort inverse of [`carry`]: every listed path present in `from`
-/// and absent in `into` goes back. Used by crash recovery, where the only
-/// wrong answer is losing a live copy.
-fn move_back(from: &Path, into: &Path, relative: &[PathBuf]) {
+/// Inverse of [`carry`]: every listed path present in `from` goes back.
+/// A conflict or I/O failure keeps the journal and both trees for retry.
+fn move_back(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
     for path in relative {
         let source = from.join(path);
         let destination = into.join(path);
-        if std::fs::symlink_metadata(&source).is_err()
-            || std::fs::symlink_metadata(&destination).is_ok()
-        {
+        if !path_exists(&source)? {
             continue;
         }
-        if let Some(parent) = destination.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if path_exists(&destination)? {
+            return Err(EngineError::Restore(format!(
+                "rewind recovery found both copies of carried path {}",
+                path.display()
+            )));
         }
-        let _ = std::fs::rename(&source, &destination);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&source, &destination)?;
     }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -426,9 +476,99 @@ pub enum Phase {
     /// Excluded paths moving from repo into tmp. Recovery: move back any
     /// that already moved, then delete tmp.
     Carrying,
-    /// Atomic exchange in flight (or two-step: repo moved aside to tmp2).
-    /// Recovery: if repo missing, move tmp into place; else delete tmp.
+    /// Root exchange in flight. Recovery makes the repo whole and parks every
+    /// displaced tree; Windows may also have an intermediate scratch tree.
     Swapping,
+}
+
+/// Result of reconciling an interrupted root replacement.
+#[derive(Debug)]
+pub struct RecoveredSwap {
+    /// The target was already published when a Windows parking rename failed.
+    pub published: bool,
+    /// The displaced tree retained in trash or a sibling location.
+    pub old_tree: Option<PathBuf>,
+}
+
+/// Stored beside the repository so startup can find the journal even while
+/// the Windows exchange has temporarily removed the repository name. The
+/// store location may come from a config file inside that missing tree.
+#[derive(Serialize, Deserialize)]
+struct RecoveryLocator {
+    repo_root: PathBuf,
+    journal: PathBuf,
+    trash: PathBuf,
+    trash_ttl_days: u32,
+}
+
+fn locator_path(repo_root: &Path) -> Result<PathBuf> {
+    let parent = repo_root
+        .parent()
+        .ok_or_else(|| EngineError::Restore("rewind repo root has no parent".into()))?;
+    let name = repo_root
+        .file_name()
+        .ok_or_else(|| EngineError::Restore("rewind repo root has no name".into()))?
+        .to_string_lossy();
+    Ok(parent.join(format!(".{name}.{}-rewind.json", crate::product::NAME)))
+}
+
+/// Recovers before loading the repository's config or canonicalizing its root.
+/// Both operations can fail after the first Windows rename has removed it.
+pub fn recover_before_repo_open(repo_root: &Path) -> Result<PathBuf> {
+    let canonical = match repo_root.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = repo_root
+                .parent()
+                .ok_or_else(|| EngineError::Restore("rewind repo root has no parent".into()))?;
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            parent.canonicalize()?.join(
+                repo_root
+                    .file_name()
+                    .ok_or_else(|| EngineError::Restore("rewind repo root has no name".into()))?,
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(windows)]
+    let canonical = {
+        let mut canonical = canonical;
+        if let (Some(parent), Some(name)) = (canonical.parent(), canonical.file_name()) {
+            let name = name.to_string_lossy();
+            let suffix = format!(".{}-swap", crate::product::NAME);
+            if let Some(original) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(&suffix))
+            {
+                let candidate = parent.join(original);
+                if locator_path(&candidate)?.exists() {
+                    // Windows holds the current directory open. Leave the old
+                    // tree before recovery renames it back to the repository.
+                    std::env::set_current_dir(parent)?;
+                    canonical = candidate;
+                }
+            }
+        }
+        canonical
+    };
+    let locator_path = locator_path(&canonical)?;
+    let text = match std::fs::read_to_string(&locator_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(canonical),
+        Err(error) => return Err(error.into()),
+    };
+    let locator: RecoveryLocator = serde_json::from_str(&text)
+        .map_err(|error| EngineError::Restore(format!("rewind locator: {error}")))?;
+    if locator.repo_root != canonical {
+        return Err(EngineError::Restore("rewind locator repo mismatch".into()));
+    }
+    recover(&locator.journal, &locator.trash, locator.trash_ttl_days)?;
+    std::fs::remove_file(locator_path)?;
+    Ok(canonical)
 }
 
 /// Materializes `generation` into `destination`, which must not exist yet.
@@ -482,6 +622,11 @@ pub async fn execute(
     let nonce = std::process::id();
     let tmp = parent.join(format!(".{name}.{}-tmp-{nonce}", crate::product::NAME));
     let journal_path = store.paths.rewind_journal();
+    let trash_root = store.paths.trash();
+
+    // A failed previous exchange may have left a complete tree in scratch.
+    // Resolve its journal before reusing either the temporary name or journal.
+    recover(&journal_path, &trash_root, trash_ttl_days)?;
 
     // 1. Materialize the target into an empty sibling directory. A tmp left
     // by an earlier attempt that failed before the swap is stale by
@@ -542,7 +687,7 @@ pub async fn execute(
         )?;
         if let Err(error) = carry(repo, &tmp, &carried) {
             // Undo what moved, then abandon the rewind with the repo whole.
-            move_back(&tmp, repo, &carried);
+            move_back(&tmp, repo, &carried)?;
             let _ = std::fs::remove_dir_all(&tmp);
             let _ = std::fs::remove_file(&journal_path);
             return Err(error);
@@ -560,20 +705,65 @@ pub async fn execute(
             carried,
         },
     )?;
-    atomic_exchange(repo, &tmp)?;
+    let locator = publish_locator(repo, &journal_path, &trash_root, trash_ttl_days)?;
+    if let Err(error) = atomic_exchange(repo, &tmp) {
+        // The third Windows rename can fail after the new tree is already
+        // published. Reconcile immediately, before the daemon accepts another
+        // rewind that could reuse the scratch name.
+        return reconcile_exchange_failure(
+            target,
+            repo,
+            &journal_path,
+            &trash_root,
+            trash_ttl_days,
+            error,
+        );
+    }
 
     // 4. Old tree to trash (best effort: EXDEV falls back to a sibling path).
-    let trash_root = store.paths.trash();
     let old_tree = park_replaced_tree(&tmp, &trash_root, parent, &name)?;
-    std::fs::remove_file(&journal_path)
-        .map_err(|error| EngineError::Restore(format!("rewind: clear journal: {error}")))?;
-    prune_trash(&trash_root, trash_ttl_days);
+    finish_published_rewind(&journal_path, &locator, &trash_root, trash_ttl_days);
 
     Ok(RewindOutcome {
         restored: target,
         old_tree,
         warning: "reload your editor: open files still point at the replaced tree",
     })
+}
+
+fn finish_published_rewind(journal: &Path, locator: &Path, trash: &Path, ttl_days: u32) {
+    // The tree is already published. Cleanup failure leaves the journal and
+    // locator for startup retry, but must not report a failed rewind.
+    if std::fs::remove_file(journal).is_ok() {
+        let _ = std::fs::remove_file(locator);
+    }
+    prune_trash(trash, ttl_days);
+}
+
+fn reconcile_exchange_failure(
+    target: GenerationId,
+    repo: &Path,
+    journal_path: &Path,
+    trash_root: &Path,
+    trash_ttl_days: u32,
+    error: EngineError,
+) -> Result<RewindOutcome> {
+    let recovered = recover(journal_path, trash_root, trash_ttl_days)?;
+    if let Ok(locator) = locator_path(repo) {
+        let _ = std::fs::remove_file(locator);
+    }
+    if let Some(RecoveredSwap {
+        published: true,
+        old_tree: Some(old_tree),
+    }) = recovered
+    {
+        return Ok(RewindOutcome {
+            restored: target,
+            old_tree,
+            warning: "reload your editor: open files still point at the replaced tree",
+        });
+    }
+    Err(error)
 }
 
 /// Moves the replaced tree out of the way and returns where it landed.
@@ -584,13 +774,18 @@ pub async fn execute(
 fn park_replaced_tree(tmp: &Path, trash_root: &Path, parent: &Path, name: &str) -> Result<PathBuf> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    let trashed = trash_root.join(format!("{name}-{stamp}"));
-    if std::fs::rename(tmp, &trashed).is_ok() {
+        .map_or(0, |duration| duration.as_nanos());
+    let unique = format!(
+        "{stamp}-{}-{}",
+        std::process::id(),
+        PARK_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let trashed = trash_root.join(format!("{name}-{unique}"));
+    if durable_rename(tmp, &trashed, false).is_ok() {
         return Ok(trashed);
     }
-    let sibling = parent.join(format!(".{name}.{}-trash-{stamp}", crate::product::NAME));
-    std::fs::rename(tmp, &sibling).map_err(|error| {
+    let sibling = parent.join(format!(".{name}.{}-trash-{unique}", crate::product::NAME));
+    durable_rename(tmp, &sibling, false).map_err(|error| {
         EngineError::Restore(format!(
             "rewind: park the replaced tree at {}: {error}",
             sibling.display()
@@ -601,7 +796,11 @@ fn park_replaced_tree(tmp: &Path, trash_root: &Path, parent: &Path, name: &str) 
 
 /// Startup crash recovery. Reads the journal (if any) and finishes or unwinds
 /// the interrupted rewind so the repo is whole before the pipeline baselines.
-pub fn recover(journal_path: &Path) -> Result<Option<Journal>> {
+pub fn recover(
+    journal_path: &Path,
+    trash_root: &Path,
+    trash_ttl_days: u32,
+) -> Result<Option<RecoveredSwap>> {
     let text = match std::fs::read_to_string(journal_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -609,6 +808,11 @@ pub fn recover(journal_path: &Path) -> Result<Option<Journal>> {
     };
     let journal: Journal = serde_json::from_str(&text)
         .map_err(|error| EngineError::Restore(format!("rewind journal: {error}")))?;
+    #[cfg(windows)]
+    let mut published = false;
+    #[cfg(not(windows))]
+    let published = false;
+    let mut old_tree = None;
     match journal.phase {
         Phase::Materializing => {
             // Repo untouched; the partial tmp tree is garbage.
@@ -617,39 +821,96 @@ pub fn recover(journal_path: &Path) -> Result<Option<Journal>> {
         Phase::Carrying => {
             // Some excluded paths may already sit in tmp: bring them home,
             // then drop the unused new tree.
-            move_back(&journal.tmp, &journal.repo_root, &journal.carried);
+            move_back(&journal.tmp, &journal.repo_root, &journal.carried)?;
             let _ = std::fs::remove_dir_all(&journal.tmp);
         }
         Phase::Swapping => {
-            // Windows swaps through a scratch name (see `atomic_exchange`);
-            // whichever step it died on, the scratch holds a tree that one
-            // of the branches below is about to supersede.
             #[cfg(windows)]
             let scratch = swap_scratch(&journal.repo_root);
-            if !journal.repo_root.exists() && journal.tmp.exists() {
-                // The swap died with the repo path vacated and the new tree
-                // still parked at tmp: finish the move. The carried paths are
-                // inside tmp and come along.
-                std::fs::rename(&journal.tmp, &journal.repo_root)?;
-            } else {
-                // The repo path is whole, so it names exactly one tree and
-                // tmp holds the other: the old tree (swap done — keep it out
-                // of the way) or the unused new tree (swap never happened).
-                // Carried paths live in whichever tree is new: if that is
-                // still tmp, they must come back before tmp goes.
-                move_back(&journal.tmp, &journal.repo_root, &journal.carried);
-                let _ = std::fs::remove_dir_all(&journal.tmp);
+            #[cfg(windows)]
+            let scratch_present = scratch
+                .as_deref()
+                .map(path_exists)
+                .transpose()?
+                .unwrap_or(false);
+            let repo_present = path_exists(&journal.repo_root)?;
+            let tmp_present = path_exists(&journal.tmp)?;
+            #[cfg(windows)]
+            {
+                published = repo_present && scratch_present && !tmp_present;
             }
-            // Whatever the scratch still holds has now been superseded by the
-            // branch above, exactly as `tmp` is discarded there.
+            #[cfg(windows)]
+            if scratch_present && tmp_present && repo_present {
+                return Err(EngineError::Restore(
+                    "rewind recovery found three live trees; refusing to discard any".into(),
+                ));
+            }
+            #[cfg(windows)]
+            if !repo_present && scratch_present {
+                // Rename #1 landed but the publication may not have. Restore
+                // the old tree, including excluded paths carried into tmp.
+                let old = scratch
+                    .as_deref()
+                    .ok_or_else(|| EngineError::Restore("rewind scratch path is missing".into()))?;
+                move_back(&journal.tmp, old, &journal.carried)?;
+                durable_rename(old, &journal.repo_root, false)?;
+            } else if !repo_present && tmp_present {
+                // A journal from an older implementation can have no scratch.
+                // Make the repo whole before attempting store startup.
+                durable_rename(&journal.tmp, &journal.repo_root, false)?;
+            } else {
+                // If the exchange never started, carried paths are still in
+                // tmp and must return to the live tree. After a completed
+                // exchange they are already in the live tree.
+                move_back(&journal.tmp, &journal.repo_root, &journal.carried)?;
+            }
+            #[cfg(not(windows))]
+            if !repo_present && tmp_present {
+                durable_rename(&journal.tmp, &journal.repo_root, false)?;
+            } else {
+                move_back(&journal.tmp, &journal.repo_root, &journal.carried)?;
+            }
+            if !path_exists(&journal.repo_root)? {
+                return Err(EngineError::Restore(
+                    "rewind recovery could not find a complete repository tree".into(),
+                ));
+            }
+            let parent = journal
+                .repo_root
+                .parent()
+                .ok_or_else(|| EngineError::Restore("rewind repo root has no parent".into()))?;
+            let name = journal
+                .repo_root
+                .file_name()
+                .ok_or_else(|| EngineError::Restore("rewind repo root has no name".into()))?
+                .to_string_lossy();
+            if path_exists(&journal.tmp)? {
+                old_tree = Some(park_replaced_tree(&journal.tmp, trash_root, parent, &name)?);
+            }
             #[cfg(windows)]
             if let Some(scratch) = scratch {
-                let _ = remove_any(&scratch);
+                if path_exists(&scratch)? {
+                    old_tree = Some(park_replaced_tree(&scratch, trash_root, parent, &name)?);
+                }
             }
         }
     }
     std::fs::remove_file(journal_path)?;
-    Ok(Some(journal))
+    #[cfg(unix)]
+    sync_parent(journal_path)?;
+    prune_trash(trash_root, trash_ttl_days);
+    Ok(Some(RecoveredSwap {
+        published,
+        old_tree,
+    }))
+}
+
+fn path_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
@@ -670,12 +931,103 @@ fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        durable_rename(&tmp, path, true)
     };
     write().map_err(|error| {
         let _ = std::fs::remove_file(&tmp);
         EngineError::Restore(format!("rewind: journal {}: {error}", path.display()))
     })?;
+    Ok(())
+}
+
+fn write_locator(path: &Path, locator: &RecoveryLocator) -> Result<()> {
+    use std::io::Write;
+    let text = serde_json::to_vec(locator)
+        .map_err(|error| EngineError::Restore(format!("encode rewind locator: {error}")))?;
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(&text)?;
+    file.sync_all()?;
+    drop(file);
+    durable_rename(&tmp, path, true)?;
+    Ok(())
+}
+
+fn publish_locator(
+    repo: &Path,
+    journal: &Path,
+    trash: &Path,
+    trash_ttl_days: u32,
+) -> Result<PathBuf> {
+    let path = locator_path(repo)?;
+    write_locator(
+        &path,
+        &RecoveryLocator {
+            repo_root: repo.to_path_buf(),
+            journal: journal.to_path_buf(),
+            trash: trash.to_path_buf(),
+            trash_ttl_days,
+        },
+    )?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn durable_rename(from: &Path, to: &Path, _replace: bool) -> std::io::Result<()> {
+    std::fs::rename(from, to)?;
+    let parent = to
+        .parent()
+        .ok_or_else(|| std::io::Error::other("rename path has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    if from.parent() != to.parent() {
+        let parent = from
+            .parent()
+            .ok_or_else(|| std::io::Error::other("rename path has no parent"))?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "MoveFileExW receives two terminated UTF-16 path buffers"
+)]
+fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<()> {
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| EngineError::Restore("rewind path has no parent".into()))?,
+    )?
+    .sync_all()?;
     Ok(())
 }
 
@@ -721,28 +1073,33 @@ pub(crate) fn swap_scratch(a: &Path) -> Option<PathBuf> {
 /// path either absent or naming exactly one whole tree, and [`recover`]
 /// resolves each of them from the journal: the `Swapping` arm finishes the
 /// move when the repo path is missing, and clears the scratch either way.
-/// A crash during a journal-less [`restore_path`] leaves the same scratch
-/// behind, which the next swap of that path removes before it starts.
+/// A crash during a journal-less [`restore_path`] may leave the same scratch
+/// behind; a later swap refuses to overwrite that potentially unique tree.
 #[cfg(windows)]
 fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
     let scratch =
         swap_scratch(a).ok_or_else(|| EngineError::Restore("swap path has no parent".into()))?;
-    // A scratch left by an interrupted swap is stale by construction: the
-    // recovery below never keeps it, so anything still here predates us.
-    let _ = remove_any(&scratch);
+    // A preexisting scratch may be the only copy of the prior tree after a
+    // failed exchange. The caller must recover it before starting a new swap.
+    if path_exists(&scratch)? {
+        return Err(EngineError::Restore(format!(
+            "swap scratch {} is occupied; recover the previous exchange first",
+            scratch.display()
+        )));
+    }
 
-    std::fs::rename(a, &scratch).map_err(|error| {
+    durable_rename(a, &scratch, false).map_err(|error| {
         EngineError::Restore(format!("swap: move aside {}: {error}", a.display()))
     })?;
-    if let Err(error) = std::fs::rename(b, a) {
+    if let Err(error) = durable_rename(b, a, false) {
         // Nothing has been published yet; put `a` back and fail clean.
-        let _ = std::fs::rename(&scratch, a);
+        let _ = durable_rename(&scratch, a, false);
         return Err(EngineError::Restore(format!(
             "swap: move {} into place: {error}",
             b.display()
         )));
     }
-    std::fs::rename(&scratch, b).map_err(|error| {
+    durable_rename(&scratch, b, false).map_err(|error| {
         // `a` already holds the new tree, so the exchange has effectively
         // happened; only the old tree's parking spot is wrong. Leave the
         // scratch for recovery rather than unwinding a published swap.
@@ -766,6 +1123,10 @@ fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
     // atomically on APFS.
     let result = unsafe { libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP) };
     if result == 0 {
+        sync_parent(a)?;
+        if a.parent() != b.parent() {
+            sync_parent(b)?;
+        }
         Ok(())
     } else {
         Err(EngineError::Restore(format!(
@@ -799,6 +1160,10 @@ fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
         )
     };
     if result == 0 {
+        sync_parent(a)?;
+        if a.parent() != b.parent() {
+            sync_parent(b)?;
+        }
         Ok(())
     } else {
         Err(EngineError::Restore(format!(
@@ -810,6 +1175,75 @@ fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parking_replaced_trees_never_reuses_a_name() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let trash = work.path().join("trash");
+        std::fs::create_dir(&trash)?;
+        let mut parked = Vec::new();
+        for index in 0..3 {
+            let tmp = work.path().join(format!("tmp-{index}"));
+            std::fs::create_dir(&tmp)?;
+            std::fs::write(tmp.join("old.txt"), index.to_string())?;
+            let destination = park_replaced_tree(&tmp, &trash, work.path(), "repo")?;
+            assert_eq!(
+                std::fs::read_to_string(destination.join("old.txt"))?,
+                index.to_string()
+            );
+            parked.push(destination);
+        }
+        assert!(parked[0] != parked[1] && parked[1] != parked[2] && parked[0] != parked[2]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_restore_rejects_symlinked_parent() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let root = work.path().join("repo");
+        let outside = work.path().join("outside");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&outside)?;
+        std::os::unix::fs::symlink(&outside, root.join("dir"))?;
+        assert!(ensure_real_parents(&root, Path::new("dir/file")).is_err());
+        assert!(!outside.join("file").exists());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_restore_rejects_reparse_parent_when_symlinks_are_available() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let root = work.path().join("repo");
+        let outside = work.path().join("outside");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&outside)?;
+        if let Err(error) = std::os::windows::fs::symlink_dir(&outside, root.join("dir")) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        assert!(ensure_real_parents(&root, Path::new("dir/file")).is_err());
+        assert!(!outside.join("file").exists());
+        Ok(())
+    }
+
+    fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
+        let trash = journal_path.with_file_name("trash");
+        std::fs::create_dir_all(&trash)?;
+        super::recover(journal_path, &trash, 30)
+    }
+
+    fn parked_tree_contains(journal_path: &Path, file: &str, expected: &[u8]) -> bool {
+        let trash = journal_path.with_file_name("trash");
+        std::fs::read_dir(trash)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| std::fs::read(entry.path().join(file)).ok().as_deref() == Some(expected))
+    }
 
     fn journal(repo: &Path, tmp: &Path, phase: Phase) -> Journal {
         Journal {
@@ -835,7 +1269,10 @@ mod tests {
         let journal_path = work.path().join("journal.json");
         write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
 
-        recover(&journal_path).expect("recover");
+        let recovered = recover(&journal_path)
+            .expect("recover")
+            .expect("recovered journal");
+        assert!(!recovered.published);
         assert_eq!(
             std::fs::read(repo.join("file.txt")).expect("read"),
             b"restored"
@@ -922,6 +1359,32 @@ mod tests {
     }
 
     #[test]
+    fn recover_keeps_both_trees_and_journal_on_carried_path_conflict() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::create_dir(&tmp).expect("tmp");
+        std::fs::write(repo.join(".env"), b"repo copy").expect("repo data");
+        std::fs::write(tmp.join(".env"), b"staged copy").expect("staged data");
+        let journal_path = work.path().join("journal.json");
+        let mut entry = journal(&repo, &tmp, Phase::Carrying);
+        entry.carried = vec![PathBuf::from(".env")];
+        write(&journal_path, &entry);
+
+        recover(&journal_path).expect_err("conflicting copies require inspection");
+        assert_eq!(
+            std::fs::read(repo.join(".env")).expect("repo"),
+            b"repo copy"
+        );
+        assert_eq!(
+            std::fs::read(tmp.join(".env")).expect("staged"),
+            b"staged copy"
+        );
+        assert!(journal_path.exists());
+    }
+
+    #[test]
     fn recover_after_the_swap_leaves_carried_paths_in_the_new_tree() {
         // Exchange completed: repo is the new tree with the carried paths,
         // tmp is the old tree without them. Nothing moves; tmp goes.
@@ -945,6 +1408,7 @@ mod tests {
             b"LIVE"
         );
         assert!(!tmp.exists());
+        assert!(parked_tree_contains(&journal_path, "file.txt", b"old"));
     }
 
     #[test]
@@ -1004,41 +1468,110 @@ mod tests {
         );
     }
 
-    /// Windows swaps through a scratch directory, so a crash can leave the
-    /// repo path vacated with the new tree still at `tmp` and the old tree
-    /// parked in the scratch. Recovery has to finish the move *and* clear the
-    /// scratch, or the next rewind inherits a stale tree beside the repo.
     #[cfg(windows)]
     #[test]
-    fn recover_clears_the_scratch_a_windows_swap_left() {
+    fn exchange_refuses_to_overwrite_a_previous_scratch_tree() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let live = work.path().join("live");
+        let staged = work.path().join("staged");
+        let scratch = swap_scratch(&live).expect("scratch");
+        for path in [&live, &staged, &scratch] {
+            std::fs::create_dir(path).expect("tree");
+        }
+        std::fs::write(scratch.join("only-copy"), b"old data").expect("scratch data");
+
+        atomic_exchange(&live, &staged).expect_err("scratch must block new swap");
+        assert!(live.exists());
+        assert!(staged.exists());
+        assert_eq!(
+            std::fs::read(scratch.join("only-copy")).expect("old data survived"),
+            b"old data"
+        );
+    }
+
+    /// A crash after Windows rename #1 must roll back to the old tree and
+    /// retain the staged new tree in trash for recovery or inspection.
+    #[cfg(windows)]
+    #[test]
+    fn startup_recovers_before_the_repository_path_exists() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work
+            .path()
+            .canonicalize()
+            .expect("canonical parent")
+            .join("repo");
+        let scratch = swap_scratch(&repo).expect("scratch path");
+        let staged = work.path().join("staged");
+        std::fs::create_dir(&scratch).expect("old tree");
+        std::fs::write(scratch.join("old.txt"), b"original").expect("old file");
+        std::fs::create_dir(&staged).expect("new tree");
+        std::fs::write(staged.join("new.txt"), b"replacement").expect("new file");
+        let store = work.path().join("custom-store");
+        std::fs::create_dir(&store).expect("custom store");
+        let journal_path = store.join("rewind-journal.json");
+        let trash = store.join("trash");
+        std::fs::create_dir(&trash).expect("trash");
+        write(&journal_path, &journal(&repo, &staged, Phase::Swapping));
+        let locator = locator_path(&repo).expect("locator path");
+        write_locator(
+            &locator,
+            &RecoveryLocator {
+                repo_root: repo.clone(),
+                journal: journal_path.clone(),
+                trash,
+                trash_ttl_days: 30,
+            },
+        )
+        .expect("locator");
+
+        recover_before_repo_open(&repo).expect("startup recovery");
+        assert_eq!(
+            std::fs::read(repo.join("old.txt")).expect("old tree"),
+            b"original"
+        );
+        assert!(!journal_path.exists());
+        assert!(!locator.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recover_preserves_both_trees_after_first_windows_rename() {
         let work = tempfile::tempdir().expect("tempdir");
         let repo = work.path().join("repo");
         let tmp = work.path().join("repo.tmp");
         std::fs::create_dir(&tmp).expect("tmp");
         std::fs::write(tmp.join("file.txt"), b"new tree").expect("seed new");
+        std::fs::write(tmp.join(".env"), b"carried live data").expect("carry");
         // Died between rename one and rename two: repo vacated, old tree parked.
         let scratch = swap_scratch(&repo).expect("scratch path");
         std::fs::create_dir(&scratch).expect("scratch");
         std::fs::write(scratch.join("file.txt"), b"old tree").expect("seed old");
         let journal_path = work.path().join("journal.json");
-        write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
+        let mut entry = journal(&repo, &tmp, Phase::Swapping);
+        entry.carried = vec![PathBuf::from(".env")];
+        write(&journal_path, &entry);
 
         recover(&journal_path).expect("recover");
 
         assert_eq!(
             std::fs::read(repo.join("file.txt")).expect("repo whole"),
-            b"new tree"
+            b"old tree"
         );
         assert!(!scratch.exists(), "scratch must not outlive recovery");
         assert!(!tmp.exists());
         assert!(!journal_path.exists());
+        assert_eq!(
+            std::fs::read(repo.join(".env")).expect("carried data survived"),
+            b"carried live data"
+        );
+        assert!(parked_tree_contains(&journal_path, "file.txt", b"new tree"));
     }
 
-    /// The other Windows crash point: rename two landed, so the repo already
-    /// holds the new tree and only the scratch is left to clear.
+    /// After rename #2 the new tree is published, and the old tree in
+    /// scratch must be parked rather than deleted.
     #[cfg(windows)]
     #[test]
-    fn recover_clears_the_scratch_after_the_swap_landed() {
+    fn recover_preserves_old_tree_after_second_windows_rename() {
         let work = tempfile::tempdir().expect("tempdir");
         let repo = work.path().join("repo");
         std::fs::create_dir(&repo).expect("repo");
@@ -1050,7 +1583,23 @@ mod tests {
         let journal_path = work.path().join("journal.json");
         write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
 
-        recover(&journal_path).expect("recover");
+        let generation = GenerationId::new(acyclic_fs::Digest::ZERO);
+        let trash = journal_path.with_file_name("trash");
+        std::fs::create_dir(&trash).expect("trash");
+        let outcome = reconcile_exchange_failure(
+            generation,
+            &repo,
+            &journal_path,
+            &trash,
+            30,
+            EngineError::Restore("injected third rename failure".into()),
+        )
+        .expect("published rewind is a success");
+        assert_eq!(outcome.restored, generation);
+        assert_eq!(
+            std::fs::read(outcome.old_tree.join("file.txt")).expect("old tree"),
+            b"old tree"
+        );
 
         assert_eq!(
             std::fs::read(repo.join("file.txt")).expect("repo whole"),
@@ -1058,5 +1607,6 @@ mod tests {
         );
         assert!(!scratch.exists(), "scratch must not outlive recovery");
         assert!(!journal_path.exists());
+        assert!(parked_tree_contains(&journal_path, "file.txt", b"old tree"));
     }
 }

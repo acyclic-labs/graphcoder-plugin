@@ -142,6 +142,84 @@ impl Client {
         result
     }
 
+    /// Take a user-requested checkpoint and wait until it has landed.
+    ///
+    /// Product consumers should use this instead of constructing the wire
+    /// operation themselves. Hook-specific checkpoint metadata remains on
+    /// [`Client::call`] until it has a real consumer-facing abstraction.
+    pub fn manual_checkpoint(
+        &mut self,
+        label: Option<String>,
+    ) -> Result<proto::CheckpointInfo, String> {
+        match self.call(proto::Op::Checkpoint {
+            kind: proto::CheckpointRequestKind::Manual,
+            session_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            label,
+            wait: true,
+            durable: false,
+        })? {
+            proto::Reply::Checkpoint(info) => Ok(info),
+            other => Err(unexpected_reply("checkpoint", &other)),
+        }
+    }
+
+    /// List checkpoints through the stable, typed client surface.
+    pub fn timeline(
+        &mut self,
+        session_id: Option<String>,
+        turn: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<proto::TimelineEntry>, String> {
+        match self.call(proto::Op::Timeline {
+            session_id,
+            turn,
+            limit,
+        })? {
+            proto::Reply::Timeline(entries) => Ok(entries),
+            other => Err(unexpected_reply("timeline", &other)),
+        }
+    }
+
+    /// Replace the working tree at a checkpoint.
+    pub fn rewind(&mut self, target: proto::RewindTarget) -> Result<proto::RewindInfo, String> {
+        match self.call(proto::Op::Rewind { target, path: None })? {
+            proto::Reply::Rewind(info) => Ok(info),
+            other => Err(unexpected_reply("rewind", &other)),
+        }
+    }
+
+    /// Restore one path while leaving the rest of the tree untouched.
+    pub fn restore(&mut self, checkpoint: i64, path: String) -> Result<proto::RestoreInfo, String> {
+        match self.call(proto::Op::Rewind {
+            target: proto::RewindTarget::Checkpoint(checkpoint),
+            path: Some(path),
+        })? {
+            proto::Reply::Restore(info) => Ok(info),
+            other => Err(unexpected_reply("restore", &other)),
+        }
+    }
+
+    /// Compute a diff using either row ids or generation prefixes.
+    pub fn diff(
+        &mut self,
+        before: Option<i64>,
+        after: Option<i64>,
+        before_hex: Option<String>,
+        after_hex: Option<String>,
+    ) -> Result<Vec<proto::DiffEntry>, String> {
+        match self.call(proto::Op::Diff {
+            before,
+            after,
+            before_hex,
+            after_hex,
+        })? {
+            proto::Reply::Diff(entries) => Ok(entries),
+            other => Err(unexpected_reply("diff", &other)),
+        }
+    }
+
     fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Payload, String> {
         let deadline = self.call_timeout.map(|timeout| Instant::now() + timeout);
         let request = proto::Request {
@@ -204,6 +282,10 @@ impl Client {
         }
         Ok(response.payload)
     }
+}
+
+fn unexpected_reply(operation: &str, reply: &proto::Reply) -> String {
+    format!("{operation}: unexpected daemon reply {reply:?}")
 }
 
 fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, String> {

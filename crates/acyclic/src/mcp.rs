@@ -104,16 +104,7 @@ where
 /// recorded afterwards (the same thing the CLI prints), so the caller can
 /// refer to the post-restore state without another `timeline` call.
 fn restore_one(client: &mut Client, checkpoint: i64, path: String) -> Result<String, McpError> {
-    let reply = call(
-        client,
-        proto::Op::Rewind {
-            target: proto::RewindTarget::Checkpoint(checkpoint),
-            path: Some(path),
-        },
-    )?;
-    let proto::Reply::Restore(info) = reply else {
-        return Err(internal_error("unexpected reply".into()));
-    };
+    let info = client.restore(checkpoint, path).map_err(internal_error)?;
     let what = match info.action {
         proto::RestoreAction::Removed => format!("absent at #{}, removed", info.checkpoint),
         _ => format!("restored from #{}", info.checkpoint),
@@ -211,21 +202,9 @@ impl McpServer {
         Parameters(params): Parameters<CheckpointParams>,
     ) -> Result<String, McpError> {
         with_daemon(self.repo.clone(), move |client| {
-            let reply = call(
-                client,
-                proto::Op::Checkpoint {
-                    kind: proto::CheckpointRequestKind::Manual,
-                    session_id: None,
-                    tool_call_id: None,
-                    tool_name: None,
-                    label: params.message,
-                    wait: true,
-                    durable: false,
-                },
-            )?;
-            let proto::Reply::Checkpoint(info) = reply else {
-                return Err(internal_error("unexpected reply".into()));
-            };
+            let info = client
+                .manual_checkpoint(params.message)
+                .map_err(internal_error)?;
             Ok(format!("checkpoint #{} ({})", info.row_id, info.generation))
         })
         .await
@@ -240,17 +219,9 @@ impl McpServer {
         Parameters(params): Parameters<TimelineParams>,
     ) -> Result<String, McpError> {
         with_daemon(self.repo.clone(), move |client| {
-            let reply = call(
-                client,
-                proto::Op::Timeline {
-                    session_id: None,
-                    turn: None,
-                    limit: params.limit.unwrap_or(50),
-                },
-            )?;
-            let proto::Reply::Timeline(entries) = reply else {
-                return Err(internal_error("unexpected reply".into()));
-            };
+            let entries = client
+                .timeline(None, None, params.limit.unwrap_or(50))
+                .map_err(internal_error)?;
             if entries.is_empty() {
                 return Ok("no checkpoints yet".into());
             }
@@ -341,16 +312,9 @@ impl McpServer {
             ));
         }
         with_daemon(self.repo.clone(), move |client| {
-            let reply = call(
-                client,
-                proto::Op::Rewind {
-                    target: proto::RewindTarget::Checkpoint(params.checkpoint),
-                    path: None,
-                },
-            )?;
-            let proto::Reply::Rewind(info) = reply else {
-                return Err(internal_error("unexpected reply".into()));
-            };
+            let info = client
+                .rewind(proto::RewindTarget::Checkpoint(params.checkpoint))
+                .map_err(internal_error)?;
             Ok(format!(
                 "restored checkpoint #{}\nold tree kept at {}\nnote: {}",
                 info.restored_checkpoint, info.old_tree, info.warning
@@ -366,18 +330,9 @@ impl McpServer {
     )]
     async fn diff(&self, Parameters(params): Parameters<DiffParams>) -> Result<String, McpError> {
         with_daemon(self.repo.clone(), move |client| {
-            let reply = call(
-                client,
-                proto::Op::Diff {
-                    before: params.before,
-                    after: params.after,
-                    before_hex: None,
-                    after_hex: None,
-                },
-            )?;
-            let proto::Reply::Diff(entries) = reply else {
-                return Err(internal_error("unexpected reply".into()));
-            };
+            let entries = client
+                .diff(params.before, params.after, None, None)
+                .map_err(internal_error)?;
             if entries.is_empty() {
                 return Ok("no changes".into());
             }
