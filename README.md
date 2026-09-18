@@ -121,7 +121,7 @@ V1 is entirely local: no sandboxes, no managed sessions, no cloud sync. It ships
 One engine, thin adapters:
 
 - **`acyclic` CLI + daemon** — watcher, Merkle-DAG snapshot store, index. Host-agnostic.
-- **Per-host adapters** — hook-based for CLIs with a lifecycle-hook API (Claude Code, Codex, Cursor), MCP-based for desktop apps and IDEs without one (Claude Desktop, VS Code; Cursor gets both). Every adapter is a `HostAdapter` in `crates/acyclic/src/install.rs`; the MCP server itself is `crates/acyclic/src/mcp.rs`, a thin translation of each tool call into the same `acyclic-proto::Op` the hooks send. The table under [Install](#per-host) says what each one writes and how far it has been verified; `docs/design/06-installation.md` has the design and the ship decision for the MCP path.
+- **Per-host adapters** — hook-based for CLIs with a lifecycle-hook API (Claude Code, Codex, Cursor), MCP-based for desktop apps and IDEs without one (Claude Desktop, VS Code; Cursor gets both). Every adapter is a `HostAdapter` in `crates/acyclic/src/install.rs`; the MCP server itself is `crates/acyclic/src/mcp.rs`, a thin translation of each tool call into the same private `proto::Op` the hooks send. The table under [Install](#per-host) says what each one writes and how far it has been verified; `docs/design/06-installation.md` has the design and the ship decision for the MCP path.
 
 ## Launch plan
 

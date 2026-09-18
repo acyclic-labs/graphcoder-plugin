@@ -5,8 +5,8 @@
 //! the last session ended, what it changed, which branches it abandoned, and
 //! the verbs that reach the rest.
 
+use crate::proto;
 use acyclic_engine::product::NAME;
-use acyclic_proto as proto;
 
 /// Hard cap on the rendered text, including the trailing newline.
 pub const BUDGET_BYTES: usize = 1000;

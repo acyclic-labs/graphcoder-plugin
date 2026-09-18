@@ -22,13 +22,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::proto;
 use acyclic_engine::index::Index;
 use acyclic_engine::pipeline::PipelineHandle;
 use acyclic_engine::spec::{
     RunId, RunOutcome, SpecEvent as LogEvent, SpecEventRow, SpecHit, SpecKey, SpecKind,
     SpecMetrics, SpecState, SpecStore, SpeculateConfig,
 };
-use acyclic_proto as proto;
 use tokio::sync::{mpsc, oneshot};
 
 /// Bound on the claim path's wait for `spec.db`. Short on purpose: the one

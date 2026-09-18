@@ -8,7 +8,6 @@ version = "0.0.2"
 dependencies = [
  "acyclic-engine",
  "acyclic-fs",
- "acyclic-proto",
  "clap",
  "libc",
  "rmcp",
@@ -84,14 +83,6 @@ dependencies = [
  "prost-types",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "acyclic-proto"
-version = "0.0.2"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

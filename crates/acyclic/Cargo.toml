@@ -11,7 +11,6 @@ description = "Agent-native state engine: checkpoints, rewind, and blast-radius 
 [dependencies]
 acyclic-engine = { path = "../acyclic-engine" }
 acyclic-fs.workspace = true
-acyclic-proto = { path = "../acyclic-proto" }
 clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "3.3.0", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"

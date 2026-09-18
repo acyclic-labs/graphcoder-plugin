@@ -10,8 +10,8 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::proto;
 use acyclic_engine::product::NAME;
-use acyclic_proto as proto;
 
 use crate::client::{Client, ConnectError, Spawn};
 

@@ -6,8 +6,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::ipc::ClientStream;
+use crate::proto;
 use acyclic_engine::product::NAME;
-use acyclic_proto as proto;
 
 #[derive(Clone, Copy)]
 pub enum Spawn {

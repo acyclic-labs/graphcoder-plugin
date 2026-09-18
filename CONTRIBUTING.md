@@ -100,7 +100,7 @@ guards what those can't express. The rules, and why each exists:
 The public product name is defined once, in `product.toml`, and threaded through everywhere else:
 `product::NAME` in Rust, `scripts/product.sh` in shell. Never hardcode the name as a literal
 string or path in source — `scripts/check-product-name.sh` fails CI if it drifts. Crate names
-(`acyclic`, `acyclic-engine`, `acyclic-proto`, `acyclic-qual`) are internal identifiers and are
+(`acyclic`, `acyclic-engine`, `acyclic-qual`) are internal identifiers and are
 exempt from this check.
 
 ## Design context

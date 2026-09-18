@@ -3,7 +3,7 @@
 //! that support it alongside hooks (Cursor). Exposes the same verbs already
 //! surfaced to every other host via `AGENTS_MD_BLOCK`/`SELF_ROLLBACK_SKILL`
 //! (see `install.rs`) as MCP tools, translating each call directly into the
-//! `acyclic-proto::Op` the daemon already understands. The MCP adapters in
+//! `proto::Op` the daemon already understands. The MCP adapters in
 //! `install.rs` register it with each host; `tests/acceptance/mcp-e2e.sh`
 //! drives it end-to-end.
 //!
@@ -19,8 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::proto;
 use acyclic_engine::product::{self, NAME};
-use acyclic_proto as proto;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo},

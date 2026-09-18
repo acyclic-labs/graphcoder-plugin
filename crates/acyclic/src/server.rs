@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ipc;
+use crate::proto;
 use acyclic_engine::config::Config;
 use acyclic_engine::fork::{
     self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
@@ -23,7 +24,6 @@ use acyclic_fs::{
     mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
     NativeMountRequest, NativeMountSession, RoutedMountSource,
 };
-use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify};
 

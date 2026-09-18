@@ -18,8 +18,7 @@ The engine is imported, not built: `acyclic-fs` + `acyclic-fs-mount` via path de
 ```
 crates/
   acyclic-engine/       lib: store, pipeline, index, rewind, diff, config
-  acyclic-proto/        lib: CLI ↔ daemon message types
-  acyclic/              bin: CLI + hidden `__daemon` subcommand
+  acyclic/              bin: CLI + hidden `__daemon` subcommand; private protocol module
   acyclic-qual/         Phase 0 harness → standing bench suite (exists)
 adapters/claude-code/   hooks, /rewind command, self-rollback skill
 tests/acceptance/       one script per acceptance criterion
@@ -82,7 +81,7 @@ Single-file restore (`rewind --path`): copy the one file out of the target check
 
 **Goal:** the bare-CLI product works end to end.
 
-- **Protocol** (`acyclic-proto`): newline-delimited JSON over the unix socket. Ops: `ping, status, checkpoint, timeline, rewind, diff, session_start, session_end, commit, stop`.
+- **Protocol** (`acyclic/src/proto.rs`): newline-delimited JSON over the local daemon transport. Ops: `ping, status, checkpoint, timeline, rewind, diff, session_start, session_end, commit, stop`.
   The one latency-critical detail: `checkpoint{wait:false}` replies on *enqueue* (~ms — the PostToolUse path); `wait:true` replies when the checkpoint lands (the PreToolUse path).
 - **Daemon** (`acyclic __daemon`): socket listener + pipeline + janitor (trash TTL, idle-commit timer). Pidfile prevents doubles; SIGTERM drains the queue and commits.
 - **CLI verbs:** `init`, `checkpoint [-m] [--wait] [--durable]`, `timeline`, `rewind <id|--last|--session-start> [--path]` (prints blast summary, confirms), `diff [--stat]`, `status`, `stop`, `install <host>`.

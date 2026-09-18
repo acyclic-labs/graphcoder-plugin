@@ -19,6 +19,7 @@ mod hook;
 mod install;
 mod ipc;
 mod mcp;
+mod proto;
 mod server;
 mod spec_runner;
 mod speculate;
@@ -27,7 +28,6 @@ use std::path::{Path, PathBuf};
 
 use acyclic_engine::product::{self, NAME};
 use acyclic_engine::short_hex;
-use acyclic_proto as proto;
 use clap::{Parser, Subcommand};
 
 use client::{Client, ConnectError, Spawn};
