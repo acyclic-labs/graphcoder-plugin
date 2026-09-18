@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use acyclic_engine::config::Config;
-use acyclic_engine::fork::ForkSeed;
-use acyclic_engine::index::{Attribution, CheckpointKind, Index};
-use acyclic_engine::merge::{self, ConflictKind, Entry, Reason};
-use acyclic_engine::pipeline::{self, PipelineHandle};
-use acyclic_engine::store::{Store, StorePaths};
-use acyclic_engine::GenerationId;
+use acyclic::config::Config;
+use acyclic::fork::ForkSeed;
+use acyclic::index::{Attribution, CheckpointKind, Index};
+use acyclic::merge::{self, ConflictKind, Entry, Reason};
+use acyclic::pipeline::{self, PipelineHandle};
+use acyclic::store::{Store, StorePaths};
+use acyclic::GenerationId;
 use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{CancellationToken, WorkCounters};
@@ -124,8 +124,8 @@ fn namespace(path: &str) -> NamespacePath {
         .split('/')
         .map(|component| {
             LogicalName::new(
-                acyclic_engine::names::encoding(),
-                acyclic_engine::names::str_to_bytes(component),
+                acyclic::names::encoding(),
+                acyclic::names::str_to_bytes(component),
                 limits.maximum_component_bytes,
             )
             .expect("logical name")
@@ -295,7 +295,7 @@ fn plan_and_merge_generation_over_real_generations() {
             .await
             .expect("diff")
             .into_iter()
-            .filter(|c| c.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+            .filter(|c| c.change != acyclic::diff::ChangeKind::MetadataOnly)
             .map(|c| c.path)
             .collect();
         assert_eq!(changed, plan.landing_paths());
@@ -411,7 +411,7 @@ fn conflicts_are_collected_and_r_carries_markers() {
             .await
             .expect("diff")
             .into_iter()
-            .filter(|c| c.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+            .filter(|c| c.change != acyclic::diff::ChangeKind::MetadataOnly)
             .map(|c| c.path)
             .collect();
         let roots = merge::subtree_roots(&changes);
@@ -437,7 +437,7 @@ fn conflicts_are_collected_and_r_carries_markers() {
             .await
             .expect("diff")
             .into_iter()
-            .filter(|c| c.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+            .filter(|c| c.change != acyclic::diff::ChangeKind::MetadataOnly)
             .map(|c| c.path)
             .collect();
         assert!(remaining.is_empty(), "overlay must equal R: {remaining:?}");

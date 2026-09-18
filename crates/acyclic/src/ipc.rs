@@ -6,7 +6,7 @@
 //! the endpoint naming, the "already running" check, and teardown differ.
 //!
 //! Callers name the endpoint with the socket path from
-//! [`acyclic_engine::store::Paths::socket`] on every platform. On Windows
+//! [`acyclic::store::Paths::socket`] on every platform. On Windows
 //! that path is never created on disk — it only supplies the stable,
 //! per-store name the pipe is built from.
 
@@ -58,7 +58,7 @@ fn pipe_name(socket: &Path) -> String {
             }
         })
         .collect();
-    format!(r"\\.\pipe\{}-{key}", acyclic_engine::product::NAME)
+    format!(r"\\.\pipe\{}-{key}", acyclic::product::NAME)
 }
 
 // ---------------------------------------------------------------- client

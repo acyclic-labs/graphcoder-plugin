@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::ipc::ClientStream;
 use crate::proto;
-use acyclic_engine::product::NAME;
+use acyclic::product::NAME;
 
 #[derive(Clone, Copy)]
 pub enum Spawn {
@@ -47,17 +47,17 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         let started = std::time::Instant::now();
         if let Ok(stream) = ClientStream::connect(socket) {
-            acyclic_engine::trace!(
+            acyclic::trace!(
                 "client",
                 "connected to running daemon at {} in {:.1}ms",
                 crate::ipc::endpoint_display(socket),
-                acyclic_engine::trace::ms(started)
+                acyclic::trace::ms(started)
             );
             return Self::from_stream(stream);
         }
         match spawn {
             Spawn::Never => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "no daemon at {} and spawning is not allowed here",
                     crate::ipc::endpoint_display(socket)
@@ -65,7 +65,7 @@ impl Client {
                 Err(ConnectError::NoDaemon)
             }
             Spawn::Allowed | Spawn::AllowedFor(_) => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "no daemon at {}: spawning one",
                     crate::ipc::endpoint_display(socket)
@@ -76,10 +76,10 @@ impl Client {
                     _ => None,
                 };
                 let client = wait_for_socket(socket, child, log_path, bound);
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "daemon spawn + socket wait took {:.1}ms",
-                    acyclic_engine::trace::ms(started)
+                    acyclic::trace::ms(started)
                 );
                 client
             }
@@ -113,7 +113,7 @@ impl Client {
         let name = format!("{op:?}");
         let name = name.split([' ', '{', '(']).next().unwrap_or("?").to_owned();
         let started = std::time::Instant::now();
-        acyclic_engine::trace!("client", "call #{id} {name}");
+        acyclic::trace!("client", "call #{id} {name}");
         let result = match self.call_inner(id, op) {
             Ok(proto::Payload::Ok(reply)) => Ok(*reply),
             Ok(proto::Payload::Err { message }) => Err(message),
@@ -126,16 +126,16 @@ impl Client {
             Ok(reply) => {
                 let reply_name = format!("{reply:?}");
                 let reply_name = reply_name.split([' ', '{', '(']).next().unwrap_or("?");
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "call #{id} {name} -> {reply_name} in {:.1}ms",
-                    acyclic_engine::trace::ms(started)
+                    acyclic::trace::ms(started)
                 );
             }
-            Err(message) => acyclic_engine::trace!(
+            Err(message) => acyclic::trace!(
                 "client",
                 "call #{id} {name} -> error in {:.1}ms: {}",
-                acyclic_engine::trace::ms(started),
+                acyclic::trace::ms(started),
                 message.lines().next().unwrap_or("")
             ),
         }
@@ -421,10 +421,10 @@ fn wait_for_socket(
             }
         }
         if bound.is_some_and(|bound| started.elapsed() > bound) {
-            acyclic_engine::trace!(
+            acyclic::trace!(
                 "client",
                 "daemon still starting after {:.1}ms; not waiting",
-                acyclic_engine::trace::ms(started)
+                acyclic::trace::ms(started)
             );
             return Err(ConnectError::Starting);
         }

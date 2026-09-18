@@ -14,11 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use acyclic_engine::config::Config;
-use acyclic_engine::fork::{PromoteOutcome, SessionResolveOutcome};
-use acyclic_engine::index::{Attribution, CheckpointKind, Index};
-use acyclic_engine::pipeline::{self, PipelineHandle};
-use acyclic_engine::store::{Store, StorePaths};
+use acyclic::config::Config;
+use acyclic::fork::{PromoteOutcome, SessionResolveOutcome};
+use acyclic::index::{Attribution, CheckpointKind, Index};
+use acyclic::pipeline::{self, PipelineHandle};
+use acyclic::store::{Store, StorePaths};
 use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{CancellationToken, WorkCounters};
@@ -92,8 +92,8 @@ fn namespace(path: &str) -> NamespacePath {
         .filter(|part| !part.is_empty())
         .map(|part| {
             LogicalName::new(
-                acyclic_engine::names::encoding(),
-                acyclic_engine::names::str_to_bytes(part),
+                acyclic::names::encoding(),
+                acyclic::names::str_to_bytes(part),
                 limits.maximum_component_bytes,
             )
             .expect("name")
@@ -104,7 +104,7 @@ fn namespace(path: &str) -> NamespacePath {
 
 /// Writes into a fork's overlay exactly as a mount callback would: through
 /// the shared checkout.
-async fn write_in_fork(seed: &acyclic_engine::fork::ForkSeed, path: &str, bytes: &[u8]) {
+async fn write_in_fork(seed: &acyclic::fork::ForkSeed, path: &str, bytes: &[u8]) {
     let cancel = CancellationToken::new();
     let mut guard = seed.shared.lock().await;
     guard

@@ -54,7 +54,7 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 
 ## The public name
 
-`product.toml` at the repo root holds the public name once. The CLI command, `.<name>/config.toml`, the state and config directories, hook commands, skill names, message prefixes, the `<NAME>_TRACE` and `<NAME>_HOOK` variables, release asset names, and the npm bin all derive from it at build or packaging time (`crates/acyclic-engine/build.rs`, `scripts/product.sh`, the workflows). Crate names stay `acyclic*` because they are internal. `scripts/install.sh` is fetched standalone and mirrors the name, repo, and npm package; `scripts/check-product-name.sh` fails CI if any of them drifts or if any user-facing Rust string spells the name out. Renaming is: change `product.toml`, update the three mirror lines in `install.sh`, rebuild.
+`product.toml` at the repo root holds the public name once. The CLI command, `.<name>/config.toml`, the state and config directories, hook commands, skill names, message prefixes, the `<NAME>_TRACE` and `<NAME>_HOOK` variables, release asset names, and the npm bin all derive from it at build or packaging time (`crates/acyclic/build.rs`, `scripts/product.sh`, the workflows). Crate names stay `acyclic*` because they are internal. `scripts/install.sh` is fetched standalone and mirrors the name, repo, and npm package; `scripts/check-product-name.sh` fails CI if any of them drifts or if any user-facing Rust string spells the name out. Renaming is: change `product.toml`, update the three mirror lines in `install.sh`, rebuild.
 
 ## Configuration
 

@@ -15,7 +15,7 @@
 //! README's per-host table is the user-facing version of the same list,
 //! with how far each adapter has been verified.
 
-use acyclic_engine::product::{self, NAME, NPM_PACKAGE};
+use acyclic::product::{self, NAME, NPM_PACKAGE};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};

@@ -25,7 +25,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use acyclic_engine::store::local_options;
+use acyclic::store::local_options;
 use acyclic_fs::model::{
     AccessMode, CheckoutMode, ConsistencyMode, FilesystemProfile, GenerationSelector, Lifecycle,
     MutationMode, VolumeConfig,

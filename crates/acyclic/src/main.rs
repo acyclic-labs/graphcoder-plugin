@@ -26,8 +26,8 @@ mod speculate;
 
 use std::path::{Path, PathBuf};
 
-use acyclic_engine::product::{self, NAME};
-use acyclic_engine::short_hex;
+use acyclic::product::{self, NAME};
+use acyclic::short_hex;
 use clap::{Parser, Subcommand};
 
 use client::{Client, ConnectError, Spawn};
@@ -256,7 +256,7 @@ fn main() {
     // root that wedges every stat under it. Force-unmount it first (a no-op
     // unless a bounded probe shows the mount is genuinely wedged), so the
     // real tree is back before we read anything.
-    acyclic_engine::fork::reap_dead_shadow(&repo_arg);
+    acyclic::fork::reap_dead_shadow(&repo_arg);
     let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
         eprintln!("{}: bad repo path: {error}", product::NAME);
         std::process::exit(1);
@@ -379,10 +379,10 @@ fn step_aside() {
 #[cfg(not(windows))]
 fn step_aside() {}
 
-fn store_paths(repo: &Path) -> Result<acyclic_engine::store::StorePaths, String> {
-    let config = acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+fn store_paths(repo: &Path) -> Result<acyclic::store::StorePaths, String> {
+    let config = acyclic::config::Config::load(repo).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-    acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+    acyclic::store::StorePaths::for_repo(repo, stores_root.as_deref())
         .map_err(|error| error.to_string())
 }
 
@@ -395,7 +395,7 @@ fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
 /// One line on what forks and Safe Mode can do here, plus setup steps when
 /// the host lacks a mount provider. Shown by `init` and `install`.
 fn print_mount_capability() {
-    let capability = acyclic_engine::fork::mount_capability();
+    let capability = acyclic::fork::mount_capability();
     if capability.available {
         println!(
             "mounts:        {} (forks and Safe Mode available)",
@@ -406,7 +406,7 @@ fn print_mount_capability() {
             "mounts:        unavailable ({})",
             capability.reason.as_deref().unwrap_or("unknown reason")
         );
-        println!("{}", acyclic_engine::fork::mount_setup_hint());
+        println!("{}", acyclic::fork::mount_setup_hint());
     }
 }
 
@@ -523,7 +523,7 @@ fn print_speculation(spec: &proto::SpecStatus) {
 }
 
 fn policy(repo: &Path) -> i32 {
-    match acyclic_engine::config::Config::load(repo) {
+    match acyclic::config::Config::load(repo) {
         Ok(config) => {
             let d = config.decompose;
             println!("fan_out = {}", d.fan_out);
@@ -550,17 +550,16 @@ fn policy(repo: &Path) -> i32 {
 
 fn init(repo: &Path) -> i32 {
     let result = (|| -> Result<(), String> {
-        let config =
-            acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+        let config = acyclic::config::Config::load(repo).map_err(|error| error.to_string())?;
         let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-        let paths = acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+        let paths = acyclic::store::StorePaths::for_repo(repo, stores_root.as_deref())
             .map_err(|error| error.to_string())?;
         if paths.meta().exists() {
             println!("store already exists at {}", paths.root.display());
         } else {
             let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
             runtime
-                .block_on(acyclic_engine::store::Store::init(repo, paths.clone()))
+                .block_on(acyclic::store::Store::init(repo, paths.clone()))
                 .map_err(|error| error.to_string())?;
             println!("store created at {}", paths.root.display());
         }
@@ -1208,7 +1207,7 @@ pub(crate) fn short_session(session_id: &str) -> String {
 }
 
 fn age(created_at: i64) -> String {
-    let delta = (acyclic_engine::unix_now() - created_at).max(0);
+    let delta = (acyclic::unix_now() - created_at).max(0);
     if delta < 60 {
         format!("{delta}s ago")
     } else if delta < 3600 {

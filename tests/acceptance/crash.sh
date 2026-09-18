@@ -27,7 +27,7 @@ acy checkpoint --wait --kind post >/dev/null || fail "checkpoint after kill -9"
 # --- crash mid-swap: journal-driven recovery ------------------------------
 # The atomic-exchange platforms (macOS/Linux) always leave the repo whole;
 # a crash there leaves the journal plus a stray tmp tree. The repo-missing
-# two-step variant is unit-tested in acyclic-engine (recover()).
+# two-step variant is unit-tested in acyclic (recover()).
 acy stop >/dev/null
 sleep 0.5
 JOURNAL="$(ls -d "$STORES"/*/)"rewind-journal.json

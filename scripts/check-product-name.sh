@@ -3,7 +3,7 @@
 #   1. scripts/install.sh is fetched standalone and mirrors `name`,
 #      `github_repo`, and `npm_package`; they must match exactly.
 #   2. No user-facing Rust source spells the name out. Only crate/module
-#      identifiers (acyclic_fs, acyclic_engine, acyclic-fs ...) and comments
+#      identifiers (acyclic_fs, acyclic-qual, ...) and comments
 #      may contain it; strings, paths, and doc templates go through
 #      `product::NAME` / `product::render`.
 set -euo pipefail
@@ -22,7 +22,7 @@ have_npm="$(awk -F'"' '/^NPM_PACKAGE=/{print $2; exit}' "$ROOT/scripts/install.s
 # Literal uses of the current name in strings/paths of user-facing crates.
 # Comments (// and //!) are allowed; identifiers with '_' are crate paths.
 stray="$(grep -rn --include='*.rs' -E "\"[^\"]*\b${want_name}\b[^\"]*\"|\`${want_name} |\.${want_name}/" \
-  "$ROOT/crates/acyclic/src" "$ROOT/crates/acyclic-engine/src" \
+  "$ROOT/crates/acyclic/src" \
   | grep -v -E "${want_name}[_-](fs|engine|proto|qual)|^[^:]+:[0-9]+:\s*//" || true)"
 if [ -n "$stray" ]; then
   echo "hardcoded product name in Rust source (use product::NAME / product::render):" >&2

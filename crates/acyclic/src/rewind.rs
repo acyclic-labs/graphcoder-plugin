@@ -31,7 +31,8 @@ pub struct RewindOutcome {
 }
 
 /// What a single-path restore did to the working tree.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RestoreAction {
     /// The path now matches the checkpoint's content.
     Restored,

@@ -76,7 +76,7 @@ guards what those can't express. The rules, and why each exists:
 - **No lossy `as` casts** between integer widths or signs (`cast_possible_truncation`,
   `cast_sign_loss`, `cast_possible_wrap`, `cast_precision_loss`, `cast_lossless`). Use
   `u64::from`, `i64::try_from(x).unwrap_or(i64::MAX)`, or an `allow` that says why the value
-  is in range. `acyclic_engine::unix_now()` and `short_hex()` exist so the two most common
+  is in range. `acyclic::unix_now()` and `short_hex()` exist so the two most common
   cases are written once.
 - **Closed sets are enums, not strings.** Anything the CLI parses or the wire carries with a
   fixed vocabulary — checkpoint kinds, hook events, host names, restore actions, diff change
@@ -100,7 +100,7 @@ guards what those can't express. The rules, and why each exists:
 The public product name is defined once, in `product.toml`, and threaded through everywhere else:
 `product::NAME` in Rust, `scripts/product.sh` in shell. Never hardcode the name as a literal
 string or path in source — `scripts/check-product-name.sh` fails CI if it drifts. Crate names
-(`acyclic`, `acyclic-engine`, `acyclic-qual`) are internal identifiers and are
+(`acyclic`, `acyclic-qual`) are internal identifiers and are
 exempt from this check.
 
 ## Design context

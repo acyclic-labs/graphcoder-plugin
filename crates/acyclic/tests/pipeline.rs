@@ -11,11 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use acyclic_engine::config::Config;
-use acyclic_engine::diff::{self, ChangeKind};
-use acyclic_engine::index::{Attribution, CheckpointKind, Index};
-use acyclic_engine::pipeline;
-use acyclic_engine::store::{Store, StorePaths};
+use acyclic::config::Config;
+use acyclic::diff::{self, ChangeKind};
+use acyclic::index::{Attribution, CheckpointKind, Index};
+use acyclic::pipeline;
+use acyclic::store::{Store, StorePaths};
 
 fn read_only_index(path: &Path) -> Index {
     Index::open(path).expect("open index")
@@ -454,10 +454,7 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "src/main.rs".into())
             .await
             .expect("restore file");
-        assert_eq!(
-            outcome.action,
-            acyclic_engine::rewind::RestoreAction::Restored
-        );
+        assert_eq!(outcome.action, acyclic::rewind::RestoreAction::Restored);
         assert_eq!(
             std::fs::read(root.join("src/main.rs")).expect("read"),
             b"v1\n"
@@ -496,10 +493,7 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "new.txt".into())
             .await
             .expect("restore absent");
-        assert_eq!(
-            outcome.action,
-            acyclic_engine::rewind::RestoreAction::Removed
-        );
+        assert_eq!(outcome.action, acyclic::rewind::RestoreAction::Removed);
         assert!(!root.join("new.txt").exists());
 
         #[cfg(unix)]

@@ -7,18 +7,18 @@ use std::time::{Duration, Instant};
 
 use crate::ipc;
 use crate::proto;
-use acyclic_engine::config::Config;
-use acyclic_engine::fork::{
+use acyclic::config::Config;
+use acyclic::fork::{
     self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
 };
-use acyclic_engine::guard::GuardedMountFilesystem;
-use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
-use acyclic_engine::merge::{self, Entry};
-use acyclic_engine::pipeline::{self, PipelineHandle};
-use acyclic_engine::product::NAME;
-use acyclic_engine::spec::SpeculateConfig;
-use acyclic_engine::store::{Store, StorePaths};
-use acyclic_engine::{rewind, EngineError};
+use acyclic::guard::GuardedMountFilesystem;
+use acyclic::index::{Attribution, CheckpointKind, CheckpointRow, Index};
+use acyclic::merge::{self, Entry};
+use acyclic::pipeline::{self, PipelineHandle};
+use acyclic::product::NAME;
+use acyclic::spec::SpeculateConfig;
+use acyclic::store::{Store, StorePaths};
+use acyclic::{rewind, EngineError};
 use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::{
     mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
@@ -36,7 +36,7 @@ struct ForkState {
     /// The generation promote is judged against. Starts at the fork's cut
     /// point; a conflicting promote rebases the fork and moves it to the
     /// head it was rebased onto.
-    base: acyclic_engine::GenerationId,
+    base: acyclic::GenerationId,
     entry: proto::ForkEntry,
     /// Copy-mode forks only: the materialized directory the user works in.
     /// Captured back into `shared` at promote, removed at drop/promote.
@@ -60,7 +60,7 @@ struct DrySession {
     fork_id: String,
     session_id: String,
     shared: Arc<SharedLocalCheckout>,
-    base: acyclic_engine::GenerationId,
+    base: acyclic::GenerationId,
     mount: NativeMountSession,
 }
 
@@ -68,8 +68,8 @@ struct DrySession {
 /// overlay is already committed to the store under `generation`; nothing
 /// has touched the real tree yet.
 struct PendingSession {
-    generation: acyclic_engine::GenerationId,
-    base: acyclic_engine::GenerationId,
+    generation: acyclic::GenerationId,
+    base: acyclic::GenerationId,
     label: String,
 }
 
@@ -177,11 +177,11 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     let startup = std::time::Instant::now();
     let mut phase = std::time::Instant::now();
     let mut lap = |name: &str| {
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "startup: {name} {:.1}ms (t+{:.1}ms)",
-            acyclic_engine::trace::ms(phase),
-            acyclic_engine::trace::ms(startup)
+            acyclic::trace::ms(phase),
+            acyclic::trace::ms(startup)
         );
         phase = std::time::Instant::now();
     };
@@ -336,22 +336,22 @@ impl Server {
     async fn dispatch(&self, op: proto::Op) -> proto::Payload {
         let name = op_name(&op);
         let started = std::time::Instant::now();
-        acyclic_engine::trace!("daemon", "op {name} received");
+        acyclic::trace!("daemon", "op {name} received");
         let payload = match self.dispatch_inner(op).await {
             Ok(reply) => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "daemon",
                     "op {name} -> {} in {:.1}ms",
                     reply_name(&reply),
-                    acyclic_engine::trace::ms(started)
+                    acyclic::trace::ms(started)
                 );
                 proto::Payload::Ok(Box::new(reply))
             }
             Err(message) => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "daemon",
                     "op {name} -> error in {:.1}ms: {}",
-                    acyclic_engine::trace::ms(started),
+                    acyclic::trace::ms(started),
                     message.lines().next().unwrap_or("")
                 );
                 err(message)
@@ -445,7 +445,7 @@ impl Server {
                     rewind_target: None,
                 };
                 if wait {
-                    acyclic_engine::trace!(
+                    acyclic::trace!(
                         "daemon",
                         "checkpoint: WAIT path (reply after the capture lands; durable={durable})"
                     );
@@ -460,14 +460,14 @@ impl Server {
                     Ok(proto::Reply::Checkpoint(proto::CheckpointInfo {
                         row_id: outcome.row_id,
                         generation: hex_generation(outcome.generation),
-                        kind: wire_kind(outcome.kind),
+                        kind: outcome.kind,
                     }))
                 } else {
                     // Enqueue-ack: the hook path. Admission into the FIFO
                     // happens BEFORE the ack, so a stop arriving after the
                     // ack queues behind the capture instead of dropping it.
                     // Failures land in the index as `failed`.
-                    acyclic_engine::trace!(
+                    acyclic::trace!(
                         "daemon",
                         "checkpoint: ENQUEUE path (ack on admission, capture runs behind)"
                     );
@@ -566,7 +566,7 @@ impl Server {
                     id: row.id,
                     generation: hex_generation(row.generation),
                     created_at: row.created_at,
-                    kind: wire_kind(row.kind),
+                    kind: row.kind,
                     published: row.published,
                     session_id: row.session_id,
                     host,
@@ -633,10 +633,7 @@ impl Server {
                 Ok(proto::Reply::Restore(proto::RestoreInfo {
                     checkpoint: row_id,
                     path: outcome.path.display().to_string(),
-                    action: match outcome.action {
-                        rewind::RestoreAction::Restored => proto::RestoreAction::Restored,
-                        rewind::RestoreAction::Removed => proto::RestoreAction::Removed,
-                    },
+                    action: outcome.action,
                     recorded_checkpoint,
                 }))
             }
@@ -805,7 +802,7 @@ impl Server {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
                         mode: ForkMode::Mount.as_str().to_owned(),
-                        base: acyclic_engine::generation_hex(seed.base),
+                        base: acyclic::generation_hex(seed.base),
                         created_at: unix_now(),
                         session_id: session_id.clone(),
                         conflict_paths: Vec::new(),
@@ -863,18 +860,18 @@ impl Server {
                             paths: files.iter().map(|file| PathBuf::from(&file.path)).collect(),
                         });
                         fork.base = theirs;
-                        fork.entry.base = acyclic_engine::generation_hex(theirs);
+                        fork.entry.base = acyclic::generation_hex(theirs);
                         fork.entry.conflict_paths =
                             files.iter().map(|file| file.path.clone()).collect();
                         fork.entry.conflict = Some(proto::ConflictInfo {
-                            base: acyclic_engine::generation_hex(conflict_base),
-                            ours: acyclic_engine::generation_hex(ours),
-                            theirs: acyclic_engine::generation_hex(theirs),
+                            base: acyclic::generation_hex(conflict_base),
+                            ours: acyclic::generation_hex(ours),
+                            theirs: acyclic::generation_hex(theirs),
                         });
                         let fork_path = fork.entry.path.clone();
                         self.keep_fork(id, fork).await?;
                         return Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(theirs),
+                            generation: acyclic::generation_hex(theirs),
                             old_tree: None,
                             warning: String::new(),
                             replayed_paths: 0,
@@ -917,7 +914,7 @@ impl Server {
                         kept,
                         moved,
                     } => Ok(proto::Reply::Promote(proto::PromoteInfo {
-                        generation: acyclic_engine::generation_hex(generation),
+                        generation: acyclic::generation_hex(generation),
                         old_tree: None,
                         warning: if moved {
                             "the mainline had moved; the fork's paths were merged onto it in place"
@@ -934,7 +931,7 @@ impl Server {
                     })),
                     Landed::Nothing { generation, kept } => {
                         Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(generation),
+                            generation: acyclic::generation_hex(generation),
                             old_tree: None,
                             warning: String::new(),
                             replayed_paths: 0,
@@ -993,7 +990,7 @@ impl Server {
                         changes
                             .into_iter()
                             .filter(|change| {
-                                change.change != acyclic_engine::diff::ChangeKind::MetadataOnly
+                                change.change != acyclic::diff::ChangeKind::MetadataOnly
                             })
                             .map(diff_entry)
                             .collect(),
@@ -1075,7 +1072,7 @@ impl Server {
                         generation,
                         old_tree,
                     } => Ok(proto::Reply::Promote(proto::PromoteInfo {
-                        generation: acyclic_engine::generation_hex(generation),
+                        generation: acyclic::generation_hex(generation),
                         old_tree: old_tree.map(|path| path.display().to_string()),
                         warning: "reload your editor: open files still point at the replaced tree"
                             .into(),
@@ -1130,7 +1127,7 @@ impl Server {
                 };
             mount_native_over_existing(
                 NativeMountRequest {
-                    mount_id: acyclic_engine::MountId::new(),
+                    mount_id: acyclic::MountId::new(),
                     volume_id,
                     destination,
                     writable: true,
@@ -1177,7 +1174,7 @@ impl Server {
                 id: id.clone(),
                 path: dir.display().to_string(),
                 mode: ForkMode::Copy.as_str().to_owned(),
-                base: acyclic_engine::generation_hex(seed.base),
+                base: acyclic::generation_hex(seed.base),
                 created_at: unix_now(),
                 session_id: session_id.clone(),
                 conflict_paths: Vec::new(),
@@ -1234,10 +1231,10 @@ impl Server {
         }
         let publish_started = std::time::Instant::now();
         let head = self.handle.publish_head().await.map_err(stringify)?;
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: publish_head {:.1}ms; {} fork, mainline {} since the fork's base",
-            acyclic_engine::trace::ms(publish_started),
+            acyclic::trace::ms(publish_started),
             if fork.copy_dir.is_some() {
                 "copy"
             } else {
@@ -1259,7 +1256,7 @@ impl Server {
                 label,
             )
             .await;
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: outcome {}",
             match &landed {
@@ -1345,7 +1342,7 @@ impl Server {
             let session = tokio::task::block_in_place(move || {
                 mount_native(
                     NativeMountRequest {
-                        mount_id: acyclic_engine::MountId::new(),
+                        mount_id: acyclic::MountId::new(),
                         volume_id,
                         destination: dest,
                         writable: true,
@@ -1419,8 +1416,8 @@ impl Server {
         &self,
         id: &str,
         overlay: Arc<SharedLocalCheckout>,
-        base: acyclic_engine::GenerationId,
-        head: acyclic_engine::GenerationId,
+        base: acyclic::GenerationId,
+        head: acyclic::GenerationId,
         copy_dir: Option<&Path>,
         label: &str,
     ) -> Result<Landed, String> {
@@ -1437,17 +1434,17 @@ impl Server {
             .snapshot_overlay(Arc::clone(&overlay))
             .await
             .map_err(stringify)?;
-        let snapshot_ms = acyclic_engine::trace::ms(snapshot_started);
+        let snapshot_ms = acyclic::trace::ms(snapshot_started);
         let plan_started = std::time::Instant::now();
         let mut plan = self
             .handle
             .merge_plan(base, head, snapshot, format!("fork {id}"))
             .await
             .map_err(stringify)?;
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: snapshot_overlay {snapshot_ms:.1}ms, merge_plan {:.1}ms",
-            acyclic_engine::trace::ms(plan_started)
+            acyclic::trace::ms(plan_started)
         );
         // Gitignored paths (bytecode caches, build output, .env) are not
         // merge payload: a fork's copy never blocks a promote, the
@@ -1461,13 +1458,13 @@ impl Server {
         let ignore_started = std::time::Instant::now();
         let ignored =
             tokio::task::block_in_place(|| merge::ignored_paths(&self.repo_root, &contested));
-        let ignore_ms = acyclic_engine::trace::ms(ignore_started);
+        let ignore_ms = acyclic::trace::ms(ignore_started);
         let kept: Vec<String> = plan
             .keep_mainline_for(&ignored)
             .iter()
             .map(|path| path.display().to_string())
             .collect();
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "merge plan: take_ours={} take_theirs={} merged={} conflicted={} refused={} kept_mainline={}",
             plan.take_ours.len(),
@@ -1488,7 +1485,7 @@ impl Server {
                 "the working tree moved past the fork's base ({}) and {} path(s) cannot be merged:\n{}\n\
                  One fork must own those paths: re-fork from the current tree and redo that part, \
                  or rewind to the base. The fork is untouched",
-                acyclic_engine::generation_hex(base),
+                acyclic::generation_hex(base),
                 plan.refusals.len(),
                 lines.join("\n")
             ));
@@ -1546,7 +1543,7 @@ impl Server {
                 .await
                 .map_err(stringify)?
         };
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: gitignore check {ignore_ms:.1}ms ({} contested), landing source {} in \
              {:.1}ms ({} replayed subtree(s), {} merged file(s))",
@@ -1556,7 +1553,7 @@ impl Server {
             } else {
                 "= built merged generation"
             },
-            acyclic_engine::trace::ms(build_started),
+            acyclic::trace::ms(build_started),
             plan.take_ours.len(),
             plan.merged.len()
         );
@@ -1586,7 +1583,7 @@ impl Server {
                     rebased,
                     format!(
                         "fork {id} rebased onto {} ({} conflict(s))",
-                        acyclic_engine::short_hex(&acyclic_engine::generation_hex(head)),
+                        acyclic::short_hex(&acyclic::generation_hex(head)),
                         plan.conflicted.len()
                     ),
                 )
@@ -1642,7 +1639,7 @@ impl Server {
             )
             .await
             .map_err(stringify)?;
-        let pre_ms = acyclic_engine::trace::ms(land_started);
+        let pre_ms = acyclic::trace::ms(land_started);
         // One restore for every landing path: one drain, one timeline row
         // carrying the promote label, however many paths the fork touched.
         // publish_head captured the tree just now, so no safety row either.
@@ -1669,16 +1666,16 @@ impl Server {
                     landing.len()
                 )
             })?;
-        let restore_ms = acyclic_engine::trace::ms(restore_started);
+        let restore_ms = acyclic::trace::ms(restore_started);
         let written = u32::try_from(restored.outcomes.len()).unwrap_or(u32::MAX);
         let landed_generation = restored.generation;
         // No inline publish: the landed row is a checkpoint like any other
         // and the idle timer publishes it. Authority publish is O(tree).
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: landing {written} path(s): record rows {pre_ms:.1}ms, \
              restore {restore_ms:.1}ms, land total {:.1}ms",
-            acyclic_engine::trace::ms(land_started)
+            acyclic::trace::ms(land_started)
         );
         Ok(Landed::Replayed {
             generation: landed_generation,
@@ -1695,8 +1692,8 @@ impl Server {
     async fn rebase_fork(
         &self,
         id: &str,
-        snapshot: acyclic_engine::GenerationId,
-        rebased: acyclic_engine::GenerationId,
+        snapshot: acyclic::GenerationId,
+        rebased: acyclic::GenerationId,
         copy_dir: Option<&Path>,
     ) -> Result<(), String> {
         let changed: Vec<PathBuf> = content_changes(
@@ -2121,7 +2118,7 @@ struct PendingBranch {
     prompt: Option<String>,
     checkpoints: i64,
     /// Generations to diff for the branch's size, when the two differ.
-    diff: Option<(acyclic_engine::GenerationId, acyclic_engine::GenerationId)>,
+    diff: Option<(acyclic::GenerationId, acyclic::GenerationId)>,
 }
 
 /// Every branch the session rewound away from, with the work it would take
@@ -2174,12 +2171,10 @@ fn abandoned_branches(
 
 /// Content changes only. A rewind or restore rewrites mtimes on every path
 /// it materializes, so metadata-only rows are noise for "what changed".
-fn content_changes(
-    changes: Vec<acyclic_engine::diff::FileChange>,
-) -> Vec<acyclic_engine::diff::FileChange> {
+fn content_changes(changes: Vec<acyclic::diff::FileChange>) -> Vec<acyclic::diff::FileChange> {
     changes
         .into_iter()
-        .filter(|change| change.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+        .filter(|change| change.change != acyclic::diff::ChangeKind::MetadataOnly)
         .collect()
 }
 
@@ -2195,20 +2190,20 @@ fn err(message: String) -> proto::Payload {
 /// and hands an id passed as raw ASCII back to the user as mojibake. Ids are
 /// hex, so this is a widening on Windows and a copy everywhere else.
 fn route_name(id: &str) -> Vec<u8> {
-    acyclic_engine::names::str_to_bytes(id)
+    acyclic::names::str_to_bytes(id)
 }
 
 fn short_id() -> String {
     // UUIDv7 leads with timestamp bits (identical across nearby calls);
     // the tail is the random section.
-    acyclic_engine::MountId::new().into_bytes()[10..]
+    acyclic::MountId::new().into_bytes()[10..]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
 fn unix_now() -> i64 {
-    acyclic_engine::unix_now()
+    acyclic::unix_now()
 }
 
 /// How a fork ended up in the real tree.
@@ -2217,7 +2212,7 @@ enum Landed {
     /// `merged` of the paths were produced by a three-way content merge;
     /// `moved` says whether the mainline had moved past the fork's base.
     Replayed {
-        generation: acyclic_engine::GenerationId,
+        generation: acyclic::GenerationId,
         paths: u32,
         merged: u32,
         kept: Vec<String>,
@@ -2225,14 +2220,14 @@ enum Landed {
     },
     /// No content changes to land.
     Nothing {
-        generation: acyclic_engine::GenerationId,
+        generation: acyclic::GenerationId,
         kept: Vec<String>,
     },
     /// Nothing landed: the fork was rebased onto `theirs` and `files`
     /// carry conflict markers in the fork workspace.
     Conflicted {
-        theirs: acyclic_engine::GenerationId,
-        ours: acyclic_engine::GenerationId,
+        theirs: acyclic::GenerationId,
+        ours: acyclic::GenerationId,
         files: Vec<proto::ConflictEntry>,
         kept: Vec<String>,
     },
@@ -2300,33 +2295,14 @@ fn engine_kind(kind: proto::CheckpointRequestKind) -> CheckpointKind {
     }
 }
 
-fn wire_kind(kind: CheckpointKind) -> proto::CheckpointKind {
-    match kind {
-        CheckpointKind::Baseline => proto::CheckpointKind::Baseline,
-        CheckpointKind::Pre => proto::CheckpointKind::Pre,
-        CheckpointKind::Post => proto::CheckpointKind::Post,
-        CheckpointKind::Manual => proto::CheckpointKind::Manual,
-        CheckpointKind::PreRewind => proto::CheckpointKind::PreRewind,
-        CheckpointKind::Recovered => proto::CheckpointKind::Recovered,
-        CheckpointKind::Failed => proto::CheckpointKind::Failed,
-        CheckpointKind::Noop => proto::CheckpointKind::Noop,
-        CheckpointKind::Auto => proto::CheckpointKind::Auto,
-    }
-}
-
 #[allow(
     clippy::needless_pass_by_value,
     reason = "used as `.map(diff_entry)` over an owning iterator"
 )]
-fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
+fn diff_entry(change: acyclic::diff::FileChange) -> proto::DiffEntry {
     proto::DiffEntry {
         path: change.path.display().to_string(),
-        change: match change.change {
-            acyclic_engine::diff::ChangeKind::Added => proto::ChangeKind::Added,
-            acyclic_engine::diff::ChangeKind::Removed => proto::ChangeKind::Removed,
-            acyclic_engine::diff::ChangeKind::Modified => proto::ChangeKind::Modified,
-            acyclic_engine::diff::ChangeKind::MetadataOnly => proto::ChangeKind::Metadata,
-        },
+        change: change.change,
         file_kind: format!("{:?}", change.file_kind).to_lowercase(),
         ignored: false,
     }
@@ -2336,7 +2312,7 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     proto::TimelineEntry {
         id: row.id,
         created_at: row.created_at,
-        kind: wire_kind(row.kind),
+        kind: row.kind,
         published: row.published,
         session_id: row.session_id,
         tool_name: row.tool_name,
@@ -2346,8 +2322,8 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     }
 }
 
-fn hex_generation(generation: acyclic_engine::GenerationId) -> String {
-    acyclic_engine::generation_hex(generation)
+fn hex_generation(generation: acyclic::GenerationId) -> String {
+    acyclic::generation_hex(generation)
 }
 
 fn directory_bytes(root: &Path) -> u64 {

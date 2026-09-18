@@ -9,6 +9,7 @@ use std::path::Path;
 
 use acyclic_fs::{Digest, GenerationId};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::{EngineError, Result};
 
@@ -74,7 +75,8 @@ impl CheckpointRow {
 }
 
 /// Why a checkpoint exists.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckpointKind {
     Baseline,
     Pre,
@@ -121,6 +123,12 @@ impl CheckpointKind {
                 )))
             }
         })
+    }
+}
+
+impl std::fmt::Display for CheckpointKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.pad(self.as_str())
     }
 }
 

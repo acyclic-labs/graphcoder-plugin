@@ -4,7 +4,7 @@
 # commands, skill names, error-message prefixes, the `<NAME>_TRACE` and
 # `<NAME>_HOOK` environment variables, release asset names, and the npm bin.
 #
-# Readers: crates/acyclic-engine/build.rs (Rust, via env!), scripts/product.sh
+# Readers: crates/acyclic/build.rs (Rust, via env!), scripts/product.sh
 # (shell), .github/workflows (awk). scripts/check-product-name.sh fails CI if
 # the one self-contained file (scripts/install.sh) drifts from this.
 #

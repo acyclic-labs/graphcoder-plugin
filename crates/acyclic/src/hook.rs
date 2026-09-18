@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::proto;
-use acyclic_engine::product::NAME;
+use acyclic::product::NAME;
 
 use crate::client::{Client, ConnectError, Spawn};
 
@@ -123,7 +123,7 @@ impl HookEvent {
 
 pub fn run(repo: &Path, event: &str) -> i32 {
     let Some(event) = HookEvent::parse(event) else {
-        acyclic_engine::trace!("hook", "unknown event {event:?}: ignored");
+        acyclic::trace!("hook", "unknown event {event:?}: ignored");
         return 0;
     };
     // Reading stdin can't hang the agent: hosts close it after writing.
@@ -139,7 +139,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     } else {
         Spawn::Never
     };
-    acyclic_engine::trace!(
+    acyclic::trace!(
         "hook",
         "event {}: daemon spawn {}; pre-tool waits (bounded), post-tool enqueues (ack before capture)",
         event.as_arg(),

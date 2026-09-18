@@ -23,9 +23,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::proto;
-use acyclic_engine::index::Index;
-use acyclic_engine::pipeline::PipelineHandle;
-use acyclic_engine::spec::{
+use acyclic::index::Index;
+use acyclic::pipeline::PipelineHandle;
+use acyclic::spec::{
     RunId, RunOutcome, SpecEvent as LogEvent, SpecEventRow, SpecHit, SpecKey, SpecKind,
     SpecMetrics, SpecState, SpecStore, SpeculateConfig,
 };
@@ -107,7 +107,7 @@ impl SpecHandle {
     /// request handlers, several of them on the hook path.
     pub fn notify(&self, event: SpecEvent) {
         if let Err(error) = self.events.try_send(event) {
-            acyclic_engine::trace!("spec", "event dropped: {error}");
+            acyclic::trace!("spec", "event dropped: {error}");
         }
     }
 
@@ -155,7 +155,7 @@ impl SpecHandle {
         };
         let info = serde_json::from_str(&hit.body).ok();
         let _ = store.log(&event(LogEvent::ClaimHit, Some(hit.lead_ms)));
-        acyclic_engine::trace!("spec", "brief claimed, {}ms ahead", hit.lead_ms);
+        acyclic::trace!("spec", "brief claimed, {}ms ahead", hit.lead_ms);
         info
     }
 
@@ -299,7 +299,7 @@ pub fn spawn(
     let spec_db = deps.spec_db.clone();
     let thread_config = config.clone();
     let thread = std::thread::Builder::new()
-        .name(format!("{}-speculate", acyclic_engine::product::NAME))
+        .name(format!("{}-speculate", acyclic::product::NAME))
         // The fs futures a diff pulls in are large; match the pipeline's
         // headroom rather than the 2 MiB default.
         .stack_size(32 * 1024 * 1024)
@@ -314,7 +314,7 @@ pub fn spawn(
                 Err(error) => {
                     eprintln!(
                         "{}: speculation runtime: {error}; speculation off",
-                        acyclic_engine::product::NAME
+                        acyclic::product::NAME
                     );
                     return;
                 }
@@ -371,7 +371,7 @@ async fn run(config: SpeculateConfig, deps: SpecDeps, mut receiver: mpsc::Receiv
     let Ok(mut store) = SpecStore::open(&deps.spec_db, SCHEDULER_BUSY_TIMEOUT) else {
         eprintln!(
             "{}: speculation cache unavailable; speculation off",
-            acyclic_engine::product::NAME
+            acyclic::product::NAME
         );
         return;
     };
@@ -379,7 +379,7 @@ async fn run(config: SpeculateConfig, deps: SpecDeps, mut receiver: mpsc::Receiv
     // `running` is the one state that is never retryable.
     if let Ok(swept) = store.sweep_orphans() {
         if swept > 0 {
-            acyclic_engine::trace!("spec", "swept {swept} orphaned run(s) from a dead daemon");
+            acyclic::trace!("spec", "swept {swept} orphaned run(s) from a dead daemon");
         }
     }
     let mut scheduler = Scheduler {
@@ -444,7 +444,7 @@ impl Scheduler {
             self.in_flight = Some(run);
             return;
         }
-        acyclic_engine::trace!("spec", "cancelling the summary run: {cause:?}");
+        acyclic::trace!("spec", "cancelling the summary run: {cause:?}");
         let _ = run.cancel.send(());
         let _ = self.store.finish(run.run, &RunOutcome::Cancelled);
         self.log(LogEvent::Cancel, &run.session_id, run.turn, None, None);
@@ -463,7 +463,7 @@ impl Scheduler {
         self.in_flight = None;
         let (event, bytes) = match &report.outcome {
             RunOutcome::Ready { body } => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "spec",
                     "summary for turn {} ready in {}ms",
                     report.turn,
@@ -607,7 +607,7 @@ impl Scheduler {
         let (cancel, cancelled) = oneshot::channel();
         let done = done.clone();
         let owner = session_id.to_owned();
-        acyclic_engine::trace!("spec", "pre-firing the summarizer for turn {turn}");
+        acyclic::trace!("spec", "pre-firing the summarizer for turn {turn}");
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let outcome = crate::spec_runner::run(spec, &space, cancelled).await;
@@ -642,11 +642,7 @@ fn turn_range(
     index: &Index,
     session_id: &str,
     turn: i64,
-) -> Option<(
-    acyclic_engine::GenerationId,
-    acyclic_engine::GenerationId,
-    String,
-)> {
+) -> Option<(acyclic::GenerationId, acyclic::GenerationId, String)> {
     let row = index.turn(session_id, turn).ok()??;
     let (first, last) = (row.first_checkpoint?, row.last_checkpoint?);
     let base = index.latest_target_before(first).ok()??;
@@ -667,9 +663,9 @@ fn turn_range(
 fn render_prompt(
     config: &SpeculateConfig,
     prompt: &str,
-    changes: &[acyclic_engine::diff::FileChange],
+    changes: &[acyclic::diff::FileChange],
 ) -> String {
-    use acyclic_engine::diff::ChangeKind;
+    use acyclic::diff::ChangeKind;
     let instruction = if config.prompt_template.is_empty() {
         SUMMARY_PROMPT.to_owned()
     } else {
@@ -741,7 +737,7 @@ async fn speculate_brief(config: &SpeculateConfig, deps: &SpecDeps, store: &mut 
     let wall_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     match &outcome {
         RunOutcome::Ready { body } => {
-            acyclic_engine::trace!("spec", "brief precomputed in {wall_ms}ms");
+            acyclic::trace!("spec", "brief precomputed in {wall_ms}ms");
             log(
                 store,
                 LogEvent::Ready,

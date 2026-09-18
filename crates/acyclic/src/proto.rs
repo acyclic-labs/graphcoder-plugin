@@ -8,6 +8,60 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub use acyclic::diff::ChangeKind;
+pub use acyclic::index::CheckpointKind;
+pub use acyclic::rewind::RestoreAction;
+
+#[cfg(test)]
+mod domain_wire_tests {
+    use super::{ChangeKind, CheckpointKind, RestoreAction};
+
+    #[test]
+    fn domain_enums_preserve_version_one_wire_names() {
+        let checkpoint_kinds = [
+            (CheckpointKind::Baseline, "baseline"),
+            (CheckpointKind::Pre, "pre"),
+            (CheckpointKind::Post, "post"),
+            (CheckpointKind::Manual, "manual"),
+            (CheckpointKind::PreRewind, "pre_rewind"),
+            (CheckpointKind::Recovered, "recovered"),
+            (CheckpointKind::Failed, "failed"),
+            (CheckpointKind::Noop, "noop"),
+            (CheckpointKind::Auto, "auto"),
+        ];
+        for (kind, name) in checkpoint_kinds {
+            let encoded = serde_json::to_string(&kind).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<CheckpointKind>(&encoded).unwrap(),
+                kind
+            );
+        }
+        let changes = [
+            (ChangeKind::Added, "added"),
+            (ChangeKind::Removed, "removed"),
+            (ChangeKind::Modified, "modified"),
+            (ChangeKind::MetadataOnly, "metadata"),
+        ];
+        for (kind, name) in changes {
+            let encoded = serde_json::to_string(&kind).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<ChangeKind>(&encoded).unwrap(), kind);
+        }
+        for (action, name) in [
+            (RestoreAction::Restored, "restored"),
+            (RestoreAction::Removed, "removed"),
+        ] {
+            let encoded = serde_json::to_string(&action).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<RestoreAction>(&encoded).unwrap(),
+                action
+            );
+        }
+    }
+}
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The kinds a client may ask for. Bookkeeping kinds (`baseline`,
@@ -46,93 +100,6 @@ impl FromStr for CheckpointRequestKind {
 }
 
 impl fmt::Display for CheckpointRequestKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(self.as_str())
-    }
-}
-
-/// Why a checkpoint row exists, as the timeline reports it. Mirrors the
-/// engine's `index::CheckpointKind`; the daemon converts between them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointKind {
-    Baseline,
-    Pre,
-    Post,
-    Manual,
-    PreRewind,
-    Recovered,
-    Failed,
-    Noop,
-    Auto,
-}
-
-impl CheckpointKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::Pre => "pre",
-            Self::Post => "post",
-            Self::Manual => "manual",
-            Self::PreRewind => "pre_rewind",
-            Self::Recovered => "recovered",
-            Self::Failed => "failed",
-            Self::Noop => "noop",
-            Self::Auto => "auto",
-        }
-    }
-}
-
-impl fmt::Display for CheckpointKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(self.as_str())
-    }
-}
-
-/// What a single-path restore did to the path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RestoreAction {
-    /// The path now has the checkpoint's contents.
-    Restored,
-    /// The path was absent at the checkpoint, so it was removed.
-    Removed,
-}
-
-/// How a path differs between two checkpoints.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeKind {
-    Added,
-    Removed,
-    Modified,
-    /// Mode or other metadata only; contents are identical.
-    Metadata,
-}
-
-impl ChangeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-            Self::Modified => "modified",
-            Self::Metadata => "metadata",
-        }
-    }
-
-    /// The one-letter tag `diff` listings use: A / D / M, and `m` for
-    /// metadata-only, so real blast radius stands out from noise.
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Added => "A",
-            Self::Removed => "D",
-            Self::Modified => "M",
-            Self::Metadata => "m",
-        }
-    }
-}
-
-impl fmt::Display for ChangeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(self.as_str())
     }

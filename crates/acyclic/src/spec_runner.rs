@@ -25,8 +25,8 @@ use std::time::Duration;
 
 // Only the Unix sweep names the product; on Windows there is no sweep.
 #[cfg(unix)]
-use acyclic_engine::product::NAME;
-use acyclic_engine::spec::RunOutcome;
+use acyclic::product::NAME;
+use acyclic::spec::RunOutcome;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -67,7 +67,7 @@ impl RunSpace {
     }
 
     fn record(&self, pgid: i32, argv0: &str) {
-        let line = format!("{pgid} {} {argv0}\n", acyclic_engine::unix_now());
+        let line = format!("{pgid} {} {argv0}\n", acyclic::unix_now());
         let _ = std::fs::write(&self.pid_file, line);
     }
 

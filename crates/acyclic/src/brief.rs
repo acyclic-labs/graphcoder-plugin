@@ -6,7 +6,7 @@
 //! the verbs that reach the rest.
 
 use crate::proto;
-use acyclic_engine::product::NAME;
+use acyclic::product::NAME;
 
 /// Hard cap on the rendered text, including the trailing newline.
 pub const BUDGET_BYTES: usize = 1000;
@@ -180,7 +180,7 @@ fn short(session_id: &str) -> String {
 }
 
 fn age(at: i64) -> String {
-    let delta = (acyclic_engine::unix_now() - at).max(0);
+    let delta = (acyclic::unix_now() - at).max(0);
     if delta < 60 {
         format!("{delta}s ago")
     } else if delta < 3600 {

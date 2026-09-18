@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use acyclic_fs::kernel::{FileKind, NamespacePath};
 use acyclic_fs::{CancellationToken, GenerationId, ObjectId, WorkCounters};
+use serde::{Deserialize, Serialize};
 
 use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
@@ -25,12 +26,41 @@ pub struct FileChange {
     pub file_kind: FileKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     Added,
     Removed,
     Modified,
+    #[serde(rename = "metadata")]
     MetadataOnly,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Modified => "modified",
+            Self::MetadataOnly => "metadata",
+        }
+    }
+
+    /// The one-letter marker used by the CLI's diff output.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Removed => "D",
+            Self::Modified => "M",
+            Self::MetadataOnly => "m",
+        }
+    }
+}
+
+impl std::fmt::Display for ChangeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.pad(self.as_str())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

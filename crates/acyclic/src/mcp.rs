@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::proto;
-use acyclic_engine::product::{self, NAME};
+use acyclic::product::{self, NAME};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo},
