@@ -189,11 +189,11 @@ correct.
   crash mid-swap is recovered rather than impossible, which is weaker than
   the APFS/`renameat2` guarantee.
 
-- **No read/write deadlines.** `ClientStream::set_read_timeout` and
-  `set_write_timeout` are no-ops on Windows: a pipe opened as a `File`
-  carries no per-handle timeout. The pre-tool hook's deadline therefore does
-  not bound anything there. Closing this needs overlapped I/O or a watchdog
-  thread. **The latency gate's guarantee does not hold on Windows.**
+- **Client call deadlines.** Windows named-pipe clients use overlapped I/O
+  with a completion wait and cancellation. The call timeout covers the whole
+  request and response, including partial writes and replies. A Windows
+  regression test holds a pipe read past its deadline and verifies that the
+  client returns promptly.
 
 - **A speculative run's timeout kills without a grace period, and a
   descendant can escape the job.** `spec_runner` puts each run in a job

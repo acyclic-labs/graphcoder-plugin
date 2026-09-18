@@ -29,9 +29,11 @@ libc = "0.2"
 # timeout reach the child's own children (`spec_runner::RunGroup`).
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Storage_FileSystem",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_JobObjects",
+  "Win32_System_IO",
   "Win32_System_Memory",
   "Win32_System_Threading",
 ] }

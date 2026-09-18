@@ -25,8 +25,10 @@ pub enum Spawn {
 pub struct Client {
     stream: BufReader<ClientStream>,
     next_id: u64,
+    call_timeout: Option<Duration>,
 }
 
+#[derive(Debug)]
 pub enum ConnectError {
     /// No daemon and spawning was not allowed.
     NoDaemon,
@@ -90,14 +92,14 @@ impl Client {
         Ok(Self {
             stream: BufReader::new(stream),
             next_id: 1,
+            call_timeout: None,
         })
     }
 
     /// Bounds how long a single call may wait for its reply. Used by the
     /// pre-tool hook: an exact boundary is worth milliseconds, not seconds.
     pub fn set_deadline(&mut self, deadline: std::time::Duration) {
-        let _ = self.stream.get_ref().set_read_timeout(Some(deadline));
-        let _ = self.stream.get_ref().set_write_timeout(Some(deadline));
+        self.call_timeout = Some(deadline);
     }
 
     pub fn call(&mut self, op: proto::Op) -> Result<proto::Reply, String> {
@@ -129,6 +131,7 @@ impl Client {
     }
 
     fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Reply, String> {
+        let deadline = self.call_timeout.map(|timeout| Instant::now() + timeout);
         let request = proto::Request {
             v: proto::PROTOCOL_VERSION,
             id,
@@ -136,20 +139,117 @@ impl Client {
         };
         let mut line = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
         line.push(b'\n');
-        self.stream
-            .get_mut()
-            .write_all(&line)
-            .map_err(|error| format!("send: {error}"))?;
-        let mut response_line = String::new();
-        self.stream
-            .read_line(&mut response_line)
-            .map_err(|error| format!("receive: {error}"))?;
+        let mut sent = 0;
+        while sent < line.len() {
+            self.stream
+                .get_ref()
+                .set_write_timeout(remaining(deadline)?)
+                .map_err(|error| format!("send timeout: {error}"))?;
+            let count = self
+                .stream
+                .get_mut()
+                .write(line.get(sent..).ok_or("send: invalid offset")?)
+                .map_err(|error| format!("send: {error}"))?;
+            if count == 0 {
+                return Err("send: daemon closed the connection".to_owned());
+            }
+            sent += count;
+        }
+        let mut response_line = Vec::new();
+        loop {
+            self.stream
+                .get_ref()
+                .set_read_timeout(remaining(deadline)?)
+                .map_err(|error| format!("receive timeout: {error}"))?;
+            let available = self
+                .stream
+                .fill_buf()
+                .map_err(|error| format!("receive: {error}"))?;
+            if available.is_empty() {
+                return Err("receive: daemon closed the connection".to_owned());
+            }
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if response_line.len() + count > 64 * 1024 * 1024 {
+                return Err("receive: response exceeds 64 MiB".to_owned());
+            }
+            response_line
+                .extend_from_slice(available.get(..count).ok_or("receive: invalid offset")?);
+            self.stream.consume(count);
+            if response_line.last() == Some(&b'\n') {
+                break;
+            }
+        }
         let response: proto::Response =
-            serde_json::from_str(&response_line).map_err(|error| format!("decode: {error}"))?;
+            serde_json::from_slice(&response_line).map_err(|error| format!("decode: {error}"))?;
+        if response.id != id {
+            return Err(format!(
+                "receive: response id {} does not match request {id}",
+                response.id
+            ));
+        }
         match response.payload {
             proto::Payload::Ok(reply) => Ok(*reply),
             proto::Payload::Err { message } => Err(message),
         }
+    }
+}
+
+fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, String> {
+    match deadline {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                Err("daemon call timed out".to_owned())
+            } else {
+                Ok(Some(left))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn call_deadline_bounds_silent_reply() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let socket = std::path::PathBuf::from(format!("call-{}-{nonce}", std::process::id()));
+        let name = crate::ipc::endpoint_display(&socket);
+        let (ready, connected) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let pipe = tokio::net::windows::named_pipe::ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&name)
+                    .expect("pipe");
+                ready.send(()).expect("ready");
+                pipe.connect().await.expect("connect");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+        });
+        connected.recv().expect("server ready");
+        let stream = ClientStream::connect(&socket).expect("client connect");
+        let mut client = Client::from_stream(stream).expect("client");
+        client.set_deadline(Duration::from_millis(30));
+        let started = Instant::now();
+        let error = client
+            .call(proto::Op::Ping)
+            .expect_err("call should time out");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(180));
+        server.join().expect("server exit");
     }
 }
 
