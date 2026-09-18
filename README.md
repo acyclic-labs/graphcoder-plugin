@@ -74,6 +74,8 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 
 Speculation is configured separately, in `~/.config/acyclic/speculate.toml` — per developer, never checked in, because turning it on can spend that developer's money. See [Speculation](#speculation).
 
+`exclude` matches **paths, not names**: `exclude = ["__pycache__"]` excludes a top-level `__pycache__/` and nothing else — it will not exclude `src/__pycache__/`. Name every path you mean (`"src/__pycache__"`), or exclude the directory that contains them. The wrong form fails silently and looks like it worked: the build output is captured anyway, and a Rust `target/` measured 1.4&nbsp;GB of store and +29&nbsp;s per build against 14&nbsp;MB and 35&nbsp;s with it excluded.
+
 Adding a path to `exclude` takes effect at the next daemon start; the baseline it builds is scrubbed, and every later checkpoint skips the path. Generations captured before the rule still hold it (see below).
 
 ## Speculation

@@ -296,6 +296,11 @@ fn record_lease(repo: &Path, tool: Option<&str>, path: Option<&str>) {
     let Ok(paths) = crate::store_paths(repo) else {
         return;
     };
+    // The store root exists after `init`, but a lease is worth recording from
+    // the very first tool call, which can precede it.
+    if std::fs::create_dir_all(&paths.root).is_err() {
+        return;
+    }
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -376,5 +381,108 @@ mod tests {
             assert!(payload.session_id.is_none(), "raw: {raw}");
             assert!(payload.tool_name.is_none());
         }
+    }
+
+    /// A scratch repo whose store lives beside it, so `record_lease` writes
+    /// somewhere real and nothing touches the developer's own stores. The
+    /// store root comes from the repo's own config, so that is where the
+    /// redirect goes — there is no env override, deliberately.
+    fn scratch() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".acyclic")).expect("repo");
+        let stores = dir.path().join("stores");
+        std::fs::create_dir_all(&stores).expect("stores");
+        std::fs::write(
+            repo.join(".acyclic/config.toml"),
+            format!("store_dir = {:?}\n", stores.to_string_lossy()),
+        )
+        .expect("config");
+        // The store root is created lazily by `init`; the lease writer must
+        // work before that, which is what create_dir_all in it is for.
+        (dir, repo)
+    }
+
+    fn leases_of(repo: &Path) -> String {
+        let paths = crate::store_paths(repo).expect("store paths");
+        std::fs::read_to_string(paths.root.join("leases")).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_path_is_recorded_repo_relative() {
+        let (_dir, repo) = scratch();
+        let absolute = repo.join("src/report.py");
+        record_lease(&repo, Some("Edit"), Some(&absolute.to_string_lossy()));
+        record_lease(&repo, Some("Write"), Some("src/money.py"));
+        let text = leases_of(&repo);
+        // Absolute and relative inputs both land relative: a reader compares
+        // these against paths from `diff`, which are repo-relative.
+        assert!(
+            text.contains("\tEdit\tsrc/report.py\n"),
+            "absolute path not made relative: {text}"
+        );
+        assert!(text.contains("\tWrite\tsrc/money.py\n"), "{text}");
+    }
+
+    #[test]
+    fn a_tool_with_no_path_records_a_wildcard() {
+        let (_dir, repo) = scratch();
+        // Bash names no file and can touch anything, so a reader must block
+        // rather than guess.
+        record_lease(&repo, Some("Bash"), None);
+        assert!(
+            leases_of(&repo).contains("\tBash\t*\n"),
+            "{}",
+            leases_of(&repo)
+        );
+    }
+
+    #[test]
+    fn a_tab_in_either_field_is_refused() {
+        let (_dir, repo) = scratch();
+        // The file is tab separated. A tab smuggled in through a filename
+        // would make a reader mis-split the line and treat junk as a path.
+        record_lease(&repo, Some("Ed\tit"), Some("src/a\tb.py"));
+        let text = leases_of(&repo);
+        assert!(text.contains("\t?\t*\n"), "tabs not neutralised: {text}");
+        assert_eq!(text.lines().count(), 1, "one line per call: {text}");
+    }
+
+    #[test]
+    fn the_kill_switch_writes_nothing() {
+        let (_dir, repo) = scratch();
+        std::env::set_var("ACYCLIC_NO_LEASES", "1");
+        record_lease(&repo, Some("Edit"), Some("src/report.py"));
+        std::env::remove_var("ACYCLIC_NO_LEASES");
+        assert!(
+            leases_of(&repo).is_empty(),
+            "the off switch must be an off switch"
+        );
+    }
+
+    #[test]
+    fn leases_never_land_inside_the_repo() {
+        let (_dir, repo) = scratch();
+        record_lease(&repo, Some("Edit"), Some("src/report.py"));
+        // The regression this guards: writing into the tree woke the watcher,
+        // and the pre-tool hook then waited for the checkpoint its own write
+        // caused — 65ms to 120ms. It would also have shown up in every blast
+        // radius as a changed path.
+        assert!(
+            !repo.join(".speculation").exists(),
+            "a lease inside the repo is captured by the watcher and inflates \
+             every diff"
+        );
+    }
+
+    #[test]
+    fn appending_keeps_earlier_lines() {
+        let (_dir, repo) = scratch();
+        for path in ["a.py", "b.py", "c.py"] {
+            record_lease(&repo, Some("Edit"), Some(path));
+        }
+        // A reader takes the live window by timestamp, so history must not be
+        // truncated by a later write.
+        assert_eq!(leases_of(&repo).lines().count(), 3, "{}", leases_of(&repo));
     }
 }
