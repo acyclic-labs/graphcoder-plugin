@@ -39,18 +39,16 @@ pub fn unix_now() -> i64 {
 /// Unix shells conventionally provide `HOME`; Windows provides
 /// `USERPROFILE` instead.
 pub fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            #[cfg(windows)]
-            {
-                std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
-            }
-            #[cfg(not(windows))]
-            {
-                None
-            }
-        })
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
 }
 
 /// The first 12 hex digits of a generation id, as every listing prints it.
