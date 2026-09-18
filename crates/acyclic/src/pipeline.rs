@@ -1440,14 +1440,18 @@ impl Pipeline {
         })
     }
 
-    /// Polls the watcher until it stays quiet for `quiesce_ms` (capped at
-    /// `quiesce_cap_ms`), capturing every non-empty batch. Returns whether
-    /// anything was captured.
+    /// Captures every available watcher batch, then waits for `quiesce_ms`
+    /// of quiet after the first change (capped at `quiesce_cap_ms`). An empty
+    /// first poll returns immediately. Returns whether anything was captured.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "watch invalidation and capture share one poll loop"
+    )]
     async fn drain_watcher(&mut self) -> Result<bool> {
         let quiesce = Duration::from_millis(self.config.quiesce_ms);
         let cap = Duration::from_millis(self.config.quiesce_cap_ms);
         let started = Instant::now();
-        let mut last_change = Instant::now();
+        let mut last_change = None;
         let mut changed = false;
         let mut polls = 0u32;
         let mut batches = 0u32;
@@ -1510,16 +1514,21 @@ impl Pipeline {
                         self.scrub_exclusions().await?;
                     }
                     changed = true;
-                    last_change = Instant::now();
+                    last_change = Some(Instant::now());
                 }
                 WatchBatch::Changes { .. } => {
-                    if last_change.elapsed() >= quiesce || started.elapsed() >= cap {
+                    if last_change.is_none()
+                        || last_change.is_some_and(|last| last.elapsed() >= quiesce)
+                        || started.elapsed() >= cap
+                    {
                         crate::trace!(
                             "pipeline",
                             "drain: done after {:.1}ms, {polls} polls, {batches} batch(es), \
                              {hints} hint(s); stopped by {}",
                             crate::trace::ms(started),
-                            if started.elapsed() >= cap {
+                            if last_change.is_none() {
+                                "empty poll"
+                            } else if started.elapsed() >= cap {
                                 "cap"
                             } else {
                                 "quiesce window"
@@ -1623,12 +1632,12 @@ impl Pipeline {
     /// The safety net for hosts with no lifecycle-hook API (Claude Desktop
     /// over MCP): a checkpoint no request asked for, taken once the watcher
     /// has been quiet for `auto_checkpoint_idle_ms`. Runs on every idle
-    /// tick: drains whatever the watcher has (cheap, bounded by
-    /// `quiesce_ms`; usually nothing, since hook-driven hosts drain on their
-    /// own pre/post-tool checkpoints), then records a row only once a full
-    /// tick has passed with no further changes and nothing else has
-    /// checkpointed them in the meantime. Never records a row when nothing
-    /// changed, so it cannot spam the timeline.
+    /// tick: drains whatever the watcher has (an empty watcher returns after
+    /// one poll; hook-driven hosts usually drained on their own pre/post-tool
+    /// checkpoints), then records a row only once a full tick has passed with
+    /// no further changes and nothing else has checkpointed them in the
+    /// meantime. Never records a row when nothing changed, so it cannot spam
+    /// the timeline.
     async fn auto_checkpoint(&mut self) {
         if self.config.auto_checkpoint_idle_ms == 0 || self.shadowed || self.state != State::Ready {
             return;

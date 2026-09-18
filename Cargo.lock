@@ -29,6 +29,7 @@ dependencies = [
 name = "acyclic-fs"
 version = "0.2.0-rc.5"
 dependencies = [
+ "acyclic-linux-io",
  "acyclic-objects",
  "acyclic-stream",
  "async-trait",
@@ -57,9 +58,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "acyclic-linux-io"
+version = "0.1.0-rc.1"
+dependencies = [
+ "io-uring",
+ "libc",
+]
+
+[[package]]
 name = "acyclic-objects"
 version = "1.0.0-rc.4"
 dependencies = [
+ "acyclic-linux-io",
  "async-trait",
  "blake3",
  "bytes",
@@ -1039,6 +1049,17 @@ name = "io-lifetimes"
 version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
+
+[[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "ipnet"

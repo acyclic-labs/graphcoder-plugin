@@ -956,30 +956,12 @@ impl Server {
                 }
             }
             proto::Op::ForkDiff { id } => {
-                let (base, shared, copy_dir) = {
+                let (base, shared, capture_dir) = {
                     let forks = self.forks.lock().await;
                     let fork = forks.get(&id).ok_or(format!("no fork {id}"))?;
                     (fork.base, Arc::clone(&fork.shared), fork.copy_dir.clone())
                 };
-                // Mounted fork: its writes already sit in its own overlay, so
-                // snapshot that. Copy fork: read the directory into a
-                // scratch overlay pinned at the base (native capture cannot
-                // read through the mount itself: NFS lacks the extent ioctl).
-                // Either way the fork stays promotable afterwards.
-                let overlay = match copy_dir {
-                    None => shared,
-                    Some(dir) => {
-                        let scratch = self
-                            .handle
-                            .scratch_checkout(base)
-                            .await
-                            .map_err(stringify)?;
-                        fork::capture_copy(&scratch, &dir)
-                            .await
-                            .map_err(stringify)?;
-                        scratch
-                    }
-                };
+                let overlay = self.fork_view(base, shared, capture_dir.as_deref()).await?;
                 let changes = if overlay.lock().await.has_pending_mutations() {
                     let generation = self
                         .handle
@@ -1205,6 +1187,34 @@ impl Server {
         Ok(proto::Reply::Forks(created))
     }
 
+    /// Uses the live overlay for mounted forks. Copy forks are reconciled
+    /// from the host tree into a scratch checkout before diff or promotion.
+    async fn fork_view(
+        &self,
+        base: acyclic::GenerationId,
+        shared: Arc<SharedLocalCheckout>,
+        capture_dir: Option<&Path>,
+    ) -> Result<Arc<SharedLocalCheckout>, String> {
+        let Some(dir) = capture_dir else {
+            return Ok(shared);
+        };
+        let started = std::time::Instant::now();
+        let scratch = self
+            .handle
+            .scratch_checkout(base)
+            .await
+            .map_err(stringify)?;
+        let scratch_ms = acyclic::trace::ms(started);
+        let capture_started = std::time::Instant::now();
+        fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
+        acyclic::trace!(
+            "daemon",
+            "copy fork capture: scratch {scratch_ms:.1}ms, full-tree capture {:.1}ms",
+            acyclic::trace::ms(capture_started)
+        );
+        Ok(scratch)
+    }
+
     /// Lands a fork in place. The fork's paths are merged onto the current
     /// head (a three-way merge when the mainline moved; a plain write of
     /// the fork's paths when it did not) and written onto the real tree
@@ -1217,24 +1227,10 @@ impl Server {
         fork: &ForkState,
         label: &str,
     ) -> Result<Landed, String> {
-        // Get at the fork's overlay. A mounted fork keeps serving while we
-        // work: its snapshot is taken under the checkout lock, and the
-        // route is detached only once the fork has landed. (Detaching
-        // first and re-attaching on a conflict left the kernel's negative
-        // name cache hiding the fork on Linux FUSE, which cannot
-        // invalidate a route name.)
-        let overlay = match fork.copy_dir.as_deref() {
-            Some(dir) => {
-                let scratch = self
-                    .handle
-                    .scratch_checkout(fork.base)
-                    .await
-                    .map_err(stringify)?;
-                fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
-                scratch
-            }
-            None => Arc::clone(&fork.shared),
-        };
+        let capture_dir = fork.copy_dir.as_deref();
+        let overlay = self
+            .fork_view(fork.base, Arc::clone(&fork.shared), capture_dir)
+            .await?;
         // A rebased fork must have resolved its markers before it can land.
         if let Some(conflict) = fork.conflict.as_ref() {
             self.refuse_unresolved_markers(&overlay, conflict).await?;

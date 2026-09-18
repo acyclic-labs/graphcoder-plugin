@@ -46,8 +46,8 @@ impl ForkMode {
     }
 }
 
-/// What the host can do for fork and Safe Mode mounts, probed once at
-/// daemon start and reported by `status`/`init`.
+/// What the host can do for fork mounts, probed once at daemon start and
+/// reported by `status`/`init`.
 #[derive(Clone, Debug)]
 pub struct MountCapability {
     /// Human name of the provider this build would use ("fuse", "nfs loopback").
@@ -69,16 +69,8 @@ impl MountCapability {
 
 /// Live probe of the native mount provider.
 ///
-/// Windows is held to copy forks whatever the probe says. `ProjFS` mounts
-/// and projects correctly there — a fork's tree appears and reads back fine —
-/// but writes into the projection stop at the `ProjFS` local cache and never
-/// reach the overlay checkout, so `fork-diff` reports no changes and
-/// `promote` lands nothing. Silently discarding a fork's work is far worse
-/// than copying it, and copy forks are verified on Windows: write, diff and
-/// promote all behave.
-///
-/// Revisit when the sdk's `ProjFS` provider carries writes back. The probe
-/// still runs so `status` can name the provider it found.
+/// Windows forks use copies until `ProjFS` can capture every admitted host
+/// mutation, including imports from outside its virtualized namespace.
 pub fn mount_capability() -> MountCapability {
     let probe = probe_native_mount();
     let provider = match probe.kind {
@@ -94,8 +86,7 @@ pub fn mount_capability() -> MountCapability {
             provider,
             available: false,
             reason: Some(
-                "ProjFS projects a fork but does not carry writes back to the store, \
-                 so forks use full copies (promote works the same)"
+                "ProjFS cannot capture every external import into a writable fork; forks use copies"
                     .to_owned(),
             ),
         }
@@ -129,11 +120,10 @@ pub fn mount_setup_hint() -> &'static str {
         )
     } else if cfg!(windows) {
         concat!(
-            "forks use full copies on Windows. ProjFS can project a fork, but it does\n",
-            "not carry writes back to the store, so a mounted fork would silently lose\n",
-            "your work; copies land correctly through `promote`. Nothing to install.\n",
-            "Safe Mode (dry_run) needs mounts, so it is unavailable on Windows for the\n",
-            "same reason.",
+            "forks use full copies on Windows. ProjFS cannot capture every\n",
+            "external import into a writable fork, so mounted forks are not\n",
+            "admitted. Safe Mode (dry_run) cannot shadow an existing Windows\n",
+            "directory with ProjFS.",
         )
     } else {
         "native mounts are not supported on this platform; forks use full copies \

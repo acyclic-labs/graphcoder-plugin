@@ -354,7 +354,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                     return 1;
                 }
             };
-            match execute(&mut client, command) {
+            match execute(&mut client, command, repo) {
                 Ok(()) => 0,
                 Err(message) => {
                     eprintln!("{}: {message}", product::NAME);
@@ -591,7 +591,7 @@ fn init(repo: &Path) -> i32 {
     clippy::too_many_lines,
     reason = "one arm per Command; each arm is a single call plus its printing"
 )]
-fn execute(client: &mut Client, command: Command) -> Result<(), String> {
+fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), String> {
     match command {
         Command::Checkpoint {
             message,
@@ -1033,7 +1033,15 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         }
         Command::Stop => {
             client.call(proto::Op::Stop)?;
-            println!("daemon stopping");
+            let pidfile = store_paths(repo)?.pidfile();
+            let started = std::time::Instant::now();
+            while pidfile.exists() {
+                if started.elapsed() >= std::time::Duration::from_secs(30) {
+                    return Err("daemon did not finish stopping within 30 seconds".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("daemon stopped");
             Ok(())
         }
         Command::SessionStart { session_id, host } => {

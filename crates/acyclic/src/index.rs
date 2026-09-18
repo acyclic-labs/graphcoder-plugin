@@ -415,10 +415,10 @@ impl Index {
     /// Records the start of a conversation turn; returns its 1-based number.
     /// The prompt is truncated to an excerpt on a char boundary.
     pub fn turn_started(&mut self, session_id: &str, prompt: &str) -> Result<i64> {
-        self.ensure_session(session_id)?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_session_on(&transaction, session_id)?;
         let next: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(turn), 0) + 1 FROM turns WHERE session_id = ?1",
             params![session_id],
@@ -519,15 +519,6 @@ impl Index {
         Ok(())
     }
 
-    /// A turn or checkpoint for a session the daemon never saw start (its
-    /// `SessionStart` hook fired while the daemon was down) still gets a
-    /// session row, so `sessions`, `diff --turn`, and `brief` can find it.
-    /// The host is unknown at this point; a later `session_started` is
-    /// ignored by the primary key, so the row keeps its earliest start.
-    fn ensure_session(&mut self, session_id: &str) -> Result<()> {
-        ensure_session_on(&self.connection, session_id)
-    }
-
     pub fn session_ended(&mut self, session_id: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE sessions SET ended_at = ?2 WHERE session_id = ?1",
@@ -538,6 +529,9 @@ impl Index {
 }
 
 fn ensure_session_on(connection: &Connection, session_id: &str) -> Result<()> {
+    // A turn or checkpoint for a session whose SessionStart hook was missed
+    // still needs a discoverable session row. A later session_started call
+    // fills in its host without replacing this earlier start time.
     connection.execute(
         "INSERT OR IGNORE INTO sessions(session_id, host, started_at) VALUES (?1, NULL, ?2)",
         params![session_id, now()],
