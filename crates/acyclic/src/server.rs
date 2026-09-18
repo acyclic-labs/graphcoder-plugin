@@ -215,7 +215,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     let listener = bind_socket(&runtime, &paths)?;
     lap("socket bind + pidfile");
     let store = runtime
-        .block_on(Store::open(paths.clone()))
+        .block_on(Store::open(repo_root, paths.clone()))
         .map_err(|error| error.to_string())?;
     let repo_root = store.repo_root.clone();
     lap("store open");

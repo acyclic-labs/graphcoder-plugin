@@ -135,7 +135,9 @@ fn checkpoint_rewind_journey() {
     thread.join().expect("pipeline thread");
 
     // Diff runs against the reopened store (no daemon needed).
-    let store = runtime.block_on(Store::open(paths)).expect("reopen");
+    let store = runtime
+        .block_on(Store::open(repo.path(), paths))
+        .expect("reopen");
     let changes = runtime
         .block_on(diff::diff(&store, pre_generation, post_generation))
         .expect("diff");

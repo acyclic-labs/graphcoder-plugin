@@ -37,22 +37,54 @@ impl StorePaths {
     /// Resolves the store root for a repo. `stores_root` override comes from
     /// config; the default is `~/.local/share/acyclic/stores`.
     pub fn for_repo(repo_root: &Path, stores_root: Option<&Path>) -> Result<Self> {
+        let canonical = repo_root
+            .canonicalize()
+            .map_err(|error| EngineError::Store(format!("canonicalize repo root: {error}")))?;
         let base = if let Some(path) = stores_root {
-            path.to_path_buf()
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                canonical.join(path)
+            }
         } else {
             let home = std::env::var_os("HOME")
                 .ok_or_else(|| EngineError::Store("HOME is not set".into()))?;
             Path::new(&home).join(format!(".local/share/{}/stores", crate::product::NAME))
         };
-        let canonical = repo_root
-            .canonicalize()
-            .map_err(|error| EngineError::Store(format!("canonicalize repo root: {error}")))?;
+        let base = canonicalize_planned(&base)?;
         let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
         let hex = digest.to_hex();
         let short = hex.get(..16).unwrap_or(&hex);
-        Ok(Self {
+        let paths = Self {
             root: base.join(short),
-        })
+        };
+        paths.ensure_outside_repo(&canonical)?;
+        Ok(paths)
+    }
+
+    fn ensure_outside_repo(&self, repo_root: &Path) -> Result<()> {
+        let repo = repo_root.canonicalize()?;
+        for path in [
+            self.root.clone(),
+            self.object_store(),
+            self.index_db(),
+            self.spec_db(),
+            self.spec_runs(),
+            self.pidfile(),
+            self.rewind_journal(),
+            self.trash(),
+            self.meta(),
+            self.root.join("daemon.log"),
+        ] {
+            let resolved = canonicalize_planned(&path)?;
+            if resolved.starts_with(&repo) {
+                return Err(EngineError::Store(format!(
+                    "store must be outside the repository: {}",
+                    resolved.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn object_store(&self) -> PathBuf {
@@ -93,6 +125,35 @@ impl StorePaths {
     /// Scratch and pid files for in-flight speculative child processes.
     pub fn spec_runs(&self) -> PathBuf {
         self.root.join("spec")
+    }
+}
+
+fn canonicalize_planned(path: &Path) -> std::io::Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut resolved) => {
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if cursor
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(std::io::Error::other("dangling store path symlink"));
+                }
+                let name = cursor.file_name().ok_or(error)?;
+                missing.push(name.to_os_string());
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("store path has no existing ancestor"))?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -165,14 +226,18 @@ impl Store {
     /// Creates the store for a repo: directories, volume, meta record.
     /// Fails if the store already exists.
     pub async fn init(repo_root: &Path, paths: StorePaths) -> Result<Self> {
+        paths.ensure_outside_repo(repo_root)?;
         if paths.meta().exists() {
             return Err(EngineError::Store(format!(
                 "store already initialized at {}",
                 paths.root.display()
             )));
         }
+        std::fs::create_dir_all(&paths.root)?;
+        paths.ensure_outside_repo(repo_root)?;
         std::fs::create_dir_all(paths.object_store())?;
         std::fs::create_dir_all(paths.trash())?;
+        paths.ensure_outside_repo(repo_root)?;
 
         let cancel = CancellationToken::new();
         let fs = LocalFs::local(local_options(paths.object_store()))
@@ -213,7 +278,8 @@ impl Store {
     }
 
     /// Opens an existing store recorded in `meta.json`.
-    pub async fn open(paths: StorePaths) -> Result<Self> {
+    pub async fn open(repo_root: &Path, paths: StorePaths) -> Result<Self> {
+        paths.ensure_outside_repo(repo_root)?;
         let text = std::fs::read_to_string(paths.meta()).map_err(|error| {
             EngineError::Store(format!(
                 "no store at {} ({error}); run init first",
@@ -228,6 +294,13 @@ impl Store {
                 meta.schema
             )));
         }
+        let expected_repo = repo_root.canonicalize()?;
+        if meta.repo_root.canonicalize()? != expected_repo {
+            return Err(EngineError::Store(
+                "store belongs to a different repository".into(),
+            ));
+        }
+        paths.ensure_outside_repo(&expected_repo)?;
 
         let cancel = CancellationToken::new();
         let phase = std::time::Instant::now();
@@ -336,7 +409,7 @@ mod tests {
         let created_id = created.volume_id;
         drop(created);
 
-        let reopened = Store::open(paths).await.expect("open");
+        let reopened = Store::open(repo.path(), paths).await.expect("open");
         assert_eq!(reopened.volume_id, created_id);
         assert_eq!(
             reopened.repo_root,
@@ -351,5 +424,85 @@ mod tests {
         let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
         Store::init(repo.path(), paths.clone()).await.expect("init");
         assert!(Store::init(repo.path(), paths).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_inside_repo_is_rejected_on_init_and_open() {
+        let repo = tempfile::tempdir().expect("repo dir");
+        let paths = StorePaths {
+            root: repo.path().join(".stores").join("fixture"),
+        };
+        assert!(StorePaths::for_repo(repo.path(), Some(&repo.path().join(".stores"))).is_err());
+        assert!(matches!(
+            Store::init(repo.path(), paths.clone()).await,
+            Err(EngineError::Store(message)) if message.contains("outside the repository")
+        ));
+        assert!(!paths.root.exists());
+        assert!(!paths.meta().exists());
+
+        std::fs::create_dir_all(&paths.root).expect("create invalid root");
+        atomic_write_json(
+            &paths.meta(),
+            &StoreMeta {
+                schema: 1,
+                repo_root: repo.path().canonicalize().expect("canonical repo"),
+                volume_id: VolumeId::new(),
+            },
+        )
+        .expect("seed meta");
+        assert!(matches!(
+            Store::open(repo.path(), paths).await,
+            Err(EngineError::Store(message)) if message.contains("outside the repository")
+        ));
+    }
+
+    #[test]
+    fn relative_store_dir_resolves_from_repo_before_daemon_changes_cwd() {
+        let repo = tempfile::tempdir().expect("repo dir");
+        let paths = StorePaths::for_repo(repo.path(), Some(Path::new("../stores")))
+            .expect("resolve relative store");
+        assert!(paths.root.is_absolute());
+        assert!(paths.root.starts_with(
+            repo.path()
+                .canonicalize()
+                .expect("canonical repo")
+                .parent()
+                .expect("repo parent")
+                .join("stores")
+        ));
+    }
+
+    #[tokio::test]
+    async fn store_open_rejects_a_different_requested_repository() {
+        let repo = tempfile::tempdir().expect("repo dir");
+        let other = tempfile::tempdir().expect("other repo dir");
+        let stores = tempfile::tempdir().expect("stores dir");
+        let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
+        drop(Store::init(repo.path(), paths.clone()).await.expect("init"));
+        assert!(matches!(
+            Store::open(other.path(), paths).await,
+            Err(EngineError::Store(message)) if message.contains("different repository")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_child_symlink_into_repo_is_rejected() {
+        let repo = tempfile::tempdir().expect("repo dir");
+        let stores = tempfile::tempdir().expect("stores dir");
+        let target = repo.path().join("misplaced-store");
+        std::fs::create_dir(&target).expect("target dir");
+        let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("resolve paths");
+        std::fs::create_dir_all(&paths.root).expect("store root");
+        std::os::unix::fs::symlink(&target, paths.object_store()).expect("store link");
+        assert!(StorePaths::for_repo(repo.path(), Some(stores.path())).is_err());
+        assert!(matches!(
+            Store::init(repo.path(), paths).await,
+            Err(EngineError::Store(message)) if message.contains("outside the repository")
+        ));
+        assert_eq!(
+            std::fs::read_dir(target).expect("target entries").count(),
+            0
+        );
     }
 }
