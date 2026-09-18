@@ -61,6 +61,25 @@ impl Payload {
 /// just labeled by enqueue order rather than a strict barrier.
 const PRE_TOOL_WAIT: Duration = Duration::from_millis(2_000);
 
+/// How long a session start waits for a daemon that is still coming up.
+/// A warm daemon answers in a few milliseconds; a cold one is building its
+/// first snapshot, which can take minutes on a large tree, and the agent's
+/// first turn must not wait for that.
+const SESSION_START_WAIT: Duration = Duration::from_millis(300);
+
+fn print_starting_notice() {
+    // Stdout lands in the agent's context, like the brief would.
+    println!(
+        "{NAME}: building the first snapshot of this tree in the background; checkpoints \
+         start once `{NAME} status` says ready, and `{NAME} brief` has the previous session."
+    );
+}
+
+fn is_timeout(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("timed out") || lower.contains("timeout") || lower.contains("would block")
+}
+
 /// The lifecycle events a host adapter wires `acyclic hook <event>` to.
 /// The CLI argument form (`pre-tool`, ...) is what the adapters write into
 /// hook config, so it is derived here rather than spelled in `install.rs`.
@@ -113,8 +132,10 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     let mut payload = parse_payload(&raw);
     let host = std::env::var("ACYCLIC_HOST").unwrap_or_else(|_| "claude-code".into());
 
+    // A session start may spawn the daemon, but never waits for its first
+    // snapshot: the agent's first turn is behind this hook.
     let spawn = if event == HookEvent::SessionStart {
-        Spawn::Allowed
+        Spawn::AllowedFor(SESSION_START_WAIT)
     } else {
         Spawn::Never
     };
@@ -124,10 +145,15 @@ pub fn run(repo: &Path, event: &str) -> i32 {
         event.as_arg(),
         if matches!(spawn, Spawn::Allowed) { "allowed" } else { "never" }
     );
-    let Ok(mut client) = connect(repo, spawn) else {
+    let mut client = match connect(repo, spawn) {
+        Ok(client) => client,
+        Err(ConnectError::Starting) => {
+            print_starting_notice();
+            return 0;
+        }
         // No daemon (not initialized, or stopped): checkpointing is off.
         // Stay quiet — hooks fire on every tool call.
-        return 0;
+        Err(_) => return 0,
     };
 
     let op = match event {
@@ -155,12 +181,20 @@ pub fn run(repo: &Path, event: &str) -> i32 {
         },
         HookEvent::SessionStart => {
             let session_id = payload.session().unwrap_or_default();
+            // A daemon mid-baseline (first snapshot, or a recovery rescan)
+            // answers when it is Ready; it still registers the session
+            // then. Do not hold the agent's first turn for it.
+            client.set_deadline(SESSION_START_WAIT);
             let registered = client.call(proto::Op::SessionStart {
                 session_id: session_id.clone(),
                 host,
             });
             if let Err(message) = registered {
-                eprintln!("{NAME} hook (session-start): {message}");
+                if is_timeout(&message) {
+                    print_starting_notice();
+                } else {
+                    eprintln!("{NAME} hook (session-start): {message}");
+                }
                 return 0;
             }
             // Stdout of a SessionStart hook lands in the agent's context:

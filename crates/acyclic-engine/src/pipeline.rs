@@ -1875,11 +1875,11 @@ impl Pipeline {
         })
     }
 
-    /// Mints one fork: publish the current state (the fork base), then cut a
-    /// fresh writable Head checkout whose overlay the daemon will mount.
-    /// Same first half as `promote`: fold in pending changes, publish, and
-    /// hand back the head so the caller can decide between a plain land
-    /// (head == fork base) and a replay (head moved).
+    /// Captures the current tree as the head a promote is judged against
+    /// (recorded as `promote base`), and hands it back so the caller can
+    /// decide between a plain land (head == fork base) and a replay (head
+    /// moved). It does not publish: authority publish is O(tree) and runs
+    /// on the idle timer.
     async fn publish_head(&mut self) -> Result<GenerationId> {
         if self.state != State::Ready {
             return Err(EngineError::Capture(format!(
@@ -1899,7 +1899,7 @@ impl Pipeline {
         )?;
         self.last_generation = head;
         self.last_checkpoint_row = Some(row);
-        self.commit_engine().await?;
+        self.checkpoints_since_commit += 1;
         Ok(head)
     }
 
@@ -1961,13 +1961,16 @@ impl Pipeline {
         )?;
         self.last_generation = base;
         self.last_checkpoint_row = Some(row);
-        self.commit_engine().await?;
+        self.checkpoints_since_commit += 1;
 
+        // Cut the fork at the exact base generation, published or not: an
+        // authority publish is O(tree) and belongs on the idle timer, not in
+        // front of a fork.
         let checkout = self
             .store
             .volume
             .checkout(
-                acyclic_fs::model::GenerationSelector::Head,
+                acyclic_fs::model::GenerationSelector::Exact(base),
                 crate::store::writable_head(),
                 WorkCounters::UNBOUNDED,
                 &self.cancel,

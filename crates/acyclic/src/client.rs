@@ -13,6 +13,11 @@ use acyclic_proto as proto;
 pub enum Spawn {
     /// Interactive: start the daemon if it isn't running (waits for baseline).
     Allowed,
+    /// Start the daemon if it isn't running, but wait at most this long for
+    /// it to answer. Past that, [`ConnectError::Starting`]: the daemon keeps
+    /// coming up in the background. The session-start hook uses this so a
+    /// cold daemon never delays the agent's first turn.
+    AllowedFor(Duration),
     /// Hook path: never spawn; a missing daemon is a warning-and-exit-2.
     Never,
 }
@@ -25,6 +30,8 @@ pub struct Client {
 pub enum ConnectError {
     /// No daemon and spawning was not allowed.
     NoDaemon,
+    /// A daemon was spawned and is still starting; the bounded wait ran out.
+    Starting,
     Other(String),
 }
 
@@ -54,14 +61,18 @@ impl Client {
                 );
                 Err(ConnectError::NoDaemon)
             }
-            Spawn::Allowed => {
+            Spawn::Allowed | Spawn::AllowedFor(_) => {
                 acyclic_engine::trace!(
                     "client",
                     "no daemon at {}: spawning one",
                     crate::ipc::endpoint_display(socket)
                 );
                 let child = spawn_daemon(repo_root, log_path)?;
-                let client = wait_for_socket(socket, child, log_path);
+                let bound = match spawn {
+                    Spawn::AllowedFor(bound) => Some(bound),
+                    _ => None,
+                };
+                let client = wait_for_socket(socket, child, log_path, bound);
                 acyclic_engine::trace!(
                     "client",
                     "daemon spawn + socket wait took {:.1}ms",
@@ -277,17 +288,32 @@ fn wait_for_socket(
     socket: &Path,
     mut child: std::process::Child,
     log_path: &Path,
+    bound: Option<Duration>,
 ) -> Result<Client, ConnectError> {
     let started = Instant::now();
-    let deadline = Duration::from_secs(30 * 60);
+    let deadline = bound.unwrap_or(Duration::from_secs(30 * 60));
     let mut reported = false;
     loop {
         if let Ok(stream) = ClientStream::connect(socket) {
             if let Ok(mut client) = Client::from_stream(stream) {
+                // The daemon binds its socket before it opens the store, so
+                // a connect can succeed while the ping waits on the store
+                // open; bound the ping too so a caller with a bound never
+                // sits on it.
+                client.set_deadline(bound.unwrap_or(Duration::from_secs(60)));
                 if client.call(proto::Op::Ping).is_ok() {
+                    client.set_deadline(Duration::from_secs(24 * 60 * 60));
                     return Ok(client);
                 }
             }
+        }
+        if bound.is_some_and(|bound| started.elapsed() > bound) {
+            acyclic_engine::trace!(
+                "client",
+                "daemon still starting after {:.1}ms; not waiting",
+                acyclic_engine::trace::ms(started)
+            );
+            return Err(ConnectError::Starting);
         }
         if let Ok(Some(status)) = child.try_wait() {
             let log = std::fs::read_to_string(log_path).unwrap_or_default();
@@ -302,7 +328,7 @@ fn wait_for_socket(
                 log_path.display()
             )));
         }
-        if started.elapsed() > Duration::from_secs(2) && !reported {
+        if bound.is_none() && started.elapsed() > Duration::from_secs(2) && !reported {
             eprintln!("{NAME}: daemon starting (building the first snapshot of the tree)...");
             reported = true;
         }

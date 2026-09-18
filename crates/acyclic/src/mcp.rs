@@ -75,6 +75,7 @@ fn connect(repo: &Path) -> Result<Client, McpError> {
         ConnectError::NoDaemon => {
             internal_error("daemon not running and could not be started".into())
         }
+        ConnectError::Starting => internal_error("daemon is still starting".into()),
         ConnectError::Other(message) => internal_error(message),
     })
 }

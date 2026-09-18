@@ -27,6 +27,10 @@ pub struct Config {
     /// the hooks drain the watcher first, so the tick finds nothing and
     /// records nothing. Zero disables it.
     pub auto_checkpoint_idle_ms: u64,
+    /// The daemon exits after this long (ms) with no request, no live
+    /// session, no live fork and no Safe Mode session. It restarts on the
+    /// next session start. Zero keeps it alive forever.
+    pub daemon_idle_exit_ms: u64,
     /// Days a rewound-away tree is kept in the store's trash.
     pub trash_ttl_days: u32,
     /// Override for the store directory (defaults to the per-machine root).
@@ -116,6 +120,7 @@ impl Default for Config {
             commit_every: 25,
             commit_idle_ms: 60_000,
             auto_checkpoint_idle_ms: 5_000,
+            daemon_idle_exit_ms: 3_600_000,
             trash_ttl_days: 7,
             store_dir: None,
             dry_run: false,
