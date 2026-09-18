@@ -404,7 +404,13 @@ impl Server {
     async fn dispatch_inner(&self, op: proto::Op) -> Result<proto::Reply, String> {
         *self.last_activity.lock().await = Instant::now();
         match op {
-            proto::Op::Ping => Ok(proto::Reply::Pong),
+            proto::Op::Ping => {
+                let status = self.handle.status().await.map_err(stringify)?;
+                if status.state == pipeline::State::Baselining {
+                    return Err("pipeline baseline is still in progress".to_owned());
+                }
+                Ok(proto::Reply::Pong)
+            }
             proto::Op::Status => {
                 let status = self.handle.status().await.map_err(stringify)?;
                 Ok(proto::Reply::Status(proto::StatusInfo {

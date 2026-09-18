@@ -34,6 +34,27 @@ fn fast_config() -> Config {
 }
 
 #[test]
+fn startup_failure_is_reported_by_status() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    std::fs::remove_dir(repo.path()).expect("remove empty repo before watcher opens");
+    let (handle, thread) = pipeline::spawn(store, index, fast_config());
+
+    let error = runtime
+        .block_on(handle.status())
+        .expect_err("startup must fail");
+    assert!(error.to_string().contains("pipeline failed to start"));
+    drop(handle);
+    thread.join().expect("pipeline thread");
+}
+
+#[test]
 fn checkpoint_rewind_journey() {
     let repo = tempfile::tempdir().expect("repo");
     let stores = tempfile::tempdir().expect("stores");

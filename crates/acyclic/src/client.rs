@@ -409,11 +409,10 @@ fn wait_for_socket(
     loop {
         if let Ok(stream) = ClientStream::connect(socket) {
             if let Ok(mut client) = Client::from_stream(stream) {
-                // The daemon binds its socket before it opens the store, so
-                // a connect can succeed while the ping waits on the store
-                // open; bound the ping too so a caller with a bound never
-                // sits on it.
-                client.set_deadline(bound.unwrap_or(Duration::from_secs(60)));
+                // The socket can accept connections before the pipeline has
+                // completed its baseline. Ping waits for that pipeline and
+                // carries a startup error back to this caller.
+                client.set_deadline(deadline.saturating_sub(started.elapsed()));
                 if client.call(proto::Op::Ping).is_ok() {
                     client.set_deadline(Duration::from_secs(24 * 60 * 60));
                     return Ok(client);

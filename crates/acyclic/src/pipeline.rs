@@ -232,7 +232,7 @@ enum Request {
         reply: oneshot::Sender<Result<PromoteOutcome>>,
     },
     Status {
-        reply: oneshot::Sender<StatusReport>,
+        reply: oneshot::Sender<Result<StatusReport>>,
     },
     SetShadowed {
         active: bool,
@@ -625,7 +625,7 @@ impl PipelineHandle {
     }
 
     pub async fn status(&self) -> Result<StatusReport> {
-        request!(self, Status {})
+        request!(self, Status {})?
     }
 
     /// Safe Mode: while a session's fork is shadow-mounted over the real repo
@@ -874,13 +874,7 @@ fn fail_request(request: Request, message: &str) {
         Request::RestorePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::TurnStarted { reply, .. } => drop(reply.send(Err(error()))),
         Request::SetShadowed { reply, .. } => drop(reply.send(Err(error()))),
-        Request::Status { reply } => drop(reply.send(StatusReport {
-            state: State::Baselining,
-            last_checkpoint: None,
-            unpublished: 0,
-            checkpoints_since_commit: 0,
-            watcher: WatcherHealth::default(),
-        })),
+        Request::Status { reply } => drop(reply.send(Err(error()))),
         Request::SessionStarted { reply, .. } | Request::SessionEnded { reply, .. } => {
             drop(reply.send(Err(error())));
         }
@@ -1270,13 +1264,13 @@ impl Pipeline {
                 false
             }
             Request::Status { reply } => {
-                let _ = reply.send(StatusReport {
+                let _ = reply.send(Ok(StatusReport {
                     state: self.state,
                     last_checkpoint: self.last_checkpoint_row,
                     unpublished: self.index.unpublished_count().unwrap_or(0),
                     checkpoints_since_commit: self.checkpoints_since_commit,
                     watcher: self.watcher_health.clone(),
-                });
+                }));
                 false
             }
             Request::SetShadowed { active, reply } => {
