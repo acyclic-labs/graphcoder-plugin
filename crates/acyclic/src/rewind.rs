@@ -6,10 +6,10 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(unix)]
-use acyclic_fs::kernel::MetadataField;
-use acyclic_fs::kernel::{FileKind, FilePayload, LogicalName, NamespacePath};
-use acyclic_fs::{materialize_checkout, ByteRange, MaterializeOptions};
+use acyclic_fs::kernel::{LogicalName, NamespacePath};
+use acyclic_fs::{
+    materialize_checkout, materialize_checkout_host_path, MaterializeError, MaterializeOptions,
+};
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
@@ -72,29 +72,59 @@ pub async fn restore_path_into(
     root: &Path,
     relative: &Path,
 ) -> Result<RestoreOutcome> {
-    let components = validate_relative(relative)?;
+    let mut checkout = store.checkout_exact(target).await?;
+    materialize_path_into_checkout(&mut checkout, root, relative, PathReplace::Atomic).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PathReplace {
+    Atomic,
+    LiveMount,
+}
+
+pub(crate) async fn materialize_path_into_checkout(
+    checkout: &mut LocalCheckout,
+    root: &Path,
+    relative: &Path,
+    replace: PathReplace,
+) -> Result<RestoreOutcome> {
+    validate_relative(relative)?;
+    let normalized = normalized_relative(relative);
     let destination = root.join(relative);
     ensure_real_parents(root, relative)?;
     let parent = destination
         .parent()
         .ok_or_else(|| EngineError::Restore("path has no parent".into()))?;
-    let name = destination
-        .file_name()
-        .ok_or_else(|| EngineError::Restore("path has no name".into()))?
-        .to_string_lossy()
-        .into_owned();
-
-    let mut checkout = store.checkout_exact(target).await?;
-    let limits = checkout.volume_config().limits;
     let cancel = CancellationToken::new();
-    let namespace = namespace_path(&components, limits)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("lookup"))?
-        .value;
-
-    let Some(record) = lookup.record else {
+    // The SDK requires an empty root and recreates the selected path below
+    // it. Keep ordinary restore staging outside the watched repository;
+    // live mounts must stage on the mount to permit the final rename.
+    let stage_parent = match replace {
+        PathReplace::Atomic => root
+            .parent()
+            .ok_or_else(|| EngineError::Restore("repository root has no parent".into()))?,
+        PathReplace::LiveMount => parent,
+    };
+    let stage_root = create_restore_stage(stage_parent)?;
+    let staged = stage_root.join(&normalized);
+    let materialized = materialize_checkout_host_path(
+        checkout,
+        &normalized,
+        &MaterializeOptions {
+            destination: stage_root.clone(),
+            maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
+            maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
+            transfer_bytes: TRANSFER_BYTES,
+        },
+        WorkCounters::UNBOUNDED,
+        &cancel,
+    )
+    .await;
+    if matches!(
+        materialized.as_ref().map_err(|failure| &failure.error),
+        Err(MaterializeError::MissingPath)
+    ) {
+        std::fs::remove_dir_all(&stage_root)?;
         // Faithful restore of an absent path: remove it if it exists now.
         return match std::fs::symlink_metadata(&destination) {
             Ok(metadata) => {
@@ -108,62 +138,53 @@ pub async fn restore_path_into(
                     action: RestoreAction::Removed,
                 })
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(EngineError::Restore(format!(
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match replace {
+                PathReplace::Atomic => Err(EngineError::Restore(format!(
                     "{} does not exist at that checkpoint or in the tree",
                     relative.display()
-                )))
-            }
+                ))),
+                PathReplace::LiveMount => Ok(RestoreOutcome {
+                    path: relative.to_path_buf(),
+                    action: RestoreAction::Removed,
+                }),
+            },
             Err(error) => Err(error.into()),
         };
-    };
-
-    // Stage next to the destination so the final rename never crosses a
-    // filesystem; the parent must exist (it did at the checkpoint, but the
-    // tree may have lost it since).
-    ensure_real_parents(root, relative)?;
-    let staged = parent.join(format!(
-        ".{name}.{}-restore-{}",
-        crate::product::NAME,
-        std::process::id()
-    ));
-    let _ = remove_any(&staged);
-    let written = write_node(
-        &mut checkout,
-        &namespace,
-        record.kind,
-        &record.payload,
-        &staged,
-        limits,
-        &cancel,
-    )
-    .await;
-    if let Err(error) = written {
-        let _ = remove_any(&staged);
-        return Err(error);
+    }
+    if let Err(error) = materialized {
+        let _ = std::fs::remove_dir_all(&stage_root);
+        return Err(EngineError::Restore(format!("materialize path: {error}")));
     }
     ensure_real_parents(root, relative)?;
 
-    // Swap in. An existing destination is exchanged atomically and the old
-    // node discarded; an absent one is a plain rename.
+    // A live mount must observe ordinary remove/rename operations through
+    // its driver. A user restore exchanges an existing node atomically.
     match std::fs::symlink_metadata(&destination) {
-        Ok(_) => {
-            if let Err(error) = atomic_exchange(&destination, &staged) {
-                let _ = remove_any(&staged);
-                return Err(error);
+        Ok(_) => match replace {
+            PathReplace::Atomic => {
+                // An exchange may have published the new node before a
+                // durability error. Keep both staged and scratch trees.
+                atomic_exchange(&destination, &staged)?;
             }
-            let _ = remove_any(&staged);
-        }
+            PathReplace::LiveMount => replace_live_mount(&staged, &destination, parent)?,
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Err(error) = std::fs::rename(&staged, &destination) {
-                let _ = remove_any(&staged);
+            let renamed = match replace {
+                PathReplace::Atomic => durable_rename(&staged, &destination, false),
+                PathReplace::LiveMount => std::fs::rename(&staged, &destination),
+            };
+            if let Err(error) = renamed {
                 return Err(error.into());
             }
         }
         Err(error) => {
-            let _ = remove_any(&staged);
             return Err(error.into());
         }
+    }
+    std::fs::remove_dir_all(&stage_root)?;
+    #[cfg(unix)]
+    if replace == PathReplace::Atomic {
+        sync_parent(&stage_root)?;
     }
     Ok(RestoreOutcome {
         path: relative.to_path_buf(),
@@ -171,132 +192,55 @@ pub async fn restore_path_into(
     })
 }
 
-/// Writes one checkpoint node (recursively for directories) to a fresh host
-/// path. Modes are applied; mtimes are not (same contract as a full rewind).
-pub(crate) fn write_node<'a>(
-    checkout: &'a mut LocalCheckout,
-    namespace: &'a NamespacePath,
-    kind: FileKind,
-    payload: &'a FilePayload,
-    host: &'a Path,
-    limits: acyclic_fs::model::VolumeLimits,
-    cancel: &'a CancellationToken,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
-    Box::pin(async move {
-        match kind {
-            FileKind::Regular => {
-                let length = match payload {
-                    FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
-                    FilePayload::Regular { logical_bytes, .. } => *logical_bytes,
-                    _ => {
-                        return Err(EngineError::Restore(
-                            "regular file with foreign payload".into(),
-                        ))
-                    }
-                };
-                let mut file = std::fs::File::create(host)?;
-                let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
-                let mut offset = 0;
-                while offset < length {
-                    let take = chunk.min(length - offset);
-                    let read = checkout
-                        .read_file_range(
-                            namespace,
-                            ByteRange {
-                                offset,
-                                length: take,
-                            },
-                            WorkCounters::UNBOUNDED,
-                            cancel,
-                        )
-                        .await
-                        .map_err(EngineError::fs("read file range"))?
-                        .value;
-                    use std::io::Write;
-                    file.write_all(&read.bytes)?;
-                    offset += take;
-                }
-                file.sync_all()?;
-                drop(file);
-                apply_mode(checkout, namespace, host, cancel).await
-            }
-            FileKind::SymbolicLink => {
-                let target = checkout
-                    .read_symbolic_link(namespace, WorkCounters::UNBOUNDED, cancel)
-                    .await
-                    .map_err(EngineError::fs("read symlink"))?
-                    .value;
-                create_symlink(&target, host)
-            }
-            FileKind::Directory => {
-                std::fs::create_dir(host)?;
-                let mut entries = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = checkout
-                        .list_directory_records(
-                            namespace,
-                            after.as_ref(),
-                            MAXIMUM_DIRECTORY_ENTRIES,
-                            WorkCounters::UNBOUNDED,
-                            cancel,
-                        )
-                        .await
-                        .map_err(EngineError::fs("list directory"))?
-                        .value;
-                    for entry in &page.entries {
-                        entries.push((entry.name.clone(), entry.record.kind, entry.record.payload));
-                    }
-                    match page.entries.last() {
-                        Some(last) if page.has_more => after = Some(last.name.clone()),
-                        _ => break,
-                    }
-                }
-                for (name, kind, payload) in entries {
-                    let mut components = namespace.components().to_vec();
-                    components.push(name.clone());
-                    let child = NamespacePath::new(components, limits)
-                        .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?;
-                    let child_host = host.join(logical_to_os(&name));
-                    write_node(
-                        checkout,
-                        &child,
-                        kind,
-                        &payload,
-                        &child_host,
-                        limits,
-                        cancel,
-                    )
-                    .await?;
-                }
-                apply_mode(checkout, namespace, host, cancel).await
-            }
-            other => Err(EngineError::Restore(format!(
-                "cannot restore a {other:?} node (only files, symlinks, and directories)"
-            ))),
+fn replace_live_mount(staged: &Path, destination: &Path, parent: &Path) -> Result<()> {
+    let backup_root = create_restore_stage(parent)?;
+    let backup = backup_root.join("old");
+    if let Err(error) = std::fs::rename(destination, &backup) {
+        let _ = std::fs::remove_dir(&backup_root);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(staged, destination) {
+        if let Err(rollback) = std::fs::rename(&backup, destination) {
+            return Err(EngineError::Restore(format!(
+                "materialize rename failed: {error}; old node remains at {} after rollback failed: {rollback}",
+                backup.display()
+            )));
         }
-    })
+        let _ = std::fs::remove_dir(&backup_root);
+        return Err(error.into());
+    }
+    remove_any(&backup)?;
+    std::fs::remove_dir(&backup_root)?;
+    Ok(())
 }
 
-async fn apply_mode(
-    checkout: &mut LocalCheckout,
-    namespace: &NamespacePath,
-    host: &Path,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    let metadata = checkout
-        .read_metadata(namespace, WorkCounters::UNBOUNDED, cancel)
-        .await
-        .map_err(EngineError::fs("read metadata"))?
-        .value;
-    #[cfg(unix)]
-    if let MetadataField::Value(mode) = metadata.posix_mode {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(host, std::fs::Permissions::from_mode(mode & 0o7777))?;
+fn normalized_relative(relative: &Path) -> PathBuf {
+    relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+fn create_restore_stage(parent: &Path) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let sequence = PARK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(
+            ".{}-restore-{}-{sequence}",
+            crate::product::NAME,
+            std::process::id()
+        ));
+        match std::fs::create_dir(&stage) {
+            Ok(()) => return Ok(stage),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
-    #[cfg(not(unix))]
-    let _ = (metadata, host);
-    Ok(())
+    Err(EngineError::Restore(
+        "could not allocate a unique restore stage".into(),
+    ))
 }
 
 pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
@@ -394,22 +338,6 @@ pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
 
 fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     crate::names::os_to_bytes(name)
-}
-
-fn logical_to_os(name: &LogicalName) -> std::ffi::OsString {
-    crate::names::bytes_to_os(name.as_bytes())
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &[u8], host: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), host)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_symlink(_target: &[u8], _host: &Path) -> Result<()> {
-    Err(EngineError::Restore("symlink restore is unix-only".into()))
 }
 
 /// Crash-recovery journal. Present on disk only while a swap is in flight.

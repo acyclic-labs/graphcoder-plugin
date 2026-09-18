@@ -1134,31 +1134,12 @@ pub async fn materialize_paths(
     paths: &[PathBuf],
 ) -> Result<()> {
     let mut checkout = store.checkout_exact(generation).await?;
-    let limits = checkout.volume_config().limits;
-    let cancel = CancellationToken::new();
     for path in paths {
-        let namespace = namespace_of(path)?;
-        let destination = dir.join(path);
-        crate::rewind::remove_any(&destination)?;
-        let lookup = checkout
-            .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-            .await
-            .map_err(EngineError::fs("lookup"))?
-            .value;
-        let Some(record) = lookup.record else {
-            continue;
-        };
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        crate::rewind::write_node(
+        crate::rewind::materialize_path_into_checkout(
             &mut checkout,
-            &namespace,
-            record.kind,
-            &record.payload,
-            &destination,
-            limits,
-            &cancel,
+            dir,
+            path,
+            crate::rewind::PathReplace::LiveMount,
         )
         .await?;
     }

@@ -431,7 +431,19 @@ fn single_path_restore_leaves_the_rest_alone() {
     std::fs::write(root.join("src/main.rs"), b"v1\n").expect("seed");
     std::fs::write(root.join("src/deep/a.txt"), b"a1\n").expect("seed");
     std::fs::write(root.join("src/deep/b.txt"), b"b1\n").expect("seed");
+    std::fs::write(root.join("src/deep/hard-a.txt"), b"linked\n").expect("seed hard link");
+    std::fs::hard_link(
+        root.join("src/deep/hard-a.txt"),
+        root.join("src/deep/hard-b.txt"),
+    )
+    .expect("hard link");
+    std::fs::hard_link(
+        root.join("src/deep/hard-a.txt"),
+        root.join("outside-hard.txt"),
+    )
+    .expect("hard link outside restored subtree");
     std::fs::write(root.join("other.txt"), b"keep\n").expect("seed");
+    std::fs::write(root.join("source.txt"), b"link source\n").expect("seed");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -456,9 +468,15 @@ fn single_path_restore_leaves_the_rest_alone() {
             .expect("v1");
 
         // Mutate everything.
+        // A new hard link can arrive as a lone watcher hint. The SDK must
+        // request a baseline instead of recording it as an independent file.
+        std::fs::hard_link(root.join("source.txt"), root.join("late-link.txt"))
+            .expect("late hard link");
         std::fs::write(root.join("src/main.rs"), b"v2\n").expect("edit");
         std::fs::write(root.join("src/deep/a.txt"), b"a2\n").expect("edit");
         std::fs::remove_file(root.join("src/deep/b.txt")).expect("rm");
+        std::fs::remove_file(root.join("src/deep/hard-b.txt")).expect("rm hard link");
+        std::fs::write(root.join("src/deep/hard-a.txt"), b"changed\n").expect("edit hard link");
         std::fs::write(root.join("src/deep/c.txt"), b"c2\n").expect("add");
         std::fs::write(root.join("other.txt"), b"changed\n").expect("edit");
         std::fs::write(root.join("new.txt"), b"new\n").expect("add");
@@ -514,6 +532,16 @@ fn single_path_restore_leaves_the_rest_alone() {
             b"b1\n"
         );
         assert!(!root.join("src/deep/c.txt").exists());
+        std::fs::write(root.join("src/deep/hard-a.txt"), b"relinked\n")
+            .expect("write restored hard link");
+        assert_eq!(
+            std::fs::read(root.join("src/deep/hard-b.txt")).expect("read restored hard link"),
+            b"relinked\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("outside-hard.txt")).expect("read untouched outside link"),
+            b"changed\n"
+        );
         assert_eq!(
             std::fs::read(root.join("other.txt")).expect("read"),
             b"changed\n"

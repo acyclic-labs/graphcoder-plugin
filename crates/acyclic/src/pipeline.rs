@@ -932,6 +932,10 @@ impl Pipeline {
 
     /// Full baseline: capture the whole tree, checkpoint, finish the watcher
     /// rescan, publish. Used at startup and after RescanRequired/rewind.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "rescan retries share one publication boundary"
+    )]
     async fn baseline(&mut self, kind: CheckpointKind) -> Result<()> {
         crate::trace!(
             "pipeline",
@@ -939,83 +943,118 @@ impl Pipeline {
         );
         let baseline_started = Instant::now();
         self.state = State::Baselining;
-        // A baseline requires a clean checkout. Mid-session (watcher
-        // invalidation, rewind) the overlay holds uncommitted captures:
-        // publish them first. At startup this is a no-op.
-        let phase = Instant::now();
-        self.commit_engine().await?;
-        let precommit_ms = crate::trace::ms(phase);
-        let phase = Instant::now();
-        capture_baseline(
-            &mut self.store.checkout,
-            &self.options,
-            WorkCounters::UNBOUNDED,
-            &self.cancel,
-        )
-        .await
-        .map_err(EngineError::fs("capture baseline"))?;
-        let capture_ms = crate::trace::ms(phase);
-        let phase = Instant::now();
-        self.scrub_exclusions().await?;
-        let generation = self.checkpoint_engine().await?;
-        let snapshot_ms = crate::trace::ms(phase);
-        let row = self
-            .index
-            .record(generation, kind, &Attribution::default())?;
-        self.last_generation = generation;
-        self.last_checkpoint_row = Some(row);
-
-        // Changes that raced the baseline arrive as the rescan-completion
-        // batch; fold them in before declaring Ready.
-        let batch = self
-            .watch
-            .as_mut()
-            .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
-            .finish_rescan()
-            .map_err(EngineError::fs("finish rescan"))?;
-        // A root hint here is already covered by the rescan that just ran.
-        let (batch, root) = strip_root_hints(batch);
-        if root != RootHint::None {
+        // A newly created hard link can race the rescan tail. Restart with a
+        // fresh watcher so the next full capture sees every alias together.
+        for attempt in 0..3 {
+            // A baseline requires a clean checkout. Mid-session (watcher
+            // invalidation, rewind) the overlay holds uncommitted captures:
+            // publish them first. At startup this is a no-op.
+            let phase = Instant::now();
+            self.commit_engine().await?;
+            let precommit_ms = crate::trace::ms(phase);
+            let phase = Instant::now();
+            capture_baseline(
+                &mut self.store.checkout,
+                &self.options,
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("capture baseline"))?;
+            let capture_ms = crate::trace::ms(phase);
+            let phase = Instant::now();
+            self.scrub_exclusions().await?;
+            let scrub_ms = crate::trace::ms(phase);
+            // Changes that raced the baseline arrive as the rescan-completion
+            // batch; fold them in before declaring Ready.
+            let batch = self
+                .watch
+                .as_mut()
+                .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
+                .finish_rescan()
+                .map_err(EngineError::fs("finish rescan"))?;
+            // A root hint here is already covered by the rescan that just ran.
+            let (batch, root) = strip_root_hints(batch);
+            if matches!(batch, WatchBatch::RescanRequired { .. }) {
+                self.watcher_health.invalidations += 1;
+                self.watcher_health.last_reason = Some("rescan tail invalidated".into());
+                self.reset_watch().await?;
+                crate::trace!(
+                    "pipeline",
+                    "baseline rescan tail invalidated; retry {}",
+                    attempt + 1
+                );
+                continue;
+            }
+            if root != RootHint::None {
+                crate::trace!(
+                    "pipeline",
+                    "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
+                );
+            }
+            if let WatchBatch::Changes { ref changes, .. } = batch {
+                if !changes.is_empty() {
+                    let captured = capture_watch_batch(
+                        &mut self.store.checkout,
+                        batch,
+                        &self.options,
+                        WorkCounters::UNBOUNDED,
+                        &self.cancel,
+                    )
+                    .await;
+                    if let Err(failure) = captured {
+                        if matches!(
+                            failure.error,
+                            acyclic_fs::CaptureError::RescanRequired { .. }
+                        ) {
+                            self.watcher_health.invalidations += 1;
+                            self.watcher_health.last_reason = Some(failure.error.to_string());
+                            self.reset_watch().await?;
+                            crate::trace!(
+                                "pipeline",
+                                "baseline rescan tail needs full capture; retry {}",
+                                attempt + 1
+                            );
+                            continue;
+                        }
+                        return Err(EngineError::fs("capture rescan tail")(failure));
+                    }
+                    self.scrub_exclusions().await?;
+                }
+            }
+            let phase = Instant::now();
+            let generation = self.checkpoint_engine().await?;
+            let snapshot_ms = crate::trace::ms(phase);
+            let row = self
+                .index
+                .record(generation, kind, &Attribution::default())?;
+            self.last_generation = generation;
+            self.last_checkpoint_row = Some(row);
+            let phase = Instant::now();
+            self.commit_engine().await?;
+            let postcommit_ms = crate::trace::ms(phase);
+            self.state = State::Ready;
+            if kind == CheckpointKind::Recovered {
+                let ms = crate::trace::ms(baseline_started);
+                self.watcher_health.recovery_rescans += 1;
+                self.watcher_health.recovery_ms_total += ms;
+                self.watcher_health.last_recovery_ms = ms;
+            }
             crate::trace!(
                 "pipeline",
-                "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
+                "baseline phases: pre-commit {precommit_ms:.1}ms, full capture {capture_ms:.1}ms, \
+             scrub {scrub_ms:.1}ms, snapshot {snapshot_ms:.1}ms, post-commit {postcommit_ms:.1}ms"
             );
+            crate::trace!(
+                "pipeline",
+                "baseline done in {:.1}ms; state Ready",
+                crate::trace::ms(baseline_started)
+            );
+            return Ok(());
         }
-        if let WatchBatch::Changes { ref changes, .. } = batch {
-            if !changes.is_empty() {
-                capture_watch_batch(
-                    &mut self.store.checkout,
-                    batch,
-                    &self.options,
-                    WorkCounters::UNBOUNDED,
-                    &self.cancel,
-                )
-                .await
-                .map_err(EngineError::fs("capture rescan tail"))?;
-                self.scrub_exclusions().await?;
-            }
-        }
-        let phase = Instant::now();
-        self.commit_engine().await?;
-        let postcommit_ms = crate::trace::ms(phase);
-        self.state = State::Ready;
-        if kind == CheckpointKind::Recovered {
-            let ms = crate::trace::ms(baseline_started);
-            self.watcher_health.recovery_rescans += 1;
-            self.watcher_health.recovery_ms_total += ms;
-            self.watcher_health.last_recovery_ms = ms;
-        }
-        crate::trace!(
-            "pipeline",
-            "baseline phases: pre-commit {precommit_ms:.1}ms, full capture {capture_ms:.1}ms, \
-             scrub+snapshot {snapshot_ms:.1}ms, rescan tail+post-commit {postcommit_ms:.1}ms"
-        );
-        crate::trace!(
-            "pipeline",
-            "baseline done in {:.1}ms; state Ready",
-            crate::trace::ms(baseline_started)
-        );
-        Ok(())
+        Err(EngineError::Store(
+            "baseline rescan repeatedly invalidated".into(),
+        ))
     }
 
     /// Handles one request; returns true when the pipeline should exit.
@@ -1446,15 +1485,27 @@ impl Pipeline {
                 WatchBatch::Changes { ref changes, .. } if !changes.is_empty() => {
                     batches += 1;
                     hints += changes.len();
-                    capture_watch_batch(
+                    let captured = capture_watch_batch(
                         &mut self.store.checkout,
                         batch,
                         &self.options,
                         WorkCounters::UNBOUNDED,
                         &self.cancel,
                     )
-                    .await
-                    .map_err(EngineError::fs("capture watch batch"))?;
+                    .await;
+                    if let Err(failure) = captured {
+                        if matches!(
+                            failure.error,
+                            acyclic_fs::CaptureError::RescanRequired { .. }
+                        ) {
+                            self.watcher_health.invalidations += 1;
+                            self.watcher_health.last_reason = Some(failure.error.to_string());
+                            self.reset_watch().await?;
+                            self.baseline(CheckpointKind::Recovered).await?;
+                            return Ok(true);
+                        }
+                        return Err(EngineError::fs("capture watch batch")(failure));
+                    }
                     if scrub {
                         self.scrub_exclusions().await?;
                     }
@@ -1739,7 +1790,7 @@ impl Pipeline {
                 &parent,
             )?));
         }
-        capture_watch_batch(
+        let captured = capture_watch_batch(
             &mut self.store.checkout,
             WatchBatch::Changes {
                 epoch: WatchEpoch::from_u64(0),
@@ -1751,8 +1802,20 @@ impl Pipeline {
             WorkCounters::UNBOUNDED,
             &self.cancel,
         )
-        .await
-        .map_err(EngineError::fs("capture restored paths"))?;
+        .await;
+        if let Err(failure) = captured {
+            if matches!(
+                failure.error,
+                acyclic_fs::CaptureError::RescanRequired { .. }
+            ) {
+                self.watcher_health.invalidations += 1;
+                self.watcher_health.last_reason = Some(failure.error.to_string());
+                self.reset_watch().await?;
+                self.baseline(CheckpointKind::Recovered).await?;
+                return Ok(());
+            }
+            return Err(EngineError::fs("capture restored paths")(failure));
+        }
         self.scrub_exclusions().await
     }
 
