@@ -1,51 +1,24 @@
 #!/usr/bin/env bash
-# Linux validation without leaving the Mac: build and run the full test +
-# acceptance suite inside a Linux container. acyclic-fs is fetched from its
-# own public git repo (see Cargo.toml), not a sibling checkout; all build
-# artifacts and test state stay on container-local filesystems (which is
-# also what exercises renameat2(RENAME_EXCHANGE) and inotify on a Linux
-# kernel for real).
-#
-# Usage: scripts/docker-linux.sh [image]
+# Run the identical qualification gate on a Linux kernel in a container.
 set -euo pipefail
-
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SDK="$(cd "$PLUGIN/../../../sdk" && pwd)"
 IMAGE="${1:-rust:1-bookworm}"
-
-# FUSE inside the container (fork mounts): pass the device + cap when the
-# host offers them; forks.sh skips gracefully otherwise.
 FUSE_FLAGS=()
-if [ -e /dev/fuse ] || [ "$(uname -s)" = "Darwin" ]; then
+if [ -e /dev/fuse ]; then
   FUSE_FLAGS=(--device /dev/fuse --cap-add SYS_ADMIN)
 fi
-
 docker run --rm \
   "${FUSE_FLAGS[@]}" \
-  -v "$PLUGIN:/src/graphcoder-plugin:ro" \
+  -v "$PLUGIN:/lab/worktrees/graphcoder/plugin-sdk-lab:ro" \
+  -v "$SDK:/lab/sdk:ro" \
   -v acyclic-linux-cargo:/cargo \
   -v acyclic-linux-target:/build \
   -e CARGO_HOME=/cargo \
   -e CARGO_TARGET_DIR=/build/target \
-  -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
   "$IMAGE" bash -eu -o pipefail -c '
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null
     apt-get install -y -qq sqlite3 procps python3 >/dev/null
-
-    cd /src/graphcoder-plugin
-    echo "=== cargo test (workspace)"
-    cargo test --workspace 2>&1 | grep -E "test result|error" || true
-    cargo test --workspace >/dev/null
-
-    echo "=== release build"
-    cargo build --release
-
-    echo "=== acceptance suite"
-    export TMPDIR=/tmp
-    export ACYCLIC_BIN=/build/target/release/acyclic
-    export ACYCLIC_QUAL=/build/target/release/acyclic-qual
-    export ACYCLIC_LAT_FILES=5000
-    export ACYCLIC_LAT_MB=64
-    export ACYCLIC_SOAK_ROUNDS=30
-    bash tests/acceptance/run-all.sh
-  '
+    python3 /lab/sdk/scripts/qualify-local.py
+  '\n

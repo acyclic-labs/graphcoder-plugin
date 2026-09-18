@@ -73,15 +73,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "acyclic-qual"
-version = "0.0.2"
-dependencies = [
- "acyclic",
- "acyclic-fs",
- "tokio",
-]
-
-[[package]]
 name = "acyclic-stream"
 version = "1.0.0-rc.7"
 dependencies = [

@@ -5,7 +5,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ACYCLIC_BIN:-$REPO_ROOT/target/debug/acyclic}"
-QUAL="${ACYCLIC_QUAL:-$REPO_ROOT/target/debug/acyclic-qual}"
+SDK_ROOT="$(cd "$REPO_ROOT/../../../sdk" && pwd)"
+QUAL="${ACYCLIC_QUAL:-$SDK_ROOT/target/debug/qualify}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/acyclic-acceptance.XXXXXX")"
 # Canonicalize: macOS TMPDIR ends in "/" and /var -> /private/var, so the

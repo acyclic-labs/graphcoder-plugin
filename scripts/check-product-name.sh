@@ -3,7 +3,7 @@
 #   1. scripts/install.sh is fetched standalone and mirrors `name`,
 #      `github_repo`, and `npm_package`; they must match exactly.
 #   2. No user-facing Rust source spells the name out. Only crate/module
-#      identifiers (acyclic_fs, acyclic-qual, ...) and comments
+#      identifiers (acyclic_fs, ...) and comments
 #      may contain it; strings, paths, and doc templates go through
 #      `product::NAME` / `product::render`.
 set -euo pipefail
