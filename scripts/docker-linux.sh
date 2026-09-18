@@ -21,4 +21,4 @@ docker run --rm \
     apt-get update -qq >/dev/null
     apt-get install -y -qq sqlite3 procps python3 >/dev/null
     python3 /lab/sdk/scripts/qualify-local.py
-  '\n
+  '

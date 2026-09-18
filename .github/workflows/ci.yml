@@ -53,4 +53,4 @@ jobs:
             qualify-${{ matrix.os }}-
       - name: Run the shared bounded gate
         shell: pwsh
-        run: python sdk/scripts/qualify-local.py --plugin-root worktrees/graphcoder/plugin-sdk-lab\n
+        run: python sdk/scripts/qualify-local.py --plugin-root worktrees/graphcoder/plugin-sdk-lab

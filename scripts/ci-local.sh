@@ -3,4 +3,4 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$(cd "$ROOT/../../../sdk" && pwd)"
-exec python3 "$SDK/scripts/qualify-local.py" --plugin-root "$ROOT" "$@"\n
+exec python3 "$SDK/scripts/qualify-local.py" --plugin-root "$ROOT" "$@"
