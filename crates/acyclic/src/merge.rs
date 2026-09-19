@@ -22,7 +22,8 @@ use acyclic_fs::text_merge::{
     merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
 };
 use acyclic_fs::{
-    ByteRange, CancellationToken, FileRecordRangeReadRequest, GenerationId, WorkCounters,
+    AuthoredMutation, ByteRange, CancellationToken, FileRecordRangeReadRequest, GenerationId,
+    WorkCounters,
 };
 use bytes::Bytes;
 
@@ -956,19 +957,20 @@ async fn copy_node(
             .await
             .map_err(EngineError::fs("batch subtree metadata"))?
             .value;
+        let regular = read_regular_frontier(&reader, &nodes, cancel).await?;
         frontier = Vec::new();
-        for ((path, record), metadata) in nodes.into_iter().zip(metadata) {
+        let mut mutations = Vec::with_capacity(nodes.len());
+        for (index, ((path, record), metadata)) in nodes.into_iter().zip(metadata).enumerate() {
             match record.kind {
                 FileKind::Regular => {
-                    let bytes = read_regular_record(&reader, record, cancel).await?;
-                    dst.create_file(
-                        path.clone(),
-                        Bytes::from(bytes),
-                        WorkCounters::UNBOUNDED,
-                        cancel,
-                    )
-                    .await
-                    .map_err(EngineError::fs("create file"))?;
+                    let bytes = regular.get(index).ok_or_else(|| {
+                        EngineError::Fs("subtree read omitted a regular file".into())
+                    })?;
+                    mutations.push(AuthoredMutation::CreateFile {
+                        path,
+                        bytes: Bytes::from(bytes.clone()),
+                        metadata,
+                    });
                 }
                 FileKind::SymbolicLink => {
                     let target = reader
@@ -976,19 +978,17 @@ async fn copy_node(
                         .await
                         .map_err(EngineError::fs("read resolved symlink"))?
                         .value;
-                    dst.create_symbolic_link(
-                        path.clone(),
-                        Bytes::copy_from_slice(&target),
-                        WorkCounters::UNBOUNDED,
-                        cancel,
-                    )
-                    .await
-                    .map_err(EngineError::fs("create symlink"))?;
+                    mutations.push(AuthoredMutation::CreateSymbolicLink {
+                        path,
+                        target,
+                        metadata,
+                    });
                 }
                 FileKind::Directory => {
-                    dst.create_directory(path.clone(), WorkCounters::UNBOUNDED, cancel)
-                        .await
-                        .map_err(EngineError::fs("create directory"))?;
+                    mutations.push(AuthoredMutation::CreateDirectory {
+                        path: path.clone(),
+                        metadata,
+                    });
                     for name in list_children(src, &path, cancel).await? {
                         frontier.push(child_path(&path, &name, limits)?);
                     }
@@ -999,63 +999,77 @@ async fn copy_node(
                     )))
                 }
             }
-            if let MetadataField::Value(mode) = metadata.posix_mode {
-                let set = FileMetadata {
-                    posix_mode: MetadataField::Value(mode),
-                    ..FileMetadata::default()
-                };
-                dst.set_metadata(path, set, WorkCounters::UNBOUNDED, cancel)
-                    .await
-                    .map_err(EngineError::fs("set metadata"))?;
-            }
+        }
+        let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
+            .unwrap_or(usize::MAX)
+            .saturating_div(2)
+            .max(1);
+        for chunk in mutations.chunks(maximum) {
+            dst.apply_authored_transaction(chunk.to_vec(), WorkCounters::UNBOUNDED, cancel)
+                .await
+                .map_err(EngineError::fs("create subtree frontier"))?;
         }
     }
     Ok(())
 }
 
-async fn read_regular_record<A, O>(
+async fn read_regular_frontier<A, O>(
     reader: &acyclic_fs::PinnedReader<A, O>,
-    record: FileRecord,
+    nodes: &[(NamespacePath, FileRecord)],
     cancel: &CancellationToken,
-) -> Result<Vec<u8>>
+) -> Result<Vec<Vec<u8>>>
 where
     A: acyclic_fs::AsyncAuthorityStore,
     O: acyclic_fs::AsyncObjectStore,
 {
-    let length = match record.payload {
-        acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
-        acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
-        _ => return Err(EngineError::Fs("regular file with foreign payload".into())),
-    };
-    let chunk = TRANSFER_BYTES;
-    let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-    let mut offset = 0;
-    while offset < length {
-        let take = chunk.min(length - offset);
+    let mut contents = vec![Vec::new(); nodes.len()];
+    let mut offsets = vec![0_u64; nodes.len()];
+    loop {
+        let mut destinations = Vec::new();
+        let mut requests = Vec::new();
+        for (index, ((_, record), offset)) in nodes.iter().zip(&mut offsets).enumerate() {
+            let length = match record.payload {
+                acyclic_fs::kernel::FilePayload::InlineRegular(inline) => {
+                    inline.as_bytes().len() as u64
+                }
+                acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
+                _ => continue,
+            };
+            if *offset >= length {
+                continue;
+            }
+            let take = TRANSFER_BYTES.min(length - *offset);
+            destinations.push(index);
+            requests.push(FileRecordRangeReadRequest {
+                record: *record,
+                range: ByteRange {
+                    offset: *offset,
+                    length: take,
+                },
+            });
+            *offset += take;
+        }
+        if requests.is_empty() {
+            break;
+        }
         let read = reader
             .read_file_record_ranges(
-                &[FileRecordRangeReadRequest {
-                    record,
-                    range: ByteRange {
-                        offset,
-                        length: take,
-                    },
-                }],
-                1,
+                &requests,
+                FILE_READ_CONCURRENCY,
                 WorkCounters::UNBOUNDED,
                 cancel,
             )
             .await
-            .map_err(EngineError::fs("read file range"))?
+            .map_err(EngineError::fs("batch read subtree ranges"))?
             .value;
-        let chunk = read
-            .into_iter()
-            .next()
-            .ok_or_else(|| EngineError::Fs("record range read returned no result".into()))?;
-        out.extend_from_slice(&chunk.bytes);
-        offset += take;
+        for (index, chunk) in destinations.into_iter().zip(read) {
+            contents
+                .get_mut(index)
+                .ok_or_else(|| EngineError::Fs("batch read returned an invalid index".into()))?
+                .extend_from_slice(&chunk.bytes);
+        }
     }
-    Ok(out)
+    Ok(contents)
 }
 
 /// Which of `paths` the repo's `.gitignore` rules ignore, per
