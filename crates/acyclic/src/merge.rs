@@ -235,17 +235,6 @@ fn descendants<'a>(
         .filter(move |next| next.as_path() != path)
 }
 
-/// Paths whose content differs between two summary maps (added, removed,
-/// or kind/payload changed). Metadata-only differences do not count.
-fn host_path(path: &NamespacePath) -> PathBuf {
-    path.components()
-        .iter()
-        .fold(PathBuf::new(), |mut path, component| {
-            path.push(crate::names::bytes_to_os(component.as_bytes()));
-            path
-        })
-}
-
 async fn changed_paths(
     before: &crate::store::LocalGeneration,
     after: &crate::store::LocalGeneration,
@@ -257,7 +246,7 @@ async fn changed_paths(
         .changed_paths(u32::MAX)
         .await
         .map_err(EngineError::fs("resolve merge paths"))?;
-    Ok(changes
+    changes
         .into_iter()
         .filter(|change| match (change.before, change.after) {
             (Some(before), Some(after)) => {
@@ -266,9 +255,15 @@ async fn changed_paths(
             }
             _ => true,
         })
-        .map(|change| host_path(&change.path))
-        .filter(|path| !diff::is_git_internal(path))
-        .collect())
+        .map(|change| {
+            acyclic_fs::namespace_to_host_path(&change.path)
+                .map_err(EngineError::fs("resolve merge host path"))
+        })
+        .filter(|path| match path {
+            Ok(path) => !diff::is_git_internal(path),
+            Err(_) => true,
+        })
+        .collect()
 }
 
 async fn records_at(

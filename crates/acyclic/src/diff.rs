@@ -91,21 +91,17 @@ pub async fn diff(
                 }
                 (None, None) => return None,
             };
-            let path = path
-                .path
-                .components()
-                .iter()
-                .fold(PathBuf::new(), |mut path, component| {
-                    path.push(crate::names::bytes_to_os(component.as_bytes()));
-                    path
-                });
-            Some(FileChange {
-                path,
-                change,
-                file_kind,
-            })
+            Some(
+                acyclic_fs::namespace_to_host_path(&path.path)
+                    .map(|path| FileChange {
+                        path,
+                        change,
+                        file_kind,
+                    })
+                    .map_err(EngineError::fs("resolve host path")),
+            )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     // Snapshots carry `.git` so rewind restores it, but a blast-radius
     // report is about the working tree: object and ref churn from ordinary
     // git commands would otherwise swamp the real changes.
