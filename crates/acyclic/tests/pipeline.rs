@@ -604,6 +604,29 @@ fn single_path_restore_leaves_the_rest_alone() {
             b"changed\n"
         );
 
+        // Batched callers may contain duplicates and descendants of a root.
+        // The pipeline must materialize and reconcile the minimal root once.
+        std::fs::write(root.join("src/deep/a.txt"), b"a3\n").expect("edit again");
+        let restored = handle
+            .restore_paths(
+                target(v1.row_id),
+                vec![
+                    "src/deep/a.txt".into(),
+                    "src/deep".into(),
+                    "src/deep".into(),
+                ],
+                false,
+                Some("deduplicated restore".into()),
+            )
+            .await
+            .expect("restore minimal roots");
+        assert_eq!(restored.outcomes.len(), 1);
+        assert_eq!(restored.outcomes[0].path, Path::new("src/deep"));
+        assert_eq!(
+            std::fs::read(root.join("src/deep/a.txt")).expect("read"),
+            b"a1\n"
+        );
+
         // A path absent at the checkpoint is removed.
         let outcome = handle
             .restore_path(target(v1.row_id), "new.txt".into())

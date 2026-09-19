@@ -1824,7 +1824,8 @@ impl Pipeline {
         safety: bool,
         label: Option<String>,
     ) -> Result<RestoredPaths> {
-        for path in paths {
+        let paths = crate::merge::subtree_roots(paths);
+        for path in &paths {
             if self.exclusions.covers_host(path) {
                 return Err(EngineError::Restore(format!(
                     "{} is excluded from snapshots (`exclude` in {}); no checkpoint holds it",
@@ -1837,7 +1838,7 @@ impl Pipeline {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
-        let what = match paths {
+        let what = match paths.as_slice() {
             [path] => format!("{} from #{}", path.display(), target.id),
             _ => format!("{} path(s) from #{}", paths.len(), target.id),
         };
@@ -1865,7 +1866,7 @@ impl Pipeline {
 
         let write_started = Instant::now();
         let mut outcomes = Vec::with_capacity(paths.len());
-        for path in paths {
+        for path in &paths {
             outcomes.push(rewind::restore_path(&self.store, target.generation, path).await?);
         }
         let write_ms = crate::trace::ms(write_started);
@@ -1884,10 +1885,10 @@ impl Pipeline {
                 .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink())
         });
         let capture_mode = if all_leaves {
-            self.capture_paths_directly(paths).await?;
+            self.capture_paths_directly(&paths).await?;
             "direct capture"
         } else {
-            self.capture_restored_subtrees(paths).await?;
+            self.capture_restored_subtrees(&paths).await?;
             "direct subtree capture"
         };
         let post_ms = crate::trace::ms(post_started);
