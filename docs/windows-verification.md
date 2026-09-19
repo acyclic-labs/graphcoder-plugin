@@ -15,13 +15,13 @@ lint job cannot see.
 | Area | Change |
 | --- | --- |
 | `crates/acyclic/src/ipc.rs` | New. The transport split: Unix domain socket vs. Windows named pipe, with an owner-only pipe DACL. |
-| `crates/acyclic-engine/src/names.rs` | New. The one definition of how a host name becomes engine bytes. |
+| `crates/acyclic/src/names.rs` | New. The one definition of how a host name becomes engine bytes. |
 | `crates/acyclic/src/client.rs` | `ipc::ClientStream`; daemon spawn no longer leaks stdio handles or stands in the repo. |
 | `crates/acyclic/src/server.rs` | `ipc::Listener`/`ipc::ServerStream`; fork route names carry the host encoding. |
-| `crates/acyclic-engine/src/store.rs` | Volume profile and component byte budget come from `names`. |
-| `crates/acyclic-engine/src/rewind.rs` | Windows directory exchange; journal write fixed; staging is retry-safe. |
-| `crates/acyclic-engine/src/guard.rs` | Guarded prefixes and `AppleDouble` matching in the host encoding. |
-| `crates/acyclic-engine/src/{diff,exclude}.rs` | Name decoding via `names` instead of per-file UTF-8 fallbacks. |
+| `crates/acyclic/src/store.rs` | Volume profile and component byte budget come from `names`. |
+| `crates/acyclic/src/rewind.rs` | Windows directory exchange; journal write fixed; staging is retry-safe. |
+| `crates/acyclic/src/guard.rs` | Guarded prefixes and `AppleDouble` matching in the host encoding. |
+| `crates/acyclic/src/{diff,exclude}.rs` | Name decoding via `names` instead of per-file UTF-8 fallbacks. |
 | `crates/acyclic/src/fork.rs` | Windows forks require Projected File System. |
 | `crates/acyclic/src/main.rs` | The client steps out of the tree before asking for a whole-tree swap. |
 | `.github/workflows/{ci,release}.yml` | A `windows` CI job; `win32/x64` release matrix entry. |
@@ -53,7 +53,7 @@ name that arrives in any other encoding is *projected as mojibake rather
 than rejected* — fork route ids passed as raw ASCII came back as six garbage
 characters. Guarded fork paths have the sharper version of the same problem:
 they compare configured prefixes byte-for-byte against mount path components,
-and a guard that never matches **fails open**. `crates/acyclic-engine/src/names.rs`
+and a guard that never matches **fails open**. `crates/acyclic/src/names.rs`
 exists so there is exactly one place this can be got wrong.
 
 Because the profile is fixed for the life of a volume, a store created on

@@ -165,12 +165,12 @@ consistency: the fork survives every non-landing outcome.
 ## Where the code goes
 
 ```
-crates/acyclic-engine/src/merge.rs        NEW — entry table, merge3 port, marker scan
-crates/acyclic-engine/src/pipeline.rs     BuildGeneration { from, entries } request
-crates/acyclic-engine/src/fork.rs         ForkSeed.base becomes mutable; OpenConflict
-crates/acyclic-engine/src/config.rs       [merge] max_file_bytes
+crates/acyclic/src/merge.rs        NEW — entry table, merge3 port, marker scan
+crates/acyclic/src/pipeline.rs     BuildGeneration { from, entries } request
+crates/acyclic/src/fork.rs         ForkSeed.base becomes mutable; OpenConflict
+crates/acyclic/src/config.rs       [merge] max_file_bytes
 crates/acyclic/src/server.rs              replay_onto_head → merge_onto_head; rebase path
-crates/acyclic-proto/src/lib.rs           PromoteInfo.merged_files; ForkInfo.conflict
+crates/acyclic/src/lib.rs           PromoteInfo.merged_files; ForkInfo.conflict
 crates/acyclic/src/main.rs                promote / forks output
 crates/acyclic/src/install.rs             skill: PARTITION + conflict resolution
 tests/acceptance/merge.sh                 G4/G5-adjacent flips; G13–G26 added
