@@ -201,6 +201,10 @@ enum Command {
     Install {
         #[arg(value_enum)]
         host: install::Host,
+        /// Answer yes to anything the adapter would ask (today only
+        /// `pydantic-ai` asks: whether to add its package to your project).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// MCP stdio server: exposes checkpoint/timeline/rewind/diff/restore/
     /// turns/brief as tools for hosts that speak MCP (Claude Desktop, VS
@@ -316,7 +320,8 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                 1
             }
         },
-        Command::Install { host } => match install::run(repo, host) {
+        Command::Install { host, yes } => match install::run(repo, host, &install::Options { yes })
+        {
             Ok(()) => {
                 print_mount_capability();
                 0

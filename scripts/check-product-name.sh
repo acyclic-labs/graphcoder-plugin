@@ -19,6 +19,12 @@ have_npm="$(awk -F'"' '/^NPM_PACKAGE=/{print $2; exit}' "$ROOT/scripts/install.s
 [ "$have_repo" = "$want_repo" ] || { echo "scripts/install.sh REPO=$have_repo, product.toml github_repo=$want_repo" >&2; fail=1; }
 [ "$have_npm" = "$want_npm" ] || { echo "scripts/install.sh NPM_PACKAGE=$have_npm, product.toml npm_package=$want_npm" >&2; fail=1; }
 
+# The PyPI package is a second mirror: its pyproject.toml carries the name
+# and cannot read product.toml at build time.
+want_pypi="$(product_key pypi_package)"
+have_pypi="$(awk -F'"' '/^name = /{print $2; exit}' "$ROOT/packaging/pypi/pyproject.toml")"
+[ "$have_pypi" = "$want_pypi" ] || { echo "packaging/pypi/pyproject.toml name=$have_pypi, product.toml pypi_package=$want_pypi" >&2; fail=1; }
+
 # Literal uses of the current name in strings/paths of user-facing crates.
 # Comments (// and //!) are allowed; identifiers with '_' are crate paths.
 stray="$(grep -rn --include='*.rs' -E "\"[^\"]*\b${want_name}\b[^\"]*\"|\`${want_name} |\.${want_name}/" \
