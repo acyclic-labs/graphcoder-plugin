@@ -542,6 +542,9 @@ pub async fn execute(
         .into_iter()
         .filter(|relative| std::fs::symlink_metadata(repo.join(relative)).is_ok())
         .collect();
+    // The staging-only legacy phase has served its purpose. From this point
+    // the SDK owns the durable carry/exchange journal at the same path.
+    std::fs::remove_file(&journal_path)?;
     let locator = publish_locator(repo, &journal_path)?;
     let exchange = publish_native_exchange(&journal_path, repo, &tmp, carried)
         .map_err(|error| EngineError::Restore(format!("publish tree: {error}")))?;
