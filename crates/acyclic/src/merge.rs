@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use acyclic_fs::kernel::{FileKind, FileMetadata, MetadataField, NamespacePath};
+use acyclic_fs::kernel::{FileKind, FileMetadata, FileRecord, MetadataField, NamespacePath};
 pub use acyclic_fs::text_merge::{
     conflict_hunks, has_conflict_markers, ByteConflictKind as ConflictKind,
 };
@@ -24,7 +24,7 @@ use acyclic_fs::text_merge::{
 use acyclic_fs::{ByteRange, CancellationToken, GenerationId, WorkCounters};
 use bytes::Bytes;
 
-use crate::diff::{self, RecordSummary};
+use crate::diff;
 use crate::rewind::{namespace_path, validate_relative};
 use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
@@ -237,26 +237,90 @@ fn descendants<'a>(
 
 /// Paths whose content differs between two summary maps (added, removed,
 /// or kind/payload changed). Metadata-only differences do not count.
-fn changed_paths(
-    before: &BTreeMap<PathBuf, RecordSummary>,
-    after: &BTreeMap<PathBuf, RecordSummary>,
-) -> BTreeSet<PathBuf> {
-    let mut set = BTreeSet::new();
-    for (path, summary) in before {
-        match after.get(path) {
-            Some(other) if other.same_content(summary) => {}
-            _ => {
-                set.insert(path.clone());
+fn host_path(path: &NamespacePath) -> PathBuf {
+    path.components()
+        .iter()
+        .fold(PathBuf::new(), |mut path, component| {
+            path.push(crate::names::bytes_to_os(component.as_bytes()));
+            path
+        })
+}
+
+async fn changed_paths(
+    before: &crate::store::LocalGeneration,
+    after: &crate::store::LocalGeneration,
+) -> Result<BTreeSet<PathBuf>> {
+    let changes = before
+        .diff_to(after, u32::MAX)
+        .await
+        .map_err(EngineError::fs("diff merge generations"))?
+        .changed_paths(u32::MAX)
+        .await
+        .map_err(EngineError::fs("resolve merge paths"))?;
+    Ok(changes
+        .into_iter()
+        .filter(|change| match (change.before, change.after) {
+            (Some(before), Some(after)) => {
+                before.kind != after.kind
+                    || (before.kind != FileKind::Directory && before.payload != after.payload)
             }
-        }
+            _ => true,
+        })
+        .map(|change| host_path(&change.path))
+        .filter(|path| !diff::is_git_internal(path))
+        .collect())
+}
+
+async fn records_at(
+    generation: &crate::store::LocalGeneration,
+    paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, FileRecord>> {
+    if paths.is_empty() {
+        return Ok(BTreeMap::new());
     }
-    for path in after.keys() {
-        if !before.contains_key(path) {
-            set.insert(path.clone());
-        }
-    }
-    set.retain(|path| !diff::is_git_internal(path));
-    set
+    let namespaces = paths
+        .iter()
+        .map(|path| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    let records = generation
+        .lookup_paths(&namespaces)
+        .await
+        .map_err(EngineError::fs("lookup merge paths"))?;
+    Ok(paths
+        .iter()
+        .cloned()
+        .zip(records)
+        .filter_map(|(path, record)| record.map(|record| (path, record)))
+        .collect())
+}
+
+struct MergeInputs {
+    base: BTreeMap<PathBuf, FileRecord>,
+    theirs: BTreeMap<PathBuf, FileRecord>,
+    ours: BTreeMap<PathBuf, FileRecord>,
+    ours_changed: BTreeSet<PathBuf>,
+    theirs_changed: BTreeSet<PathBuf>,
+}
+
+async fn merge_inputs(
+    store: &Store,
+    base: GenerationId,
+    theirs: GenerationId,
+    ours: GenerationId,
+) -> Result<MergeInputs> {
+    let base_generation = store.generation(base).await?;
+    let theirs_generation = store.generation(theirs).await?;
+    let ours_generation = store.generation(ours).await?;
+    let ours_changed = changed_paths(&base_generation, &ours_generation).await?;
+    let theirs_changed = changed_paths(&base_generation, &theirs_generation).await?;
+    let paths: Vec<_> = ours_changed.union(&theirs_changed).cloned().collect();
+    Ok(MergeInputs {
+        base: records_at(&base_generation, &paths).await?,
+        theirs: records_at(&theirs_generation, &paths).await?,
+        ours: records_at(&ours_generation, &paths).await?,
+        ours_changed,
+        theirs_changed,
+    })
 }
 
 /// Computes the merge of fork `ours` onto mainline `theirs` from `base`.
@@ -272,11 +336,14 @@ pub async fn plan(
     ours_name: &str,
     limits: &MergeLimits,
 ) -> Result<MergePlan> {
-    let base_map = diff::summaries(store, base).await?;
-    let theirs_map = diff::summaries(store, theirs).await?;
-    let ours_map = diff::summaries(store, ours).await?;
-    let ours_changed = changed_paths(&base_map, &ours_map);
-    let theirs_changed = changed_paths(&base_map, &theirs_map);
+    let inputs = merge_inputs(store, base, theirs, ours).await?;
+    let MergeInputs {
+        base: base_map,
+        theirs: theirs_map,
+        ours: ours_map,
+        ours_changed,
+        theirs_changed,
+    } = inputs;
 
     let mut base_checkout = store.checkout_exact(base).await?;
     let mut theirs_checkout = store.checkout_exact(theirs).await?;
@@ -307,7 +374,7 @@ pub async fn plan(
         let b = base_map.get(path);
         let h = theirs_map.get(path);
         let f = ours_map.get(path);
-        let kind = |summary: Option<&RecordSummary>| summary.map(|s| s.kind);
+        let kind = |record: Option<&FileRecord>| record.map(|record| record.kind);
         match (kind(b), kind(f), kind(h)) {
             // Nothing to decide here: both deleted it (or both changed it
             // inside a now-absent dir), or independent edits below one
@@ -320,7 +387,7 @@ pub async fn plan(
             ) => {}
             // Regular files on both sides.
             (_, Some(FileKind::Regular), Some(FileKind::Regular)) => {
-                if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) {
+                if f.map(|record| record.payload) == h.map(|record| record.payload) {
                     continue;
                 }
                 let base_bytes = match kind(b) {
@@ -405,7 +472,7 @@ pub async fn plan(
             }
             // Symlinks retargeted identically are fine.
             (_, Some(FileKind::SymbolicLink), Some(FileKind::SymbolicLink))
-                if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) => {}
+                if f.map(|record| record.payload) == h.map(|record| record.payload) => {}
             // Everything else is a kind clash: a file on one side and a
             // directory or symlink on the other, symlinks retargeted
             // differently, or a file that became a directory on both sides.
