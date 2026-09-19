@@ -22,7 +22,7 @@ use acyclic_fs::text_merge::{
     merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
 };
 use acyclic_fs::{
-    AuthoredMutation, ByteRange, CancellationToken, DirectoryRecordPageRequest,
+    AuthoredMutation, ByteRange, CancellationToken, DirectoryPageRequest,
     FileRecordRangeReadRequest, GenerationId, WorkCounters,
 };
 use bytes::Bytes;
@@ -854,7 +854,7 @@ async fn list_child_paths(
     let mut pending = directories
         .iter()
         .cloned()
-        .map(|path| DirectoryRecordPageRequest {
+        .map(|path| DirectoryPageRequest {
             path,
             after: None,
             maximum_entries: PAGE_ENTRIES,
@@ -863,7 +863,7 @@ async fn list_child_paths(
     let mut children = Vec::new();
     while !pending.is_empty() {
         let pages = reader
-            .list_directory_record_pages(
+            .list_directory_pages(
                 &pending,
                 FILE_READ_CONCURRENCY,
                 WorkCounters::UNBOUNDED,
@@ -884,7 +884,7 @@ async fn list_child_paths(
                     .ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?
                     .name
                     .clone();
-                next.push(DirectoryRecordPageRequest {
+                next.push(DirectoryPageRequest {
                     after: Some(after),
                     ..request
                 });
