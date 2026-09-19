@@ -239,6 +239,9 @@ fn main() {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
+    if matches!(cli.command, Command::Daemon { .. }) {
+        std::process::exit(run(cli, Path::new(".")));
+    }
     let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     acyclic::fork::reap_legacy_shadow(&repo_arg);
     let repo_arg = acyclic::rewind::recover_before_repo_open(&repo_arg).unwrap_or_else(|error| {

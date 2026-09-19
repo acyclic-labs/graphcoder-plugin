@@ -157,12 +157,14 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         );
         phase = std::time::Instant::now();
     };
-    rewind::recover_before_repo_open(repo_root).map_err(|error| error.to_string())?;
+    fork::reap_legacy_shadow(repo_root);
+    let repo_root =
+        rewind::recover_before_repo_open(repo_root).map_err(|error| error.to_string())?;
     lap("rewind recovery before repo open");
-    let config = Config::load(repo_root).map_err(|error| error.to_string())?;
+    let config = Config::load(&repo_root).map_err(|error| error.to_string())?;
     lap("config load");
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-    let paths = StorePaths::for_repo(repo_root, stores_root.as_deref())
+    let paths = StorePaths::for_repo(&repo_root, stores_root.as_deref())
         .map_err(|error| error.to_string())?;
 
     // Finish or unwind any rewind that a crash interrupted BEFORE the store
@@ -175,7 +177,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     lap("rewind journal recovery");
-    fork::sweep_stale_forks(repo_root);
+    fork::sweep_stale_forks(&repo_root);
     lap("sweep stale forks");
     // Same reason as the fork sweep, and the same moment: a model run a
     // crashed daemon left behind is still running, and still billing.
@@ -191,7 +193,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     let listener = bind_socket(&runtime, &paths)?;
     lap("socket bind + pidfile");
     let store = runtime
-        .block_on(Store::open(repo_root, paths.clone()))
+        .block_on(Store::open(&repo_root, paths.clone()))
         .map_err(|error| error.to_string())?;
     let repo_root = store.repo_root.clone();
     lap("store open");
