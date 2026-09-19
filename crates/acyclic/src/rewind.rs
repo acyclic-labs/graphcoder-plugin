@@ -661,6 +661,7 @@ fn park_replaced_tree(tmp: &Path, parent: &Path, name: &str) -> Result<PathBuf> 
 /// Startup crash recovery. Reads the journal (if any) and finishes or unwinds
 /// the interrupted rewind so the repo is whole before the pipeline baselines.
 pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
+    recover_staging(&journal_path.with_extension("staging.json"))?;
     let text = match std::fs::read_to_string(journal_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -677,6 +678,24 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
         }));
     }
     recover_legacy(journal_path, &text)
+}
+
+fn recover_staging(path: &Path) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let journal: Journal = serde_json::from_str(&text)
+        .map_err(|error| EngineError::Restore(format!("rewind staging journal: {error}")))?;
+    if journal.phase != Phase::Materializing {
+        return Err(EngineError::Restore(
+            "rewind staging journal has an invalid phase".into(),
+        ));
+    }
+    remove_any(&journal.tmp)?;
+    std::fs::remove_file(path)?;
+    Ok(())
 }
 
 fn recover_legacy(journal_path: &Path, text: &str) -> Result<Option<RecoveredSwap>> {
@@ -1037,6 +1056,25 @@ mod tests {
         assert_eq!(std::fs::read(repo.join("keep.txt")).expect("read"), b"live");
         assert!(!tmp.exists());
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn recover_discards_separate_partial_staging() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::write(repo.join("keep.txt"), b"live").expect("seed");
+        let tmp = work.path().join("repo.tmp");
+        std::fs::create_dir(&tmp).expect("tmp");
+        std::fs::write(tmp.join("partial.txt"), b"half").expect("seed");
+        let journal_path = work.path().join("journal.json");
+        let staging_path = journal_path.with_extension("staging.json");
+        write(&staging_path, &journal(&repo, &tmp, Phase::Materializing));
+
+        recover(&journal_path).expect("recover");
+        assert_eq!(std::fs::read(repo.join("keep.txt")).expect("read"), b"live");
+        assert!(!tmp.exists());
+        assert!(!staging_path.exists());
     }
 
     #[test]
