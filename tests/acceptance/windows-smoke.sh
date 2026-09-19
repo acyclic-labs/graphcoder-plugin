@@ -27,7 +27,7 @@ REPO="$WORK/repo"
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ] && [ "${ACYCLIC_SMOKE_METRICS:-0}" = 1 ]; then
-    find "$WORK/stores" -name daemon.log -exec tail -n 80 {} \; 2>/dev/null || true
+    /usr/bin/find "$WORK/stores" -name daemon.log -exec tail -n 80 {} \; 2>/dev/null || true
   fi
   "$ACYCLIC" --repo "$REPO" stop >/dev/null 2>&1 || true
   if [[ "$WORK" == */acyclic-windows-smoke.* && -d "$WORK" ]]; then
@@ -126,7 +126,7 @@ grep -q 'edited in fork' a.txt || fail "promote did not land a.txt"
 metric promote
 
 if [ "${ACYCLIC_SMOKE_METRICS:-0}" = 1 ]; then
-  pid_file="$(find "$WORK/stores" -name daemon.pid -print -quit)"
+  pid_file="$(/usr/bin/find "$WORK/stores" -name daemon.pid -print -quit)"
   if [ -n "$pid_file" ]; then
     ACYCLIC_SMOKE_PID="$(< "$pid_file")" powershell -NoProfile -Command \
       '$p = Get-Process -Id $env:ACYCLIC_SMOKE_PID; "windows-smoke resource cpu_ms={0} working_set_bytes={1} private_bytes={2}" -f [int64]($p.CPU * 1000), $p.WorkingSet64, $p.PrivateMemorySize64'
