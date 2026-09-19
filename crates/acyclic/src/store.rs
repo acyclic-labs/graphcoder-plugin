@@ -253,7 +253,7 @@ impl Store {
         &mut self,
         recovered: &crate::rewind::RecoveredSwap,
     ) -> Result<()> {
-        if !recovered.published {
+        if !recovered.reconcile_head || !recovered.published {
             return Ok(());
         }
         let current = self
