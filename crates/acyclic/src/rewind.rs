@@ -333,6 +333,11 @@ struct LegacyJournal {
     pub carried: Vec<PathBuf>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StagingMarker {
+    temporary: PathBuf,
+}
+
 /// Returns every listed path present in `from` to `into` during legacy
 /// journal recovery.
 /// A conflict or I/O failure keeps the journal and both trees for retry.
@@ -544,14 +549,10 @@ pub(crate) async fn prepare<'a>(
     std::fs::create_dir(&tmp).map_err(|error| {
         EngineError::Restore(format!("rewind: stage {}: {error}", tmp.display()))
     })?;
-    write_journal(
+    write_staging_marker(
         &staging_journal_path,
-        &LegacyJournal {
-            target_generation: hex::encode(target.digest().as_bytes()),
-            repo_root: repo.clone(),
-            tmp: tmp.clone(),
-            phase: LegacyPhase::Materializing,
-            carried: Vec::new(),
+        &StagingMarker {
+            temporary: tmp.clone(),
         },
     )?;
     let generation = store.generation(target).await?;
@@ -686,14 +687,9 @@ fn recover_staging(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let journal: LegacyJournal = serde_json::from_str(&text)
+    let marker: StagingMarker = serde_json::from_str(&text)
         .map_err(|error| EngineError::Restore(format!("rewind staging journal: {error}")))?;
-    if journal.phase != LegacyPhase::Materializing {
-        return Err(EngineError::Restore(
-            "rewind staging journal has an invalid phase".into(),
-        ));
-    }
-    remove_any(&journal.tmp)?;
+    remove_any(&marker.temporary)?;
     std::fs::remove_file(path)?;
     Ok(())
 }
@@ -823,30 +819,16 @@ fn path_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn write_journal(path: &Path, journal: &LegacyJournal) -> Result<()> {
-    let text = serde_json::to_string(journal)
-        .map_err(|error| EngineError::Restore(format!("encode journal: {error}")))?;
+fn write_staging_marker(path: &Path, marker: &StagingMarker) -> Result<()> {
+    let text = serde_json::to_string(marker)
+        .map_err(|error| EngineError::Restore(format!("encode staging marker: {error}")))?;
     let tmp = path.with_extension("tmp");
-    // Durability before visibility: the journal only helps if it is on the
-    // platter before the phase it describes begins.
-    //
-    // One writable handle carries all of it. `sync_all` is a `FlushFileBuffers`
-    // on Windows, which needs write access -- flushing a handle from
-    // `File::open` fails there with "access is denied" -- and the handle has
-    // to be closed before the rename, because Windows will not rename a file
-    // anyone still holds open.
-    let write = || -> std::io::Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        durable_rename(&tmp, path, RenameMode::Replace)
-    };
-    write().map_err(|error| {
-        let _ = std::fs::remove_file(&tmp);
-        EngineError::Restore(format!("rewind: journal {}: {error}", path.display()))
-    })?;
+    let mut file = std::fs::File::create(&tmp)?;
+    use std::io::Write;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    durable_rename(&tmp, path, RenameMode::Replace)?;
     Ok(())
 }
 
@@ -1072,10 +1054,13 @@ mod tests {
         std::fs::write(tmp.join("partial.txt"), b"half").expect("seed");
         let journal_path = work.path().join("journal.json");
         let staging_path = journal_path.with_extension("staging.json");
-        write(
+        write_staging_marker(
             &staging_path,
-            &journal(&repo, &tmp, LegacyPhase::Materializing),
-        );
+            &StagingMarker {
+                temporary: tmp.clone(),
+            },
+        )
+        .expect("write staging marker");
 
         recover(&journal_path).expect("recover");
         assert_eq!(std::fs::read(repo.join("keep.txt")).expect("read"), b"live");
