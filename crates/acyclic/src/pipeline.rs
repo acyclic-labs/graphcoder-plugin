@@ -45,6 +45,8 @@ fn fork_moved(base: GenerationId) -> PromoteOutcome {
 /// Pipeline state reported by `status`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
+    /// Metadata and watcher are open; no repository descendants were scanned.
+    NeedsBaseline,
     Baselining,
     Ready,
     Rewinding,
@@ -221,6 +223,18 @@ enum Request {
     Shutdown {
         reply: oneshot::Sender<Result<()>>,
     },
+}
+
+impl Request {
+    const fn requires_ready(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status { .. }
+                | Self::TurnStarted { .. }
+                | Self::RecordGeneration { .. }
+                | Self::Shutdown { .. }
+        )
+    }
 }
 
 /// Cloneable handle used by the daemon to talk to the pipeline.
@@ -742,8 +756,9 @@ async fn run(store: Store, index: Index, config: Config, mut receiver: mpsc::Rec
     clippy::match_same_arms,
     reason = "the arms look identical but each `reply` is a differently typed sender"
 )]
-fn fail_request(request: Request, message: &str) {
-    let error = || EngineError::Store(message.to_owned());
+fn fail_request(request: Request, error: impl std::fmt::Display) {
+    let message = error.to_string();
+    let error = || EngineError::Store(message.clone());
     match request {
         Request::Checkpoint { reply, .. } => drop(reply.send(Err(error()))),
         Request::Commit { reply } => drop(reply.send(Err(error()))),
@@ -798,7 +813,7 @@ impl Pipeline {
         };
 
         let exclusions = Exclusions::parse(&config.exclude)?;
-        let mut pipeline = Self {
+        let pipeline = Self {
             store,
             index,
             config,
@@ -806,7 +821,7 @@ impl Pipeline {
             options,
             exclusions,
             cancel,
-            state: State::Baselining,
+            state: State::NeedsBaseline,
             last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
             last_checkpoint_row: None,
             checkpoints_since_commit: 0,
@@ -814,8 +829,14 @@ impl Pipeline {
             watcher_health: WatcherHealth::default(),
             auto_pending: None,
         };
-        pipeline.baseline(CheckpointKind::Baseline).await?;
         Ok(pipeline)
+    }
+
+    async fn ensure_ready(&mut self) -> Result<()> {
+        if self.state == State::Ready {
+            return Ok(());
+        }
+        self.baseline(CheckpointKind::Baseline).await
     }
 
     /// Full baseline: capture the whole tree, checkpoint, finish the watcher
@@ -952,6 +973,12 @@ impl Pipeline {
     )]
     async fn handle(&mut self, request: Request) -> bool {
         self.last_activity = Instant::now();
+        if request.requires_ready() {
+            if let Err(error) = self.ensure_ready().await {
+                fail_request(request, error);
+                return false;
+            }
+        }
         match request {
             Request::Checkpoint {
                 kind,
@@ -1464,7 +1491,13 @@ impl Pipeline {
     /// meantime. Never records a row when nothing changed, so it cannot spam
     /// the timeline.
     async fn auto_checkpoint(&mut self) {
-        if self.config.auto_checkpoint_idle_ms == 0 || self.state != State::Ready {
+        if self.config.auto_checkpoint_idle_ms == 0 {
+            return;
+        }
+        if self.state == State::NeedsBaseline && self.ensure_ready().await.is_err() {
+            return;
+        }
+        if self.state != State::Ready {
             return;
         }
         // Like `idle_commit`, failures here are advisory: the pending state
@@ -2124,5 +2157,35 @@ mod root_hint_tests {
         let (out, hint) = strip_root_hints(input);
         assert_eq!(hint, RootHint::None);
         assert!(matches!(out, WatchBatch::RescanRequired { .. }));
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_requests_do_not_force_a_repository_scan() {
+        let (status_reply, _) = oneshot::channel();
+        assert!(!Request::Status {
+            reply: status_reply
+        }
+        .requires_ready());
+
+        let (turn_reply, _) = oneshot::channel();
+        assert!(!Request::TurnStarted {
+            session_id: "session".to_owned(),
+            prompt: "prompt".to_owned(),
+            reply: turn_reply,
+        }
+        .requires_ready());
+
+        let (checkpoint_reply, _) = oneshot::channel();
+        assert!(Request::Checkpoint {
+            kind: CheckpointKind::Manual,
+            attribution: Attribution::default(),
+            reply: checkpoint_reply,
+        }
+        .requires_ready());
     }
 }

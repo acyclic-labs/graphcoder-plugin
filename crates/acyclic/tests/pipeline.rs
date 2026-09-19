@@ -188,10 +188,19 @@ fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        // A round trip first, so baseline capture is guaranteed done before
-        // the edit — otherwise the edit can race into the baseline itself
-        // and leave nothing pending for the idle timer to find.
-        let baseline_row = handle.status().await.expect("status").last_checkpoint;
+        // Wait for the enabled background observer to establish its baseline
+        // before editing; status itself remains scan free.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let baseline_row = loop {
+            if let Some(row) = handle.status().await.expect("status").last_checkpoint {
+                break Some(row);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "baseline never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
 
         // No hook, no explicit checkpoint call — just an edit, like a host
         // with no lifecycle-hook API would produce.
@@ -258,10 +267,12 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        // Baseline done first, so the edit is guaranteed to be pending
-        // rather than absorbed into the baseline (which would pass this
-        // test for the wrong reason).
-        handle.status().await.expect("status");
+        // An explicit checkpoint is the readiness boundary when background
+        // auto capture is disabled; status deliberately remains scan free.
+        handle
+            .checkpoint(CheckpointKind::Manual, Attribution::default())
+            .await
+            .expect("baseline checkpoint");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         tokio::time::sleep(Duration::from_millis(500)).await;
         handle.shutdown().await.expect("shutdown");
@@ -269,9 +280,10 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     thread.join().expect("pipeline thread");
 
     let index = read_only_index(&paths.index_db());
-    // Only the baseline row from init: the idle timer never ran.
+    // The explicit readiness request may be a baseline or a noop immediately
+    // after it; the disabled idle timer must add no later row.
     let latest = index.latest().expect("query").expect("a row exists");
-    assert_eq!(latest.kind, CheckpointKind::Baseline);
+    assert_eq!(latest.kind, CheckpointKind::Noop);
 }
 
 /// An idle tick that has drained an edit into the checkout but not yet
@@ -385,8 +397,12 @@ fn enqueued_checkpoint_survives_immediate_shutdown() {
     let (handle, thread) = pipeline::spawn(store, index, fast_config());
 
     runtime.block_on(async {
-        // Sync on Ready first: a write issued during the startup baseline is
-        // captured by it, and the enqueued checkpoint would be a noop.
+        // An explicit checkpoint is the readiness boundary; status remains
+        // metadata only and does not scan the repository.
+        handle
+            .checkpoint(CheckpointKind::Manual, Attribution::default())
+            .await
+            .expect("baseline checkpoint");
         let status = handle.status().await.expect("status");
         assert_eq!(status.state, pipeline::State::Ready);
         std::fs::write(repo.path().join("file.txt"), b"after\n").expect("edit");
