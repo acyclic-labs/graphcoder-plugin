@@ -708,6 +708,7 @@ pub fn spawn(
     let (sender, receiver) = mpsc::channel(1024);
     let thread = std::thread::Builder::new()
         .name(format!("{}-pipeline", crate::product::NAME))
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()

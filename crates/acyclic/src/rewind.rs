@@ -189,6 +189,8 @@ pub struct RecoveredSwap {
     pub old_tree: Option<PathBuf>,
     /// Generation named by the durable journal.
     pub target: GenerationId,
+    /// The durable SDK head was part of this operation and must be reconciled.
+    pub reconcile_head: bool,
 }
 
 pub async fn recover_workspace(store: &mut Store, recovered: RecoveredSwap) -> Result<()> {
@@ -258,7 +260,7 @@ fn locator_path(repo_root: &Path) -> Result<PathBuf> {
 
 /// Recovers before loading the repository's config or canonicalizing its root.
 /// Both operations can fail after the first Windows rename has removed it.
-pub fn recover_before_repo_open(repo_root: &Path) -> Result<PathBuf> {
+pub fn recover_before_repo_open(repo_root: &Path) -> Result<(PathBuf, Option<RecoveredSwap>)> {
     let canonical = match repo_root.canonicalize() {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -302,7 +304,7 @@ pub fn recover_before_repo_open(repo_root: &Path) -> Result<PathBuf> {
     let locator_path = locator_path(&canonical)?;
     let text = match std::fs::read_to_string(&locator_path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((canonical, None)),
         Err(error) => return Err(error.into()),
     };
     let locator: RecoveryLocator = serde_json::from_str(&text)
@@ -310,9 +312,18 @@ pub fn recover_before_repo_open(repo_root: &Path) -> Result<PathBuf> {
     if locator.repo_root != canonical {
         return Err(EngineError::Restore("rewind locator repo mismatch".into()));
     }
-    recover(&locator.journal)?;
-    std::fs::remove_file(locator_path)?;
-    Ok(canonical)
+    let recovered = recover(&locator.journal)?;
+    Ok((canonical, recovered))
+}
+
+/// Acknowledges that the store head was reconciled after pre-open recovery.
+pub fn finish_recovery(repo_root: &Path) -> Result<()> {
+    let path = locator_path(repo_root)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Executes a rewind against the store's repo. Called from the pipeline with
@@ -475,6 +486,7 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
             published: outcome.published,
             old_tree: outcome.displaced,
             target,
+            reconcile_head: true,
         }));
     }
     recover_legacy(journal_path, &text)
@@ -512,6 +524,7 @@ fn recover_legacy(journal_path: &Path, text: &str) -> Result<Option<RecoveredSwa
                 published,
                 old_tree,
                 target,
+                reconcile_head: true,
             }))
         }
         LegacyPhase::Carrying => {
@@ -598,6 +611,7 @@ fn recover_legacy(journal_path: &Path, text: &str) -> Result<Option<RecoveredSwa
         published,
         old_tree,
         target,
+        reconcile_head: false,
     }))
 }
 
@@ -994,6 +1008,8 @@ mod tests {
             b"original"
         );
         assert!(!journal_path.exists());
+        assert!(locator.exists());
+        finish_recovery(&repo).expect("finish recovery");
         assert!(!locator.exists());
     }
 

@@ -154,7 +154,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         );
         phase = std::time::Instant::now();
     };
-    let repo_root =
+    let (repo_root, early_recovered) =
         rewind::recover_before_repo_open(repo_root).map_err(|error| error.to_string())?;
     lap("rewind recovery before repo open");
     let config = Config::load(&repo_root).map_err(|error| error.to_string())?;
@@ -165,7 +165,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
     // Finish or unwind any rewind that a crash interrupted before serving
     // stateful operations. Fork cleanup is delayed until forks are requested.
-    let recovered = rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
+    let recovered = match early_recovered {
+        Some(recovered) => Some(recovered),
+        None => rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?,
+    };
     lap("rewind journal recovery");
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
@@ -183,6 +186,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         runtime
             .block_on(rewind::recover_workspace(&mut store, recovered))
             .map_err(|error| error.to_string())?;
+        rewind::finish_recovery(&repo_root).map_err(|error| error.to_string())?;
     }
     let repo_root = store.repo_root.clone();
     lap("store open");
@@ -349,7 +353,6 @@ impl Server {
                     state: format!("{:?}", status.state).to_lowercase(),
                     last_checkpoint: status.last_checkpoint,
                     unpublished: status.unpublished,
-                    store_bytes: 0,
                     repo_root: self.repo_root.display().to_string(),
                     mount_provider: self.mounts.provider.to_owned(),
                     mount_available: self.mounts.available,
@@ -1409,6 +1412,12 @@ impl Server {
         let mut mount = self.fork_mount.lock().await;
         let route = route_name(id)?;
         let last_route = mount.router.route_count() == 1;
+        if !last_route {
+            if let Some(session) = mount.session.as_ref() {
+                tokio::task::block_in_place(|| session.invalidate(&route))
+                    .map_err(|error| format!("invalidate {id}: {error:?}"))?;
+            }
+        }
         if last_route {
             if let Some(session) = mount.session.as_mut() {
                 tokio::task::block_in_place(|| session.stop())
@@ -1423,16 +1432,9 @@ impl Server {
         if !tokio::task::block_in_place(|| mount.router.remove_route(&route)) {
             return Err(format!("fork {id} has no mount route"));
         }
-        // The kernel may hold a positive entry cache for the removed name
-        // (FSKit caches until told otherwise): invalidate it eagerly.
-        if let Some(session) = mount.session.as_ref() {
-            tokio::task::block_in_place(|| session.invalidate(&route))
-                .map_err(|error| format!("invalidate {id}: {error:?}"))?;
-        }
         if last_route {
             if let Some(root) = fork::forks_mount_root(&self.repo_root) {
-                std::fs::remove_dir_all(root)
-                    .map_err(|error| format!("remove fork mount root: {error}"))?;
+                let _ = std::fs::remove_dir(root);
             }
         }
         Ok(())

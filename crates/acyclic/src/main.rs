@@ -240,14 +240,37 @@ fn main() {
         std::process::exit(run(cli, Path::new(".")));
     }
     let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    let repo_arg = acyclic::rewind::recover_before_repo_open(&repo_arg).unwrap_or_else(|error| {
-        eprintln!("{}: rewind recovery: {error}", product::NAME);
-        std::process::exit(1);
-    });
+    let (repo_arg, recovered) = acyclic::rewind::recover_before_repo_open(&repo_arg)
+        .unwrap_or_else(|error| {
+            eprintln!("{}: rewind recovery: {error}", product::NAME);
+            std::process::exit(1);
+        });
     let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
         eprintln!("{}: bad repo path: {error}", product::NAME);
         std::process::exit(1);
     });
+    let recovery = match recovered {
+        Some(recovered) if recovered.reconcile_head => (|| -> Result<(), String> {
+            let config = acyclic::config::Config::load(&repo).map_err(|error| error.to_string())?;
+            let stores_root = config.store_dir.as_ref().map(PathBuf::from);
+            let paths = acyclic::store::StorePaths::for_repo(&repo, stores_root.as_deref())
+                .map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+            let mut store = runtime
+                .block_on(acyclic::store::Store::open(&repo, paths))
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(acyclic::rewind::recover_workspace(&mut store, recovered))
+                .map_err(|error| error.to_string())?;
+            acyclic::rewind::finish_recovery(&repo).map_err(|error| error.to_string())
+        })(),
+        Some(_) => acyclic::rewind::finish_recovery(&repo).map_err(|error| error.to_string()),
+        None => Ok(()),
+    };
+    if let Err(error) = recovery {
+        eprintln!("{}: finish rewind recovery: {error}", product::NAME);
+        std::process::exit(1);
+    }
     if cli.repo.is_none() && stranded_in_trash(&repo) {
         // A rewind or promote swaps the repo directory's inode; a shell that
         // was inside it now resolves its cwd to the replaced tree in trash.
@@ -964,7 +987,6 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                     .map_or_else(|| "none".into(), |id| format!("#{id}"))
             );
             println!("unpublished:   {}", info.unpublished);
-            println!("store size:    {}", human_bytes(info.store_bytes));
             if info.mount_available {
                 println!("mounts:        {} (forks mount)", info.mount_provider);
             } else {

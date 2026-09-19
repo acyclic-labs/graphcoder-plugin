@@ -41,6 +41,7 @@ fn cli_recovers_a_missing_repo_before_loading_config() -> Result<(), Box<dyn std
         )?;
 
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_acyclic"));
+        command.env("HOME", &parent);
         command.current_dir(if default_repo { &scratch } else { &parent });
         if !default_repo {
             command.arg("--repo").arg("repo");

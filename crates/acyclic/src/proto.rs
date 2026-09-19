@@ -389,7 +389,6 @@ pub struct StatusInfo {
     pub state: String,
     pub last_checkpoint: Option<i64>,
     pub unpublished: u64,
-    pub store_bytes: u64,
     pub repo_root: String,
     /// Mount provider this daemon would use for forks.
     #[serde(default)]
