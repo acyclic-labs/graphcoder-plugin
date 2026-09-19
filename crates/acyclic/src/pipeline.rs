@@ -13,7 +13,7 @@ use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, C
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
     NativeWatchOptions, OperationId, WatchBatch, WatchChange, WatchEpoch, WatchSequence,
-    WorkCounters,
+    WorkCounters, WorkspaceRestore,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -2128,13 +2128,61 @@ impl Pipeline {
         generation: GenerationId,
     ) -> Result<RewindOutcome> {
         drop(self.watch.take());
-        let outcome = rewind::execute(
+        let prepared = rewind::prepare(
             &self.store,
             generation,
             self.config.trash_ttl_days,
             &self.exclusions,
         )
-        .await;
+        .await?;
+        let current = self
+            .store
+            .workspace
+            .head()
+            .await
+            .map_err(EngineError::fs("workspace head before rewind"))?;
+        let target = self
+            .store
+            .workspace
+            .generation(generation)
+            .await
+            .map_err(EngineError::fs("rewind generation"))?;
+        prepared.mark_restoring_head()?;
+        let key_bytes: [u8; 16] = generation.digest().as_bytes()[..16]
+            .try_into()
+            .map_err(|_| EngineError::Store("invalid generation digest".into()))?;
+        match self
+            .store
+            .workspace
+            .restore_generation(
+                &target,
+                current.id(),
+                acyclic_fs::IdempotencyKey::from_bytes(key_bytes),
+            )
+            .await
+            .map_err(EngineError::fs("restore workspace generation"))?
+        {
+            WorkspaceRestore::Restored(_)
+            | WorkspaceRestore::AlreadyRestored(_)
+            | WorkspaceRestore::Current(_) => {}
+            WorkspaceRestore::Stale(_)
+            | WorkspaceRestore::Fenced
+            | WorkspaceRestore::IdempotencyConflict => {
+                return Err(EngineError::Store(
+                    "workspace head changed during rewind".into(),
+                ));
+            }
+        }
+        let outcome = prepared.publish();
+        self.store.checkout = self
+            .store
+            .workspace
+            .checkout(
+                acyclic_fs::model::GenerationSelector::Head,
+                crate::store::writable_head(),
+            )
+            .await
+            .map_err(EngineError::fs("refresh rewind checkout"))?;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
         outcome

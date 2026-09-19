@@ -165,7 +165,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
     // Finish or unwind any rewind that a crash interrupted before serving
     // stateful operations. Fork cleanup is delayed until forks are requested.
-    rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
+    let recovered = rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     lap("rewind journal recovery");
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
@@ -176,9 +176,14 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // is removed; a live one refuses the second daemon via bind failure.
     let listener = bind_socket(&runtime, &paths)?;
     lap("socket bind + pidfile");
-    let store = runtime
+    let mut store = runtime
         .block_on(Store::open(&repo_root, paths.clone()))
         .map_err(|error| error.to_string())?;
+    if let Some(recovered) = recovered {
+        runtime
+            .block_on(rewind::recover_workspace(&mut store, recovered))
+            .map_err(|error| error.to_string())?;
+    }
     let repo_root = store.repo_root.clone();
     lap("store open");
     let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;

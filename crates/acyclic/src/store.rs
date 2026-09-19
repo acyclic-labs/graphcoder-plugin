@@ -14,6 +14,7 @@ use acyclic_fs::model::{
 use acyclic_fs::{
     CancellationToken, Checkout, LocalAuthorityBackend, LocalFs, LocalObjectBackend,
     LocalObjectsDurability, LocalOptions, LocalStreamDurability, VolumeId, WorkCounters,
+    WorkspaceRestore,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,8 @@ use crate::{EngineError, Result};
 pub type LocalCheckout = Checkout<LocalAuthorityBackend, LocalObjectBackend>;
 /// Concrete volume type for the local backend.
 pub type LocalVolume = acyclic_fs::LocalVolume;
+/// Concrete workspace type for the local backend.
+pub type LocalWorkspace = acyclic_fs::Workspace<LocalAuthorityBackend, LocalObjectBackend>;
 
 /// Batch limits sized for large monorepos: the fs defaults (2,048) reject any
 /// baseline capture beyond ~2k paths. Immutable per volume — size generously.
@@ -177,6 +180,7 @@ pub struct StoreMeta {
 /// An opened store: the fs engine, its volume, and a writable Head checkout.
 pub struct Store {
     pub fs: LocalFs,
+    pub workspace: LocalWorkspace,
     pub volume: LocalVolume,
     pub checkout: LocalCheckout,
     pub volume_id: VolumeId,
@@ -231,6 +235,56 @@ pub fn local_options(root: impl Into<PathBuf>) -> LocalOptions {
 }
 
 impl Store {
+    /// Reconciles an SDK head after crash recovery completed a host tree swap.
+    pub async fn recover_workspace_head(
+        &mut self,
+        recovered: &crate::rewind::RecoveredSwap,
+    ) -> Result<()> {
+        if !recovered.published {
+            return Ok(());
+        }
+        let current = self
+            .workspace
+            .head()
+            .await
+            .map_err(EngineError::fs("workspace head"))?;
+        if current.id() != recovered.target {
+            let target = self
+                .workspace
+                .generation(recovered.target)
+                .await
+                .map_err(EngineError::fs("recover rewind generation"))?;
+            let key = acyclic_fs::IdempotencyKey::from_bytes(
+                recovered.target.digest().as_bytes()[..16]
+                    .try_into()
+                    .map_err(|_| EngineError::Store("invalid generation digest".into()))?,
+            );
+            match self
+                .workspace
+                .restore_generation(&target, current.id(), key)
+                .await
+                .map_err(EngineError::fs("recover workspace rewind"))?
+            {
+                WorkspaceRestore::Restored(_)
+                | WorkspaceRestore::AlreadyRestored(_)
+                | WorkspaceRestore::Current(_) => {}
+                WorkspaceRestore::Stale(_)
+                | WorkspaceRestore::Fenced
+                | WorkspaceRestore::IdempotencyConflict => {
+                    return Err(EngineError::Store(
+                        "workspace head changed during rewind recovery".into(),
+                    ));
+                }
+            }
+        }
+        self.checkout = self
+            .workspace
+            .checkout(GenerationSelector::Head, writable_head())
+            .await
+            .map_err(EngineError::fs("refresh recovered workspace"))?;
+        Ok(())
+    }
+
     /// Creates the store for a repo: directories, volume, meta record.
     /// Fails if the store already exists.
     pub async fn init(repo_root: &Path, paths: StorePaths) -> Result<Self> {
@@ -267,6 +321,10 @@ impl Store {
             .await
             .map_err(EngineError::fs("checkout head"))?
             .value;
+        let workspace = fs
+            .open_volume_workspace("main", volume_id)
+            .await
+            .map_err(EngineError::fs("adopt workspace"))?;
 
         let repo_root = repo_root.canonicalize()?;
         let meta = StoreMeta {
@@ -277,6 +335,7 @@ impl Store {
         atomic_write_json(&paths.meta(), &meta)?;
         Ok(Self {
             fs,
+            workspace,
             volume,
             checkout,
             volume_id,
@@ -334,6 +393,10 @@ impl Store {
             .await
             .map_err(EngineError::fs("checkout head"))?
             .value;
+        let workspace = fs
+            .open_volume_workspace("main", meta.volume_id)
+            .await
+            .map_err(EngineError::fs("adopt workspace"))?;
         crate::trace!(
             "store",
             "open: object store {objects_ms:.1}ms, volume {volume_ms:.1}ms, head checkout {:.1}ms",
@@ -341,6 +404,7 @@ impl Store {
         );
         Ok(Self {
             fs,
+            workspace,
             volume,
             checkout,
             volume_id: meta.volume_id,
@@ -354,18 +418,10 @@ impl Store {
         &self,
         generation: acyclic_fs::GenerationId,
     ) -> Result<LocalCheckout> {
-        let cancel = CancellationToken::new();
-        Ok(self
-            .volume
-            .checkout(
-                GenerationSelector::Exact(generation),
-                read_only(),
-                WorkCounters::UNBOUNDED,
-                &cancel,
-            )
+        self.workspace
+            .checkout(GenerationSelector::Exact(generation), read_only())
             .await
-            .map_err(EngineError::fs("checkout exact"))?
-            .value)
+            .map_err(EngineError::fs("checkout exact"))
     }
 }
 

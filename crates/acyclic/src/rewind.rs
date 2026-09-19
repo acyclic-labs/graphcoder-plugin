@@ -33,6 +33,17 @@ pub struct RewindOutcome {
     pub warning: &'static str,
 }
 
+pub(crate) struct PreparedRewind<'a> {
+    store: &'a Store,
+    target: GenerationId,
+    tmp: PathBuf,
+    parent: PathBuf,
+    name: String,
+    journal_path: PathBuf,
+    carried: Vec<PathBuf>,
+    trash_ttl_days: u32,
+}
+
 /// What a single-path restore did to the working tree.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -372,6 +383,8 @@ fn move_back(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
 pub enum Phase {
     /// Materializing into tmp; repo untouched. Recovery: delete tmp.
     Materializing,
+    /// The prepared tree is complete and the SDK head is being restored.
+    RestoringHead,
     /// Excluded paths moving from repo into tmp. Recovery: move back any
     /// that already moved, then delete tmp.
     Carrying,
@@ -387,6 +400,52 @@ pub struct RecoveredSwap {
     pub published: bool,
     /// The displaced tree retained beside the repository.
     pub old_tree: Option<PathBuf>,
+    /// Generation named by the durable journal.
+    pub target: GenerationId,
+}
+
+pub async fn recover_workspace(store: &mut Store, recovered: RecoveredSwap) -> Result<()> {
+    store.recover_workspace_head(&recovered).await?;
+    if recovered.published {
+        return Ok(());
+    }
+    let text = match std::fs::read_to_string(store.paths.rewind_journal()) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let journal: Journal = serde_json::from_str(&text)
+        .map_err(|error| EngineError::Restore(format!("rewind journal: {error}")))?;
+    if journal.phase != Phase::RestoringHead {
+        return Ok(());
+    }
+    let locator = publish_locator(&journal.repo_root, &store.paths.rewind_journal())?;
+    let exchange = publish_native_exchange(
+        &store.paths.rewind_journal(),
+        &journal.repo_root,
+        &journal.tmp,
+        journal.carried,
+    )
+    .map_err(|error| EngineError::Restore(format!("recover publish tree: {error}")))?;
+    if !exchange.published {
+        return Err(EngineError::Restore(
+            "rewind recovery did not publish prepared tree".into(),
+        ));
+    }
+    if let Some(displaced) = exchange.displaced {
+        let parent = journal
+            .repo_root
+            .parent()
+            .ok_or_else(|| EngineError::Restore("rewind repo root has no parent".into()))?;
+        let name = journal
+            .repo_root
+            .file_name()
+            .ok_or_else(|| EngineError::Restore("rewind repo root has no name".into()))?
+            .to_string_lossy();
+        let _ = park_replaced_tree(&displaced, parent, &name)?;
+    }
+    let _ = std::fs::remove_file(locator);
+    Ok(())
 }
 
 /// Stored beside the repository so startup can find the journal even while
@@ -472,12 +531,12 @@ pub fn recover_before_repo_open(repo_root: &Path) -> Result<PathBuf> {
 /// captures paused; the caller re-baselines afterwards. Excluded paths are
 /// carried from the live tree into the restored one: no checkpoint holds
 /// them, so the working copy is the only copy.
-pub async fn execute(
-    store: &Store,
+pub(crate) async fn prepare<'a>(
+    store: &'a Store,
     target: GenerationId,
     trash_ttl_days: u32,
     exclusions: &Exclusions,
-) -> Result<RewindOutcome> {
+) -> Result<PreparedRewind<'a>> {
     let repo = &store.repo_root;
     let parent = repo
         .parent()
@@ -534,37 +593,62 @@ pub async fn execute(
         EngineError::Restore(format!("materialize: {error:?}"))
     })?;
 
-    // 2. Publish the complete sibling tree. The SDK owns durable exclusion
-    // carry and platform exchange recovery; this adapter owns materialization
-    // and the product's retained-tree naming policy.
     let carried: Vec<PathBuf> = exclusions
         .host_paths()
         .into_iter()
         .filter(|relative| std::fs::symlink_metadata(repo.join(relative)).is_ok())
         .collect();
-    // The staging-only legacy phase has served its purpose. From this point
-    // the SDK owns the durable carry/exchange journal at the same path.
-    std::fs::remove_file(&journal_path)?;
-    let locator = publish_locator(repo, &journal_path)?;
-    let exchange = publish_native_exchange(&journal_path, repo, &tmp, carried)
-        .map_err(|error| EngineError::Restore(format!("publish tree: {error}")))?;
-    if !exchange.published {
-        return Err(EngineError::Restore(
-            "native exchange recovered without publishing the target tree".into(),
-        ));
+    Ok(PreparedRewind {
+        store,
+        target,
+        tmp,
+        parent: parent.to_path_buf(),
+        name,
+        journal_path,
+        carried,
+        trash_ttl_days,
+    })
+}
+
+impl PreparedRewind<'_> {
+    pub(crate) fn mark_restoring_head(&self) -> Result<()> {
+        write_journal(
+            &self.journal_path,
+            &Journal {
+                target_generation: hex::encode(self.target.digest().as_bytes()),
+                repo_root: self.store.repo_root.clone(),
+                tmp: self.tmp.clone(),
+                phase: Phase::RestoringHead,
+                carried: self.carried.clone(),
+            },
+        )
     }
 
-    // 3. Retain the old tree beside the repository.
-    let displaced = exchange.displaced.unwrap_or(tmp);
-    let old_tree = park_replaced_tree(&displaced, parent, &name)?;
-    let _ = std::fs::remove_file(locator);
-    prune_sibling_trash(repo, trash_ttl_days);
+    pub(crate) fn publish(self) -> Result<RewindOutcome> {
+        let repo = &self.store.repo_root;
+        // The staging-only legacy phase has served its purpose. From this point
+        // the SDK owns the durable carry/exchange journal at the same path.
+        std::fs::remove_file(&self.journal_path)?;
+        let locator = publish_locator(repo, &self.journal_path)?;
+        let exchange = publish_native_exchange(&self.journal_path, repo, &self.tmp, self.carried)
+            .map_err(|error| EngineError::Restore(format!("publish tree: {error}")))?;
+        if !exchange.published {
+            return Err(EngineError::Restore(
+                "native exchange recovered without publishing the target tree".into(),
+            ));
+        }
 
-    Ok(RewindOutcome {
-        restored: target,
-        old_tree,
-        warning: "reload your editor: open files still point at the replaced tree",
-    })
+        let displaced = exchange.displaced.unwrap_or(self.tmp);
+        let old_tree = park_replaced_tree(&displaced, &self.parent, &self.name)?;
+        let _ = std::fs::remove_file(locator);
+        prune_sibling_trash(repo, self.trash_ttl_days);
+
+        Ok(RewindOutcome {
+            restored: self.target,
+            old_tree,
+            warning: "reload your editor: open files still point at the replaced tree",
+        })
+    }
 }
 
 /// Moves the replaced tree out of the way and returns where it landed.
@@ -599,6 +683,7 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
     };
     let journal: Journal = serde_json::from_str(&text)
         .map_err(|error| EngineError::Restore(format!("rewind journal: {error}")))?;
+    let target = decode_generation(&journal.target_generation)?;
     #[cfg(windows)]
     let mut published = false;
     #[cfg(not(windows))]
@@ -608,6 +693,13 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
         Phase::Materializing => {
             // Repo untouched; the partial tmp tree is garbage.
             let _ = std::fs::remove_dir_all(&journal.tmp);
+        }
+        Phase::RestoringHead => {
+            return Ok(Some(RecoveredSwap {
+                published,
+                old_tree,
+                target,
+            }))
         }
         Phase::Carrying => {
             // Some excluded paths may already sit in tmp: bring them home,
@@ -692,7 +784,17 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
     Ok(Some(RecoveredSwap {
         published,
         old_tree,
+        target,
     }))
+}
+
+fn decode_generation(encoded: &str) -> Result<GenerationId> {
+    let bytes = hex::decode(encoded)
+        .map_err(|error| EngineError::Restore(format!("rewind generation: {error}")))?;
+    let digest: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| EngineError::Restore("rewind generation must be 32 bytes".into()))?;
+    Ok(GenerationId::new(acyclic_fs::Digest::from_bytes(digest)))
 }
 
 fn path_exists(path: &Path) -> Result<bool> {
