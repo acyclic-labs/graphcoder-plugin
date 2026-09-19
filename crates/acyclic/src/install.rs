@@ -220,9 +220,6 @@ fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
     let root_map = root
         .as_object_mut()
         .ok_or_else(|| format!("{} is not an object", path.display()))?;
-    if host == "codex" {
-        remove_flat_codex_hooks(root_map);
-    }
     let hooks = root_map.entry("hooks").or_insert(json!({}));
     let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
     merge_event_hooks(hooks, "hooks", host)?;
@@ -230,22 +227,6 @@ fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
     write_atomic(path, &(text + "\n"))?;
     Ok(())
-}
-
-/// Earlier releases wrote Codex's events at the top level of `hooks.json`
-/// (`{"PreToolUse": [...]}`), a shape Codex 0.154 silently ignores. Drop
-/// our entries from that layout so a re-install moves them under `hooks`;
-/// anything a user put there is left alone.
-fn remove_flat_codex_hooks(root: &mut serde_json::Map<String, Value>) {
-    for (event, _, _) in hook_events("codex") {
-        let Some(entries) = root.get_mut(event).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        entries.retain(|entry| !is_ours(entry));
-        if entries.is_empty() {
-            root.remove(event);
-        }
-    }
 }
 
 /// Merges our entries into a map keyed by event name (the value under
@@ -1575,44 +1556,6 @@ mod tests {
         assert_eq!(
             agents_md.matches(&format!("## {NAME} checkpoints")).count(),
             1
-        );
-    }
-
-    #[test]
-    fn codex_reinstall_migrates_the_legacy_flat_layout() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let hooks_path = dir.path().join(".codex/hooks.json");
-        std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir");
-        let legacy = json!({
-            "PreToolUse": [
-                { "hooks": [{ "type": "command", "command": "echo user-hook" }] },
-                { "hooks": [{ "type": "command",
-                              "command": format!("ACYCLIC_HOST=codex {NAME} hook pre-tool") }] }
-            ],
-            "SessionEnd": [
-                { "hooks": [{ "type": "command",
-                              "command": format!("ACYCLIC_HOST=codex {NAME} hook session-end") }] }
-            ]
-        });
-        std::fs::write(&hooks_path, legacy.to_string()).expect("seed");
-
-        codex(dir.path()).expect("install");
-        let value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read"))
-                .expect("json");
-        assert_eq!(
-            value["PreToolUse"].as_array().map(Vec::len),
-            Some(1),
-            "user hook kept"
-        );
-        assert!(
-            value.get("SessionEnd").is_none(),
-            "emptied legacy key removed"
-        );
-        assert_eq!(
-            value["hooks"]["PreToolUse"].as_array().map(Vec::len),
-            Some(1),
-            "ours lives under hooks now"
         );
     }
 
