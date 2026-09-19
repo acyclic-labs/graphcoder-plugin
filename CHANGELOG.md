@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Moved
+
+This repository is archived. The plugin was imported into
+[`acyclic-labs/sdk`](https://github.com/acyclic-labs/sdk) as `plugin/` at
+commit `e82be0b` of this repository (sdk PR #100, 2026-09-19); everything
+after this line is the history that was carried across. Releases now come
+from the sdk repository as `plugin-v<version>` tags, and `scripts/install.sh`
+here is a shim that runs the installer from there.
+
 ## [Unreleased]
 
 Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
