@@ -18,9 +18,6 @@ use crate::exclude::Exclusions;
 use crate::store::{LocalGeneration, Store};
 use crate::{EngineError, Result};
 
-const MAXIMUM_DIRECTORY_ENTRIES: u32 = 1_024;
-const MAXIMUM_EXTENT_SPANS: u32 = 65_536;
-const TRANSFER_BYTES: u64 = 8 * 1024 * 1024;
 static PARK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn publication_key(generation: GenerationId) -> Result<IdempotencyKey> {
@@ -105,12 +102,7 @@ pub(crate) async fn materialize_path_from_generation(
                 PathReplace::Atomic => HostPathReplacement::Atomic,
                 PathReplace::LiveMount => HostPathReplacement::LiveMount,
             },
-            &MaterializeOptions {
-                destination: root.to_path_buf(),
-                maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
-                maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
-                transfer_bytes: TRANSFER_BYTES,
-            },
+            &MaterializeOptions::native(root),
             WorkCounters::UNBOUNDED,
             &cancel,
         )
@@ -389,12 +381,7 @@ pub(crate) async fn prepare<'a>(
     let cancel = CancellationToken::new();
     generation
         .materialize(
-            &MaterializeOptions {
-                destination: tmp.clone(),
-                maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
-                maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
-                transfer_bytes: TRANSFER_BYTES,
-            },
+            &MaterializeOptions::native(&tmp),
             WorkCounters::UNBOUNDED,
             &cancel,
         )
