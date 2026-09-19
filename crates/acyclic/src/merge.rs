@@ -22,8 +22,8 @@ use acyclic_fs::text_merge::{
     merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
 };
 use acyclic_fs::{
-    AuthoredMutation, ByteRange, CancellationToken, DirectoryPageRequest, GenerationId,
-    ResolvedFileRangeReadRequest, WorkCounters,
+    AuthoredMutation, ByteRange, CancellationToken, GenerationId, ResolvedFileRangeReadRequest,
+    WorkCounters,
 };
 use bytes::Bytes;
 
@@ -831,58 +831,43 @@ fn child_path(
         .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
 }
 
-async fn list_child_paths(
-    checkout: &LocalCheckout,
-    directories: &[NamespacePath],
+async fn resolved_child_paths<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
+    directory: &NamespacePath,
+    limits: acyclic_fs::model::VolumeLimits,
     cancel: &CancellationToken,
-) -> Result<Vec<NamespacePath>> {
-    if directories.is_empty() {
-        return Ok(Vec::new());
-    }
-    let limits = checkout.volume_config().limits;
-    let reader = checkout
-        .pinned_reader()
-        .map_err(EngineError::fs("open directory reader"))?;
-    let mut pending = directories
-        .iter()
-        .cloned()
-        .map(|path| DirectoryPageRequest {
-            path,
-            after: None,
-            maximum_entries: PAGE_ENTRIES,
-        })
-        .collect::<Vec<_>>();
+) -> Result<Vec<NamespacePath>>
+where
+    A: acyclic_fs::AsyncAuthorityStore,
+    O: acyclic_fs::AsyncObjectStore,
+{
     let mut children = Vec::new();
-    while !pending.is_empty() {
-        let pages = reader
-            .list_directory_pages(
-                &pending,
-                FILE_READ_CONCURRENCY,
+    let mut after = None;
+    loop {
+        let page = reader
+            .resolve_directory_page(
+                directory,
+                after.as_ref(),
+                PAGE_ENTRIES,
                 WorkCounters::UNBOUNDED,
                 cancel,
             )
             .await
-            .map_err(EngineError::fs("batch list directories"))?
+            .map_err(EngineError::fs("resolve subtree page"))?
             .value;
-        let mut next = Vec::new();
-        for (request, page) in pending.into_iter().zip(pages) {
-            for entry in &page.entries {
-                children.push(child_path(&request.path, &entry.name, limits)?);
-            }
-            if page.has_more {
-                let after = page
-                    .entries
-                    .last()
-                    .ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?
-                    .name
-                    .clone();
-                next.push(DirectoryPageRequest {
-                    after: Some(after),
-                    ..request
-                });
-            }
+        for entry in &page.entries {
+            children.push(child_path(directory, &entry.name, limits)?);
         }
-        pending = next;
+        if !page.has_more {
+            break;
+        }
+        after = Some(
+            page.entries
+                .last()
+                .ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?
+                .name
+                .clone(),
+        );
     }
     Ok(children)
 }
@@ -912,12 +897,18 @@ async fn remove_subtree(
         if nodes.is_empty() {
             break;
         }
-        let directories = nodes
+        let reader = dst
+            .pinned_reader()
+            .map_err(EngineError::fs("open subtree reader"))?;
+        let limits = dst.volume_config().limits;
+        frontier = Vec::new();
+        for directory in nodes
             .iter()
             .filter(|(_, record)| record.kind == FileKind::Directory)
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        frontier = list_child_paths(dst, &directories, cancel).await?;
+            .map(|(path, _)| path)
+        {
+            frontier.extend(resolved_child_paths(&reader, directory, limits, cancel).await?);
+        }
         levels.push(nodes);
     }
     let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
@@ -951,45 +942,37 @@ async fn copy_node(
 ) -> Result<()> {
     let mut frontier = vec![namespace.clone()];
     while !frontier.is_empty() {
-        let lookup = src
-            .lookup_batch_no_follow(&frontier, WorkCounters::UNBOUNDED, cancel)
+        let reader = src
+            .pinned_reader()
+            .map_err(EngineError::fs("open pinned reader"))?;
+        let files = reader
+            .resolve_files(&frontier, WorkCounters::UNBOUNDED, cancel)
             .await
-            .map_err(EngineError::fs("batch subtree lookup"))?
-            .value;
+            .map_err(EngineError::fs("batch subtree metadata"))?
+            .value
+            .into_iter();
         let nodes = frontier
             .into_iter()
-            .zip(lookup.entries)
-            .filter_map(|(path, entry)| entry.record.map(|record| (path, record)))
+            .zip(files)
+            .filter_map(|(path, file)| file.map(|file| (path, file)))
             .collect::<Vec<_>>();
         if nodes.is_empty() {
             break;
         }
-        let reader = src
-            .pinned_reader()
-            .map_err(EngineError::fs("open pinned reader"))?;
-        let node_paths = nodes
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        let files = reader
-            .resolve_files(&node_paths, WorkCounters::UNBOUNDED, cancel)
-            .await
-            .map_err(EngineError::fs("batch subtree metadata"))?
-            .value
-            .into_iter()
-            .map(|file| file.ok_or_else(|| EngineError::Fs("subtree node is absent".into())))
-            .collect::<Result<Vec<_>>>()?;
+        let files = nodes.iter().map(|(_, file)| file).collect::<Vec<_>>();
         let regular = read_regular_frontier(&reader, &files, cancel).await?;
-        let directories = nodes
+        let limits = src.volume_config().limits;
+        frontier = Vec::new();
+        for (directory, _) in nodes
             .iter()
-            .filter(|(_, record)| record.kind == FileKind::Directory)
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        frontier = list_child_paths(src, &directories, cancel).await?;
+            .filter(|(_, file)| file.description().kind == FileKind::Directory)
+        {
+            frontier.extend(resolved_child_paths(&reader, directory, limits, cancel).await?);
+        }
         let mut mutations = Vec::with_capacity(nodes.len());
-        for (index, ((path, record), file)) in nodes.into_iter().zip(files).enumerate() {
+        for (index, (path, file)) in nodes.into_iter().enumerate() {
             let metadata = file.description().metadata;
-            match record.kind {
+            match file.description().kind {
                 FileKind::Regular => {
                     let bytes = regular.get(index).ok_or_else(|| {
                         EngineError::Fs("subtree read omitted a regular file".into())
@@ -1037,7 +1020,7 @@ async fn copy_node(
 
 async fn read_regular_frontier<A, O>(
     reader: &acyclic_fs::PinnedReader<A, O>,
-    files: &[acyclic_fs::ResolvedFile<'_, A, O>],
+    files: &[&acyclic_fs::ResolvedFile<'_, A, O>],
     cancel: &CancellationToken,
 ) -> Result<Vec<Vec<u8>>>
 where
