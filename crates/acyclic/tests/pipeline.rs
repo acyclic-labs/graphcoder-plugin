@@ -160,9 +160,8 @@ fn checkpoint_rewind_journey() {
     assert!(by_name.contains(&(PathBuf::from(".env"), ChangeKind::Removed)));
 }
 
-/// The safety net for hosts with no lifecycle-hook API (Claude Desktop over
-/// MCP): an edit with no `handle.checkpoint()` call at all still gets
-/// checkpointed once the idle timer fires.
+/// Once a consumer establishes the authenticated baseline, the safety net for
+/// hosts with no lifecycle-hook API still checkpoints later unannounced edits.
 #[test]
 fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
     let repo = tempfile::tempdir().expect("repo");
@@ -188,19 +187,13 @@ fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        // Wait for the enabled background observer to establish its baseline
-        // before editing; status itself remains scan free.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let baseline_row = loop {
-            if let Some(row) = handle.status().await.expect("status").last_checkpoint {
-                break Some(row);
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "baseline never completed"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
+        let baseline_row = Some(
+            handle
+                .checkpoint(CheckpointKind::Baseline, Attribution::default())
+                .await
+                .expect("baseline")
+                .row_id,
+        );
 
         // No hook, no explicit checkpoint call — just an edit, like a host
         // with no lifecycle-hook API would produce.
@@ -364,7 +357,10 @@ fn periodic_requests_do_not_postpone_the_auto_checkpoint() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        handle.status().await.expect("status");
+        handle
+            .checkpoint(CheckpointKind::Baseline, Attribution::default())
+            .await
+            .expect("baseline");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         // Poll far more often than the idle interval, for far longer.
         for _ in 0..40 {
