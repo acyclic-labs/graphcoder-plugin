@@ -3,7 +3,6 @@
 //! Everything lives OUTSIDE the working tree (capture snapshots the whole
 //! tree and fail-closes on sockets). The repo carries only `.acyclic/config.toml`.
 
-#[cfg(target_os = "windows")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -462,11 +461,10 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .map_err(|error| EngineError::Store(format!("encode {}: {error}", path.display())))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    acyclic_fs::durable_rename(&tmp, path, acyclic_fs::RenameMode::Replace)?;
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn durable_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("bin.tmp");
     let mut file = std::fs::OpenOptions::new()
@@ -477,7 +475,7 @@ pub(crate) fn durable_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    acyclic_fs::durable_rename(&tmp, path, true)?;
+    acyclic_fs::durable_rename(&tmp, path, acyclic_fs::RenameMode::Replace)?;
     Ok(())
 }
 

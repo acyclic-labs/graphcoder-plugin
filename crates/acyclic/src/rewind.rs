@@ -7,8 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::{
-    exchange_native_entries, materialize_checkout, materialize_checkout_host_path,
-    publish_native_exchange, MaterializeError, MaterializeOptions,
+    durable_rename, exchange_native_entries, materialize_checkout, materialize_checkout_host_path,
+    publish_native_exchange, MaterializeError, MaterializeOptions, RenameMode,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
@@ -171,7 +171,7 @@ pub(crate) async fn materialize_path_into_checkout(
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let renamed = match replace {
-                PathReplace::Atomic => durable_rename(&staged, &destination, false),
+                PathReplace::Atomic => durable_rename(&staged, &destination, RenameMode::NoReplace),
                 PathReplace::LiveMount => std::fs::rename(&staged, &destination),
             };
             if let Err(error) = renamed {
@@ -633,7 +633,7 @@ fn park_replaced_tree(tmp: &Path, parent: &Path, name: &str) -> Result<PathBuf> 
         PARK_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     let sibling = parent.join(format!(".{name}.{}-trash-{unique}", crate::product::NAME));
-    durable_rename(tmp, &sibling, false).map_err(|error| {
+    durable_rename(tmp, &sibling, RenameMode::NoReplace).map_err(|error| {
         EngineError::Restore(format!(
             "rewind: park the replaced tree at {}: {error}",
             sibling.display()
@@ -705,11 +705,11 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
                     .as_deref()
                     .ok_or_else(|| EngineError::Restore("rewind scratch path is missing".into()))?;
                 move_back(&journal.tmp, old, &journal.carried)?;
-                durable_rename(old, &journal.repo_root, false)?;
+                durable_rename(old, &journal.repo_root, RenameMode::NoReplace)?;
             } else if !repo_present && tmp_present {
                 // A journal from an older implementation can have no scratch.
                 // Make the repo whole before attempting store startup.
-                durable_rename(&journal.tmp, &journal.repo_root, false)?;
+                durable_rename(&journal.tmp, &journal.repo_root, RenameMode::NoReplace)?;
             } else {
                 // If the exchange never started, carried paths are still in
                 // tmp and must return to the live tree. After a completed
@@ -718,7 +718,7 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
             }
             #[cfg(not(windows))]
             if !repo_present && tmp_present {
-                durable_rename(&journal.tmp, &journal.repo_root, false)?;
+                durable_rename(&journal.tmp, &journal.repo_root, RenameMode::NoReplace)?;
             } else {
                 move_back(&journal.tmp, &journal.repo_root, &journal.carried)?;
             }
@@ -792,7 +792,7 @@ fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        durable_rename(&tmp, path, true)
+        durable_rename(&tmp, path, RenameMode::Replace)
     };
     write().map_err(|error| {
         let _ = std::fs::remove_file(&tmp);
@@ -810,7 +810,7 @@ fn write_locator(path: &Path, locator: &RecoveryLocator) -> Result<()> {
     file.write_all(&text)?;
     file.sync_all()?;
     drop(file);
-    durable_rename(&tmp, path, true)?;
+    durable_rename(&tmp, path, RenameMode::Replace)?;
     Ok(())
 }
 
@@ -824,10 +824,6 @@ fn publish_locator(repo: &Path, journal: &Path) -> Result<PathBuf> {
         },
     )?;
     Ok(path)
-}
-
-fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
-    acyclic_fs::durable_rename(from, to, replace)
 }
 
 #[cfg(unix)]

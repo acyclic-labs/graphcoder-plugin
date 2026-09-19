@@ -677,7 +677,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     file.write_all(text.as_bytes()).map_err(stringify)?;
     file.sync_all().map_err(stringify)?;
     drop(file);
-    std::fs::rename(&tmp, path).map_err(stringify)
+    acyclic_fs::durable_rename(&tmp, path, acyclic_fs::RenameMode::Replace).map_err(stringify)
 }
 
 /// Where a host reads its MCP config. This decides both the path and the
