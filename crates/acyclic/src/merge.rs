@@ -726,11 +726,15 @@ pub async fn apply_entries(
     entries: &[(PathBuf, Entry)],
 ) -> Result<()> {
     let cancel = CancellationToken::new();
-    for (path, entry) in entries {
-        let namespace = namespace_of(path)?;
+    let namespaces = entries
+        .iter()
+        .map(|(path, _)| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    ensure_entry_parents(dst, &namespaces, &cancel).await?;
+    for ((_, entry), namespace) in entries.iter().zip(&namespaces) {
         // Boxed per entry: keeps the facade's large futures off the caller's
         // stack frame.
-        Box::pin(apply_entry(store, dst, &namespace, entry, &cancel)).await?;
+        Box::pin(apply_entry(store, dst, namespace, entry, &cancel)).await?;
     }
     Ok(())
 }
@@ -747,7 +751,6 @@ async fn apply_entry(
             match entry {
                 Entry::Regular { bytes, mode } => {
                     remove_subtree(dst, namespace, cancel).await?;
-                    ensure_parents(dst, namespace, cancel).await?;
                     dst.create_file(
                         namespace.clone(),
                         Bytes::copy_from_slice(bytes),
@@ -774,7 +777,6 @@ async fn apply_entry(
                 Entry::FromGeneration { generation } => {
                     let mut src = store.checkout_exact(*generation).await?;
                     remove_subtree(dst, namespace, cancel).await?;
-                    ensure_parents(dst, namespace, cancel).await?;
                     copy_node(&mut src, dst, namespace, cancel).await?;
                 }
             }
@@ -784,25 +786,47 @@ async fn apply_entry(
 }
 
 /// Creates missing ancestor directories of `namespace` in `dst`.
-async fn ensure_parents(
+async fn ensure_entry_parents(
     dst: &mut LocalCheckout,
-    namespace: &NamespacePath,
+    namespaces: &[NamespacePath],
     cancel: &CancellationToken,
 ) -> Result<()> {
     let limits = dst.volume_config().limits;
-    let components = namespace.components();
-    for depth in 1..components.len() {
-        let parent = NamespacePath::new(components.iter().take(depth).cloned().collect(), limits)
-            .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?;
-        let lookup = dst
-            .lookup_no_follow(&parent, WorkCounters::UNBOUNDED, cancel)
-            .await
-            .map_err(EngineError::fs("lookup"))?
-            .value;
-        if lookup.record.is_none() {
-            dst.create_directory(parent, WorkCounters::UNBOUNDED, cancel)
-                .await
-                .map_err(EngineError::fs("create directory"))?;
+    let mut parents = BTreeSet::new();
+    for namespace in namespaces {
+        let components = namespace.components();
+        for depth in 1..components.len() {
+            parents.insert(
+                NamespacePath::new(components.iter().take(depth).cloned().collect(), limits)
+                    .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?,
+            );
+        }
+    }
+    let parents = parents.into_iter().collect::<Vec<_>>();
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let lookups = dst
+        .lookup_batch_no_follow(&parents, WorkCounters::UNBOUNDED, cancel)
+        .await
+        .map_err(EngineError::fs("batch parent lookup"))?
+        .value;
+    for (parent, lookup) in parents.into_iter().zip(lookups.entries) {
+        match lookup.record {
+            Some(record) if record.kind == FileKind::Directory => {}
+            Some(_) => {
+                return Err(EngineError::Fs(format!(
+                    "{}: parent is not a directory",
+                    acyclic_fs::namespace_to_host_path(&parent)
+                        .map_err(EngineError::fs("resolve parent path"))?
+                        .display()
+                )))
+            }
+            None => {
+                dst.create_directory(parent, WorkCounters::UNBOUNDED, cancel)
+                    .await
+                    .map_err(EngineError::fs("create directory"))?;
+            }
         }
     }
     Ok(())
