@@ -2034,82 +2034,9 @@ impl Pipeline {
             &self.exclusions,
         )
         .await;
-        if outcome.is_ok() {
-            self.acknowledge_materialized_generation(generation).await?;
-        } else {
-            self.reset_watch().await?;
-            self.baseline(CheckpointKind::Recovered).await?;
-        }
-        outcome
-    }
-
-    /// Establishes a watcher boundary around an exact generation that this
-    /// process just materialized. The checkout already authenticates every
-    /// byte of the baseline, so only changes racing watcher admission need
-    /// capture. Any uncertainty falls back to the ordinary full baseline.
-    async fn acknowledge_materialized_generation(
-        &mut self,
-        generation: GenerationId,
-    ) -> Result<()> {
-        let started = Instant::now();
-        self.store.checkout = self
-            .store
-            .volume
-            .checkout(
-                acyclic_fs::model::GenerationSelector::Exact(generation),
-                crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
-            )
-            .await
-            .map_err(EngineError::fs("reopen materialized generation"))?
-            .value;
         self.reset_watch().await?;
-        let batch = self
-            .watch
-            .as_mut()
-            .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
-            .finish_rescan()
-            .map_err(EngineError::fs("finish materialization boundary"))?;
-        match batch {
-            WatchBatch::RescanRequired { reason, .. } => {
-                self.watcher_health.invalidations += 1;
-                self.watcher_health.last_reason = Some(reason.to_string());
-                self.reset_watch().await?;
-                self.baseline(CheckpointKind::Recovered).await
-            }
-            batch @ WatchBatch::Changes { .. } => {
-                let (batch, root) = strip_root_hints(batch);
-                if root != RootHint::None {
-                    self.reset_watch().await?;
-                    return self.baseline(CheckpointKind::Recovered).await;
-                }
-                if let WatchBatch::Changes { ref changes, .. } = batch {
-                    if !changes.is_empty() {
-                        capture_watch_batch(
-                            &mut self.store.checkout,
-                            batch,
-                            &self.options,
-                            WorkCounters::UNBOUNDED,
-                            &self.cancel,
-                        )
-                        .await
-                        .map_err(EngineError::fs("capture materialization tail"))?;
-                        self.scrub_exclusions().await?;
-                    }
-                }
-                let acknowledged = self.checkpoint_engine().await?;
-                self.last_generation = acknowledged;
-                self.state = State::Ready;
-                self.watcher_health.last_recovery_ms = crate::trace::ms(started);
-                crate::trace!(
-                    "pipeline",
-                    "materialized generation acknowledged in {:.1}ms without full rescan",
-                    crate::trace::ms(started)
-                );
-                Ok(())
-            }
-        }
+        self.baseline(CheckpointKind::Recovered).await?;
+        outcome
     }
 
     /// Reopens the watcher and recomputes the capture root identity — needed
