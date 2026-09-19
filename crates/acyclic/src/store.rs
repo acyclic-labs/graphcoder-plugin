@@ -309,14 +309,12 @@ impl Store {
             .map_err(EngineError::fs("create volume"))?
             .value;
         let workspace = fs
-            .open_volume_workspace("main", volume_id)
-            .await
+            .adopt_volume_workspace("main", volume)
             .map_err(EngineError::fs("adopt workspace"))?;
         let checkout = workspace
             .checkout(GenerationSelector::Head, writable_head())
             .await
             .map_err(EngineError::fs("checkout head"))?;
-        drop(volume);
 
         let repo_root = repo_root.canonicalize()?;
         let meta = StoreMeta {
@@ -375,14 +373,12 @@ impl Store {
         let volume_ms = crate::trace::ms(phase);
         let phase = std::time::Instant::now();
         let workspace = fs
-            .open_volume_workspace("main", meta.volume_id)
-            .await
+            .adopt_volume_workspace("main", volume)
             .map_err(EngineError::fs("adopt workspace"))?;
         let checkout = workspace
             .checkout(GenerationSelector::Head, writable_head())
             .await
             .map_err(EngineError::fs("checkout head"))?;
-        drop(volume);
         crate::trace!(
             "store",
             "open: object store {objects_ms:.1}ms, volume {volume_ms:.1}ms, head checkout {:.1}ms",
