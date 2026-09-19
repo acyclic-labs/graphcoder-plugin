@@ -923,106 +923,131 @@ async fn copy_node(
     cancel: &CancellationToken,
 ) -> Result<()> {
     let limits = src.volume_config().limits;
-    let mut queue: Vec<NamespacePath> = vec![namespace.clone()];
-    while let Some(path) = queue.pop() {
+    let mut frontier = vec![namespace.clone()];
+    while !frontier.is_empty() {
         let lookup = src
-            .lookup_no_follow(&path, WorkCounters::UNBOUNDED, cancel)
+            .lookup_batch_no_follow(&frontier, WorkCounters::UNBOUNDED, cancel)
             .await
-            .map_err(EngineError::fs("lookup"))?
+            .map_err(EngineError::fs("batch subtree lookup"))?
             .value;
-        let Some(record) = lookup.record else {
-            continue;
-        };
-        let metadata = src
-            .read_metadata(&path, WorkCounters::UNBOUNDED, cancel)
+        let nodes = frontier
+            .into_iter()
+            .zip(lookup.entries)
+            .filter_map(|(path, entry)| entry.record.map(|record| (path, record)))
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            break;
+        }
+        let reader = src
+            .pinned_reader()
+            .map_err(EngineError::fs("open pinned reader"))?;
+        let metadata = reader
+            .read_record_metadata_batch(
+                &nodes.iter().map(|(_, record)| *record).collect::<Vec<_>>(),
+                FILE_READ_CONCURRENCY,
+                WorkCounters::UNBOUNDED,
+                cancel,
+            )
             .await
-            .map_err(EngineError::fs("read metadata"))?
+            .map_err(EngineError::fs("batch subtree metadata"))?
             .value;
-        match record.kind {
-            FileKind::Regular => {
-                let bytes = read_regular_ns(src, &path, &record.payload, cancel).await?;
-                dst.create_file(
-                    path.clone(),
-                    Bytes::from(bytes),
-                    WorkCounters::UNBOUNDED,
-                    cancel,
-                )
-                .await
-                .map_err(EngineError::fs("create file"))?;
-            }
-            FileKind::SymbolicLink => {
-                let target = src
-                    .read_symbolic_link(&path, WorkCounters::UNBOUNDED, cancel)
+        frontier = Vec::new();
+        for ((path, record), metadata) in nodes.into_iter().zip(metadata) {
+            match record.kind {
+                FileKind::Regular => {
+                    let bytes = read_regular_record(&reader, record, cancel).await?;
+                    dst.create_file(
+                        path.clone(),
+                        Bytes::from(bytes),
+                        WorkCounters::UNBOUNDED,
+                        cancel,
+                    )
                     .await
-                    .map_err(EngineError::fs("read symlink"))?
-                    .value;
-                dst.create_symbolic_link(
-                    path.clone(),
-                    Bytes::copy_from_slice(&target),
-                    WorkCounters::UNBOUNDED,
-                    cancel,
-                )
-                .await
-                .map_err(EngineError::fs("create symlink"))?;
-            }
-            FileKind::Directory => {
-                dst.create_directory(path.clone(), WorkCounters::UNBOUNDED, cancel)
+                    .map_err(EngineError::fs("create file"))?;
+                }
+                FileKind::SymbolicLink => {
+                    let target = src
+                        .read_symbolic_link(&path, WorkCounters::UNBOUNDED, cancel)
+                        .await
+                        .map_err(EngineError::fs("read symlink"))?
+                        .value;
+                    dst.create_symbolic_link(
+                        path.clone(),
+                        Bytes::copy_from_slice(&target),
+                        WorkCounters::UNBOUNDED,
+                        cancel,
+                    )
                     .await
-                    .map_err(EngineError::fs("create directory"))?;
-                for name in list_children(src, &path, cancel).await? {
-                    queue.push(child_path(&path, &name, limits)?);
+                    .map_err(EngineError::fs("create symlink"))?;
+                }
+                FileKind::Directory => {
+                    dst.create_directory(path.clone(), WorkCounters::UNBOUNDED, cancel)
+                        .await
+                        .map_err(EngineError::fs("create directory"))?;
+                    for name in list_children(src, &path, cancel).await? {
+                        frontier.push(child_path(&path, &name, limits)?);
+                    }
+                }
+                other => {
+                    return Err(EngineError::Fs(format!(
+                        "cannot copy a {other:?} node (only files, symlinks, and directories)"
+                    )))
                 }
             }
-            other => {
-                return Err(EngineError::Fs(format!(
-                    "cannot copy a {other:?} node (only files, symlinks, and directories)"
-                )))
+            if let MetadataField::Value(mode) = metadata.posix_mode {
+                let set = FileMetadata {
+                    posix_mode: MetadataField::Value(mode),
+                    ..FileMetadata::default()
+                };
+                dst.set_metadata(path, set, WorkCounters::UNBOUNDED, cancel)
+                    .await
+                    .map_err(EngineError::fs("set metadata"))?;
             }
-        }
-        if let MetadataField::Value(mode) = metadata.posix_mode {
-            let set = FileMetadata {
-                posix_mode: MetadataField::Value(mode),
-                ..FileMetadata::default()
-            };
-            dst.set_metadata(path, set, WorkCounters::UNBOUNDED, cancel)
-                .await
-                .map_err(EngineError::fs("set metadata"))?;
         }
     }
     Ok(())
 }
 
-async fn read_regular_ns(
-    checkout: &mut LocalCheckout,
-    namespace: &NamespacePath,
-    payload: &acyclic_fs::kernel::FilePayload,
+async fn read_regular_record<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
+    record: FileRecord,
     cancel: &CancellationToken,
-) -> Result<Vec<u8>> {
-    let length = match payload {
+) -> Result<Vec<u8>>
+where
+    A: acyclic_fs::AsyncAuthorityStore,
+    O: acyclic_fs::AsyncObjectStore,
+{
+    let length = match record.payload {
         acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
-        acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => *logical_bytes,
+        acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
         _ => return Err(EngineError::Fs("regular file with foreign payload".into())),
     };
-    let limits = checkout.volume_config().limits;
-    let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
+    let chunk = TRANSFER_BYTES;
     let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
     let mut offset = 0;
     while offset < length {
         let take = chunk.min(length - offset);
-        let read = checkout
-            .read_file_range(
-                namespace,
-                ByteRange {
-                    offset,
-                    length: take,
-                },
+        let read = reader
+            .read_file_record_ranges(
+                &[FileRecordRangeReadRequest {
+                    record,
+                    range: ByteRange {
+                        offset,
+                        length: take,
+                    },
+                }],
+                1,
                 WorkCounters::UNBOUNDED,
                 cancel,
             )
             .await
             .map_err(EngineError::fs("read file range"))?
             .value;
-        out.extend_from_slice(&read.bytes);
+        let chunk = read
+            .into_iter()
+            .next()
+            .ok_or_else(|| EngineError::Fs("record range read returned no result".into()))?;
+        out.extend_from_slice(&chunk.bytes);
         offset += take;
     }
     Ok(out)
