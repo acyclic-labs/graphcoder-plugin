@@ -163,17 +163,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     let paths = StorePaths::for_repo(&repo_root, stores_root.as_deref())
         .map_err(|error| error.to_string())?;
 
-    // Finish or unwind any rewind that a crash interrupted BEFORE the store
-    // opens and the pipeline baselines; sweep fork dirs a dead daemon left
-    // mounted (fork sessions do not survive the daemon).
+    // Finish or unwind any rewind that a crash interrupted before serving
+    // stateful operations. Fork cleanup is delayed until forks are requested.
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     lap("rewind journal recovery");
-    fork::sweep_stale_forks(&repo_root)?;
-    lap("sweep stale forks");
-    // Same reason as the fork sweep, and the same moment: a model run a
-    // crashed daemon left behind is still running, and still billing.
-    crate::spec_runner::sweep_stale_runs(&paths.spec_runs());
-    lap("sweep stale spec runs");
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     // Socket + pidfile FIRST, before the store opens: a client can then
@@ -220,6 +213,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
             router: Arc::new(RoutedMountSource::new()),
             session: None,
         })),
+        fork_cleanup_pending: Arc::new(Mutex::new(true)),
         spec,
         live_sessions: Arc::new(Mutex::new(HashSet::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
@@ -249,6 +243,7 @@ struct Server {
     shutdown: Arc<Notify>,
     forks: Arc<Mutex<HashMap<String, ForkState>>>,
     fork_mount: Arc<Mutex<ForkMount>>,
+    fork_cleanup_pending: Arc<Mutex<bool>>,
     /// The speculation scheduler, when it is enabled. `None` makes every
     /// call site a no-op, so the default path costs nothing.
     spec: Option<Arc<crate::speculate::SpecHandle>>,
@@ -263,6 +258,17 @@ struct Server {
 }
 
 impl Server {
+    async fn ensure_fork_workspace_clean(&self) -> Result<(), String> {
+        let mut pending = self.fork_cleanup_pending.lock().await;
+        if !*pending {
+            return Ok(());
+        }
+        let repo_root = self.repo_root.clone();
+        tokio::task::block_in_place(|| fork::sweep_stale_forks(&repo_root))?;
+        *pending = false;
+        Ok(())
+    }
+
     async fn serve(&self, stream: ipc::ServerStream) {
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
@@ -739,6 +745,7 @@ impl Server {
                         fork::mount_setup_hint()
                     ));
                 }
+                self.ensure_fork_workspace_clean().await?;
                 let root = fork::forks_mount_root(&self.repo_root)
                     .ok_or("repo root has no parent for fork workspaces")?;
                 let mut created = Vec::new();

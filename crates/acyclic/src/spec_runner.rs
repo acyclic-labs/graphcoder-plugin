@@ -351,7 +351,7 @@ impl Drop for OwnedJob {
     }
 }
 
-/// Kills anything a dead daemon left running, before the store opens.
+/// Kills anything a dead daemon left running when speculation is enabled.
 ///
 /// Matched on the recorded command name as well as the pid, so a reused pid
 /// belonging to something else is never signalled — the check costs one
@@ -362,7 +362,7 @@ impl Drop for OwnedJob {
     reason = "kill(pid, 0) only tests for the process's existence; the \
               killpg that follows is guarded by a command-name match"
 )]
-pub fn sweep_stale_runs(spec_runs: &Path) {
+fn sweep_stale_runs(spec_runs: &Path) {
     let pids = spec_runs.join("pids");
     let Ok(entries) = std::fs::read_dir(&pids) else {
         return;
@@ -401,9 +401,6 @@ pub fn sweep_stale_runs(spec_runs: &Path) {
 /// Windows needs no sweep: each run's job object carries
 /// `KILL_ON_JOB_CLOSE` and the daemon holds its only handle, so a daemon
 /// that dies — however it dies — takes the run's whole tree with it.
-#[cfg(not(unix))]
-pub fn sweep_stale_runs(_spec_runs: &Path) {}
-
 /// Whether the live process really is the run we recorded, rather than
 /// whatever inherited its pid.
 #[cfg(unix)]
@@ -593,6 +590,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn sweeping_an_absent_directory_is_a_no_op() {
         let dir = tempfile::tempdir().expect("tempdir");
