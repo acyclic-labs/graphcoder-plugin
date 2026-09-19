@@ -826,53 +826,8 @@ fn publish_locator(repo: &Path, journal: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(unix)]
-fn durable_rename(from: &Path, to: &Path, _replace: bool) -> std::io::Result<()> {
-    std::fs::rename(from, to)?;
-    let parent = to
-        .parent()
-        .ok_or_else(|| std::io::Error::other("rename path has no parent"))?;
-    std::fs::File::open(parent)?.sync_all()?;
-    if from.parent() != to.parent() {
-        let parent = from
-            .parent()
-            .ok_or_else(|| std::io::Error::other("rename path has no parent"))?;
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-#[allow(
-    unsafe_code,
-    reason = "MoveFileExW receives two terminated UTF-16 path buffers"
-)]
 fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    let from: Vec<u16> = from
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let to: Vec<u16> = to
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let flags = MOVEFILE_WRITE_THROUGH
-        | if replace {
-            MOVEFILE_REPLACE_EXISTING
-        } else {
-            0
-        };
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    acyclic_fs::durable_rename(from, to, replace)
 }
 
 #[cfg(unix)]
