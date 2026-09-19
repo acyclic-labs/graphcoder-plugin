@@ -889,31 +889,47 @@ async fn remove_subtree(
     cancel: &CancellationToken,
 ) -> Result<()> {
     let limits = dst.volume_config().limits;
-    // (path, children_expanded)
-    let mut stack: Vec<(NamespacePath, bool)> = vec![(namespace.clone(), false)];
-    while let Some((path, expanded)) = stack.pop() {
-        if expanded {
-            dst.remove(path, None, WorkCounters::UNBOUNDED, cancel)
-                .await
-                .map_err(EngineError::fs("remove"))?;
-            continue;
-        }
+    let mut frontier = vec![namespace.clone()];
+    let mut levels = Vec::new();
+    while !frontier.is_empty() {
         let lookup = dst
-            .lookup_no_follow(&path, WorkCounters::UNBOUNDED, cancel)
+            .lookup_batch_no_follow(&frontier, WorkCounters::UNBOUNDED, cancel)
             .await
-            .map_err(EngineError::fs("lookup"))?
+            .map_err(EngineError::fs("batch subtree removal lookup"))?
             .value;
-        let Some(record) = lookup.record else {
-            continue;
-        };
-        if record.kind == FileKind::Directory {
-            let children = list_children(dst, &path, cancel).await?;
-            stack.push((path.clone(), true));
-            for name in children {
-                stack.push((child_path(&path, &name, limits)?, false));
+        let nodes = frontier
+            .into_iter()
+            .zip(lookup.entries)
+            .filter_map(|(path, entry)| entry.record.map(|record| (path, record)))
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            break;
+        }
+        frontier = Vec::new();
+        for (path, record) in &nodes {
+            if record.kind == FileKind::Directory {
+                for name in list_children(dst, path, cancel).await? {
+                    frontier.push(child_path(path, &name, limits)?);
+                }
             }
-        } else {
-            stack.push((path, true));
+        }
+        levels.push(nodes);
+    }
+    let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    for level in levels.into_iter().rev() {
+        let removals = level
+            .into_iter()
+            .map(|(path, record)| AuthoredMutation::Remove {
+                path,
+                expected_file_id: Some(record.file_id),
+            })
+            .collect::<Vec<_>>();
+        for chunk in removals.chunks(maximum) {
+            dst.apply_authored_transaction(chunk.to_vec(), WorkCounters::UNBOUNDED, cancel)
+                .await
+                .map_err(EngineError::fs("remove subtree frontier"))?;
         }
     }
     Ok(())
