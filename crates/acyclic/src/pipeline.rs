@@ -2161,16 +2161,13 @@ impl Pipeline {
             .await
             .map_err(EngineError::fs("rewind generation"))?;
         prepared.mark_restoring_head()?;
-        let key_bytes: [u8; 16] = generation.digest().as_bytes()[..16]
-            .try_into()
-            .map_err(|_| EngineError::Store("invalid generation digest".into()))?;
         match self
             .store
             .workspace
             .restore_generation(
                 &target,
                 current.id(),
-                acyclic_fs::IdempotencyKey::from_bytes(key_bytes),
+                crate::rewind::publication_key(generation)?,
             )
             .await
             .map_err(EngineError::fs("restore workspace generation"))?

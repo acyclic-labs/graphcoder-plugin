@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::{
     durable_rename, exchange_native_entries, materialize_checkout, materialize_checkout_host_path,
-    publish_native_exchange, MaterializeError, MaterializeOptions, RenameMode,
+    publish_native_exchange, IdempotencyKey, MaterializeError, MaterializeOptions, RenameMode,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,13 @@ const MAXIMUM_DIRECTORY_ENTRIES: u32 = 1_024;
 const MAXIMUM_EXTENT_SPANS: u32 = 65_536;
 const TRANSFER_BYTES: u64 = 8 * 1024 * 1024;
 static PARK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn publication_key(generation: GenerationId) -> Result<IdempotencyKey> {
+    let bytes = generation.digest().as_bytes()[..16]
+        .try_into()
+        .map_err(|_| EngineError::Store("invalid generation digest".into()))?;
+    Ok(IdempotencyKey::from_bytes(bytes))
+}
 
 /// What a completed rewind reports back.
 #[derive(Clone, Debug)]
@@ -393,6 +400,7 @@ pub async fn recover_workspace(store: &mut Store, recovered: RecoveredSwap) -> R
         &store.paths.rewind_journal(),
         &journal.repo_root,
         &journal.tmp,
+        publication_key(recovered.target)?,
         journal.carried,
     )
     .map_err(|error| EngineError::Restore(format!("recover publish tree: {error}")))?;
@@ -599,8 +607,14 @@ impl PreparedRewind<'_> {
         // the SDK owns the durable carry/exchange journal at the same path.
         std::fs::remove_file(&self.journal_path)?;
         let locator = publish_locator(repo, &self.journal_path)?;
-        let exchange = publish_native_exchange(&self.journal_path, repo, &self.tmp, self.carried)
-            .map_err(|error| EngineError::Restore(format!("publish tree: {error}")))?;
+        let exchange = publish_native_exchange(
+            &self.journal_path,
+            repo,
+            &self.tmp,
+            publication_key(self.target)?,
+            self.carried,
+        )
+        .map_err(|error| EngineError::Restore(format!("publish tree: {error}")))?;
         if !exchange.published {
             return Err(EngineError::Restore(
                 "native exchange recovered without publishing the target tree".into(),
