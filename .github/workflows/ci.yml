@@ -51,8 +51,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.bun/install/cache
             sdk/target-*
-          key: qualify-${{ matrix.os }}-${{ hashFiles('sdk/Cargo.lock', 'sdk/rust/**/*.rs', 'worktrees/graphcoder/plugin-sdk-lab/Cargo.lock', 'worktrees/graphcoder/plugin-sdk-lab/crates/**/*.rs') }}
+          key: qualify-${{ matrix.os }}-${{ hashFiles('sdk/Cargo.lock', 'sdk/bun.lock', 'sdk/rust/**/*.rs', 'sdk/typescript/**/*.ts', 'worktrees/graphcoder/plugin-sdk-lab/Cargo.lock', 'worktrees/graphcoder/plugin-sdk-lab/crates/**/*.rs') }}
           restore-keys: |
             qualify-${{ matrix.os }}-
       - name: Run the shared bounded gate
