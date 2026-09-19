@@ -4,16 +4,13 @@
 //! **H** ("theirs"), and the fork snapshot **F** ("ours"; the fork is
 //! `ours` because it merges *into* the mainline, graphcoder's convention).
 //! [`plan`] walks the union of changed paths, applies the entry-level
-//! decision table, runs [`merge3`] on regular text files both sides
+//! decision table, runs the SDK text driver on regular text files both sides
 //! changed, and returns everything the daemon needs to either land the
 //! merge or rebase the fork with conflict markers. Nothing here writes to
 //! the working tree.
 //!
-//! `merge3`, its trailing-newline rule, and [`has_conflict_markers`] are
-//! verbatim ports of graphcoder's `lib/compute/src/merge.rs` and
-//! `local/src/lib/worktree/conflict/markers.ts`.
+//! The SDK owns marker and newline semantics so every consumer sees the same result.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -33,119 +30,10 @@ const PAGE_ENTRIES: u32 = 1_024;
 const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
 // ---------------------------------------------------------------------------
-// merge3: graphcoder's three-way text merge, ported verbatim
+// Shared SDK text merge
 // ---------------------------------------------------------------------------
 
-/// Result of a 3-way merge operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Merge3Result {
-    /// True if merge completed without conflicts.
-    pub clean: bool,
-    /// Merged content. If clean=false, contains conflict markers.
-    pub content: String,
-}
-
-/// Ensures a string ends with a newline so conflict markers always occupy
-/// complete lines. Borrows when nothing needs adding.
-fn ensure_trailing_newline(s: &str) -> Cow<'_, str> {
-    if s.is_empty() || s.ends_with('\n') {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(format!("{s}\n"))
-    }
-}
-
-/// Whether the clean result keeps a trailing newline: if ours and theirs
-/// agree, that; else if ours agrees with base, theirs decides; else ours.
-fn merged_has_trailing_newline(base: &str, ours: &str, theirs: &str) -> bool {
-    let base_has_newline = base.ends_with('\n');
-    let ours_has_newline = ours.ends_with('\n');
-    let theirs_has_newline = theirs.ends_with('\n');
-    if ours_has_newline == theirs_has_newline {
-        ours_has_newline
-    } else if ours_has_newline == base_has_newline {
-        theirs_has_newline
-    } else {
-        ours_has_newline
-    }
-}
-
-/// Performs a 3-way merge (diffy, diff3 conflict style, marker length 7).
-///
-/// Conflict marker format:
-/// ```text
-/// <<<<<<< {ours_name}
-/// ... ours content ...
-/// ||||||| original
-/// ... base content ...
-/// =======
-/// ... theirs content ...
-/// >>>>>>> {theirs_name}
-/// ```
-pub fn merge3(
-    base: &str,
-    ours: &str,
-    theirs: &str,
-    ours_name: &str,
-    theirs_name: &str,
-) -> Merge3Result {
-    use diffy::{ConflictStyle, MergeOptions};
-
-    let mut options = MergeOptions::new();
-    options
-        .set_conflict_style(ConflictStyle::Diff3)
-        .set_conflict_marker_length(7);
-
-    let base_norm = ensure_trailing_newline(base);
-    let ours_norm = ensure_trailing_newline(ours);
-    let theirs_norm = ensure_trailing_newline(theirs);
-
-    match options.merge(&base_norm, &ours_norm, &theirs_norm) {
-        Ok(mut merged) => {
-            if !merged_has_trailing_newline(base, ours, theirs) {
-                merged.pop();
-            }
-            Merge3Result {
-                clean: true,
-                content: merged,
-            }
-        }
-        Err(merged_with_conflicts) => {
-            let content = merged_with_conflicts
-                .replace("<<<<<<< ours", &format!("<<<<<<< {ours_name}"))
-                .replace(">>>>>>> theirs", &format!(">>>>>>> {theirs_name}"));
-            Merge3Result {
-                clean: false,
-                content,
-            }
-        }
-    }
-}
-
-/// Whether `content` still holds a generated conflict block: a `<<<<<<< `
-/// marker at the start of a line AND a `=======` line. Recognizes the
-/// `(modified)` / `(deleted)` label variants by construction.
-pub fn has_conflict_markers(content: &str) -> bool {
-    let opens = content
-        .split_inclusive('\n')
-        .any(|line| line.starts_with("<<<<<<< ") || line.starts_with("<<<<<<<\t"));
-    if !opens {
-        return false;
-    }
-    content
-        .lines()
-        .any(|line| line == "=======" || line == "=======\r")
-}
-
-/// Number of conflict blocks in marker-bearing content.
-pub fn conflict_hunks(content: &str) -> u32 {
-    content
-        .lines()
-        .filter(|line| line.starts_with("<<<<<<< "))
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX)
-}
+pub use acyclic_fs::text_merge::{conflict_hunks, has_conflict_markers};
 
 // ---------------------------------------------------------------------------
 // Per-path decision table
@@ -274,7 +162,7 @@ pub fn merge_file(
             if ours == theirs {
                 return Ok(ContentMerge::Merged(ours.as_bytes().to_vec()));
             }
-            let result = merge3(
+            let result = acyclic_fs::text_merge::merge_text(
                 base_text.unwrap_or(""),
                 ours,
                 theirs,
@@ -319,8 +207,16 @@ fn modify_delete(
     theirs_label: &str,
     kind: ConflictKind,
 ) -> ContentMerge {
-    let base = ensure_trailing_newline(base);
-    let kept = ensure_trailing_newline(kept);
+    let base = if base.is_empty() || base.ends_with('\n') {
+        std::borrow::Cow::Borrowed(base)
+    } else {
+        std::borrow::Cow::Owned(format!("{base}\n"))
+    };
+    let kept = if kept.is_empty() || kept.ends_with('\n') {
+        std::borrow::Cow::Borrowed(kept)
+    } else {
+        std::borrow::Cow::Owned(format!("{kept}\n"))
+    };
     let (ours_block, theirs_block) = match kind {
         ConflictKind::TheirsDeleted => (kept.as_ref(), ""),
         _ => ("", kept.as_ref()),
@@ -1174,7 +1070,7 @@ mod tests {
         let base = "line 1\nline 2\nline 3\n";
         let ours = "OURS line 1\nline 2\nline 3\n";
         let theirs = "line 1\nline 2\nTHEIRS line 3\n";
-        let result = merge3(base, ours, theirs, "child", "parent");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "child", "parent");
         assert!(result.clean);
         assert_eq!(result.content, "OURS line 1\nline 2\nTHEIRS line 3\n");
     }
@@ -1184,7 +1080,8 @@ mod tests {
         let base = "line 1\nline 2\nline 3\n";
         let ours = "OURS line 1\nline 2\nline 3\n";
         let theirs = "THEIRS line 1\nline 2\nline 3\n";
-        let result = merge3(base, ours, theirs, "child-agent", "parent-agent");
+        let result =
+            acyclic_fs::text_merge::merge_text(base, ours, theirs, "child-agent", "parent-agent");
         assert!(!result.clean);
         assert!(result.content.contains("<<<<<<< child-agent\n"));
         assert!(result.content.contains("||||||| original\n"));
@@ -1197,14 +1094,15 @@ mod tests {
         let base = "line 1\nline 2\n";
         let ours = "SAME line 1\nline 2\n";
         let theirs = "SAME line 1\nline 2\n";
-        let result = merge3(base, ours, theirs, "child", "parent");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "child", "parent");
         assert!(result.clean);
         assert_eq!(result.content, "SAME line 1\nline 2\n");
     }
 
     #[test]
     fn conflict_markers_have_proper_newlines() {
-        let result = merge3("content", "ours", "theirs", "child", "parent");
+        let result =
+            acyclic_fs::text_merge::merge_text("content", "ours", "theirs", "child", "parent");
         assert!(!result.clean);
         assert!(result.content.contains("\n|||||||"));
         assert!(result.content.contains("\n=======\n"));
@@ -1213,32 +1111,18 @@ mod tests {
 
     #[test]
     fn empty_base_ours_added_theirs_empty() {
-        let result = merge3("", "added", "", "child", "parent");
+        let result = acyclic_fs::text_merge::merge_text("", "added", "", "child", "parent");
         assert!(result.clean);
         assert_eq!(result.content, "added");
     }
 
     #[test]
     fn empty_base_both_add_different() {
-        let result = merge3("", "ours\n", "theirs\n", "child", "parent");
+        let result =
+            acyclic_fs::text_merge::merge_text("", "ours\n", "theirs\n", "child", "parent");
         assert!(!result.clean);
         assert!(result.content.contains("<<<<<<< child"));
         assert!(result.content.contains(">>>>>>> parent"));
-    }
-
-    // --- trailing newline rule --------------------------------------------
-
-    #[test]
-    fn trailing_newline_rule() {
-        // ours and theirs agree: keep theirs' (== ours') state.
-        assert!(merged_has_trailing_newline("a", "a\n", "b\n"));
-        assert!(!merged_has_trailing_newline("a\n", "a", "b"));
-        // ours == base, theirs decides.
-        assert!(!merged_has_trailing_newline("a\n", "a\n", "b"));
-        assert!(merged_has_trailing_newline("a", "a", "b\n"));
-        // ours differs from base and theirs: ours decides.
-        assert!(!merged_has_trailing_newline("a\n", "x", "b\n"));
-        assert!(merged_has_trailing_newline("a", "x\n", "b"));
     }
 
     #[test]
@@ -1246,7 +1130,7 @@ mod tests {
         let base = "one\ntwo\nthree\n";
         let ours = "one\ntwo\nthree\nfour";
         let theirs = "ONE\ntwo\nthree\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         assert!(result.clean);
         assert_eq!(result.content, "ONE\ntwo\nthree\nfour");
     }
@@ -1256,7 +1140,7 @@ mod tests {
         let base = "a\r\nb\r\nc\r\n";
         let ours = "A\r\nb\r\nc\r\n";
         let theirs = "a\r\nb\r\nC\r\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         assert!(result.clean);
         assert_eq!(result.content, "A\r\nb\r\nC\r\n");
     }
@@ -1266,7 +1150,7 @@ mod tests {
         let base = "1\n2\n3\n4\n";
         let ours = "1x\n2\n3\n4\n";
         let theirs = "1\n2y\n3\n4\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         // Adjacent edits are a conflict for diff3 (git behaves the same);
         // whichever way diffy decides, the result must be consistent with clean.
         if result.clean {
@@ -1281,7 +1165,7 @@ mod tests {
         let base = "a\nb\nc\nd\n";
         let ours = "a\nd\n";
         let theirs = "a\nB\nc\nd\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         assert!(!result.clean);
         assert_eq!(conflict_hunks(&result.content), 1);
     }

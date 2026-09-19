@@ -22,7 +22,6 @@ thiserror = "2"
 hex = "0.4"
 blake3 = "1"
 bytes = "1"
-diffy = "0.4"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 
 [target.'cfg(unix)'.dependencies]
