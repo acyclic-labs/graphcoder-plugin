@@ -488,6 +488,7 @@ fn wait_for_socket(
     let started = Instant::now();
     let deadline = bound.unwrap_or(Duration::from_secs(30 * 60));
     let mut reported = false;
+    let mut retry_delay = Duration::from_millis(1);
     loop {
         if let Ok(stream) = ClientStream::connect(socket) {
             if let Ok(mut client) = Client::from_stream(stream) {
@@ -534,6 +535,7 @@ fn wait_for_socket(
             eprintln!("{NAME}: daemon starting (building the first snapshot of the tree)...");
             reported = true;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(retry_delay);
+        retry_delay = (retry_delay * 2).min(Duration::from_millis(25));
     }
 }
