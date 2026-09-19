@@ -466,6 +466,15 @@ impl MountFilesystem for GuardedMountFilesystem {
         self.guard(path)?;
         self.inner.capture_host_path(source_root, path)
     }
+
+    fn capture_host_subtree(
+        &self,
+        source_root: &Path,
+        path: &MountPath,
+    ) -> Result<(), MountSourceError> {
+        self.guard(path)?;
+        self.inner.capture_host_subtree(source_root, path)
+    }
 }
 
 #[cfg(test)]
