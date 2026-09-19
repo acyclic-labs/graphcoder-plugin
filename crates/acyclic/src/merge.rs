@@ -737,54 +737,44 @@ pub async fn apply_entries(
         .map(|(path, _)| namespace_of(path))
         .collect::<Result<Vec<_>>>()?;
     ensure_entry_parents(dst, &namespaces, &cancel).await?;
+    let mut source = None;
     for ((_, entry), namespace) in entries.iter().zip(&namespaces) {
-        // Boxed per entry: keeps the facade's large futures off the caller's
-        // stack frame.
-        Box::pin(apply_entry(store, dst, namespace, entry, &cancel)).await?;
-    }
-    Ok(())
-}
-
-async fn apply_entry(
-    store: &Store,
-    dst: &mut LocalCheckout,
-    namespace: &NamespacePath,
-    entry: &Entry,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    {
-        {
-            match entry {
-                Entry::Regular { bytes, mode } => {
-                    remove_subtree(dst, namespace, cancel).await?;
-                    dst.create_file(
-                        namespace.clone(),
-                        Bytes::copy_from_slice(bytes),
-                        WorkCounters::UNBOUNDED,
-                        cancel,
-                    )
-                    .await
-                    .map_err(EngineError::fs("create file"))?;
-                    if let Some(mode) = mode {
-                        let metadata = FileMetadata {
-                            posix_mode: MetadataField::Value(*mode),
-                            ..FileMetadata::default()
-                        };
-                        dst.set_metadata(
-                            namespace.clone(),
-                            metadata,
-                            WorkCounters::UNBOUNDED,
-                            cancel,
-                        )
-                        .await
-                        .map_err(EngineError::fs("set metadata"))?;
-                    }
+        match entry {
+            Entry::Regular { bytes, mode } => {
+                source = None;
+                remove_subtree(dst, namespace, &cancel).await?;
+                let metadata = FileMetadata {
+                    posix_mode: mode.map_or(MetadataField::Unavailable, MetadataField::Value),
+                    ..FileMetadata::default()
+                };
+                dst.apply_authored_transaction(
+                    vec![AuthoredMutation::CreateFile {
+                        path: namespace.clone(),
+                        bytes: Bytes::copy_from_slice(bytes),
+                        metadata,
+                    }],
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
+                .await
+                .map_err(EngineError::fs("create merge file"))?;
+            }
+            Entry::FromGeneration { generation } => {
+                let needs_checkout =
+                    source
+                        .as_ref()
+                        .is_none_or(|(current, _): &(GenerationId, LocalCheckout)| {
+                            current != generation
+                        });
+                if needs_checkout {
+                    source = Some((*generation, store.checkout_exact(*generation).await?));
                 }
-                Entry::FromGeneration { generation } => {
-                    let mut src = store.checkout_exact(*generation).await?;
-                    remove_subtree(dst, namespace, cancel).await?;
-                    copy_node(&mut src, dst, namespace, cancel).await?;
-                }
+                let src = &mut source
+                    .as_mut()
+                    .ok_or_else(|| EngineError::Fs("source checkout missing".into()))?
+                    .1;
+                remove_subtree(dst, namespace, &cancel).await?;
+                copy_node(src, dst, namespace, &cancel).await?;
             }
         }
     }
