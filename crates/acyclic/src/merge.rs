@@ -281,9 +281,14 @@ async fn records_at(
         .map(|path| namespace_of(path))
         .collect::<Result<Vec<_>>>()?;
     let records = generation
-        .lookup_paths(&namespaces)
+        .lookup_paths(
+            &namespaces,
+            WorkCounters::UNBOUNDED,
+            &CancellationToken::new(),
+        )
         .await
-        .map_err(EngineError::fs("lookup merge paths"))?;
+        .map_err(EngineError::fs("lookup merge paths"))?
+        .value;
     Ok(paths
         .iter()
         .cloned()
@@ -966,10 +971,10 @@ async fn copy_node(
                     .map_err(EngineError::fs("create file"))?;
                 }
                 FileKind::SymbolicLink => {
-                    let target = src
-                        .read_symbolic_link(&path, WorkCounters::UNBOUNDED, cancel)
+                    let target = reader
+                        .read_symbolic_link_record(record, WorkCounters::UNBOUNDED, cancel)
                         .await
-                        .map_err(EngineError::fs("read symlink"))?
+                        .map_err(EngineError::fs("read resolved symlink"))?
                         .value;
                     dst.create_symbolic_link(
                         path.clone(),
