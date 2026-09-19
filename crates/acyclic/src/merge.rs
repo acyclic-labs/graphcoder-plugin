@@ -15,6 +15,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use acyclic_fs::kernel::{FileKind, FileMetadata, MetadataField, NamespacePath};
+pub use acyclic_fs::text_merge::{
+    conflict_hunks, has_conflict_markers, ByteConflictKind as ConflictKind,
+};
+use acyclic_fs::text_merge::{
+    merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
+};
 use acyclic_fs::{ByteRange, CancellationToken, GenerationId, WorkCounters};
 use bytes::Bytes;
 
@@ -27,14 +33,6 @@ use crate::{EngineError, Result};
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TRANSFER_BYTES: u64 = 8 * 1024 * 1024;
 const PAGE_ENTRIES: u32 = 1_024;
-const BINARY_PROBE_BYTES: usize = 8 * 1024;
-
-// ---------------------------------------------------------------------------
-// Shared SDK text merge
-// ---------------------------------------------------------------------------
-
-pub use acyclic_fs::text_merge::{conflict_hunks, has_conflict_markers};
-
 // ---------------------------------------------------------------------------
 // Per-path decision table
 // ---------------------------------------------------------------------------
@@ -102,39 +100,6 @@ impl std::fmt::Display for Reason {
     }
 }
 
-/// What kind of conflict a marker-bearing file carries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ConflictKind {
-    /// Overlapping hunks; `hunks` counts the blocks.
-    Hunks,
-    /// The fork modified a file the mainline deleted.
-    TheirsDeleted,
-    /// The mainline modified a file the fork deleted.
-    OursDeleted,
-}
-
-/// Outcome of merging one regular file that both sides changed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ContentMerge {
-    Merged(Vec<u8>),
-    Conflicted {
-        bytes: Vec<u8>,
-        hunks: u32,
-        kind: ConflictKind,
-    },
-}
-
-/// The text gate: UTF-8, no NUL in the probe window, under the size cap.
-fn text_gate<'a>(bytes: &'a [u8], limits: &MergeLimits) -> std::result::Result<&'a str, Reason> {
-    if bytes.len() as u64 > limits.max_file_bytes {
-        return Err(Reason::TooLarge);
-    }
-    if bytes.iter().take(BINARY_PROBE_BYTES).any(|byte| *byte == 0) {
-        return Err(Reason::Binary);
-    }
-    std::str::from_utf8(bytes).map_err(|_| Reason::Binary)
-}
-
 /// Merges one regular file both sides changed. `None` on a side means that
 /// side deleted the file; `base` is `None` when both sides added it.
 pub fn merge_file(
@@ -145,90 +110,20 @@ pub fn merge_file(
     theirs_name: &str,
     limits: &MergeLimits,
 ) -> std::result::Result<ContentMerge, Reason> {
-    fn gate<'a>(
-        side: Option<&'a [u8]>,
-        limits: &MergeLimits,
-    ) -> std::result::Result<Option<&'a str>, Reason> {
-        match side {
-            None => Ok(None),
-            Some(bytes) => text_gate(bytes, limits).map(Some),
-        }
-    }
-    let base_text = gate(base, limits)?;
-    let ours_text = gate(ours, limits)?;
-    let theirs_text = gate(theirs, limits)?;
-    match (ours_text, theirs_text) {
-        (Some(ours), Some(theirs)) => {
-            if ours == theirs {
-                return Ok(ContentMerge::Merged(ours.as_bytes().to_vec()));
-            }
-            let result = acyclic_fs::text_merge::merge_text(
-                base_text.unwrap_or(""),
-                ours,
-                theirs,
-                ours_name,
-                theirs_name,
-            );
-            if result.clean {
-                Ok(ContentMerge::Merged(result.content.into_bytes()))
-            } else {
-                let hunks = conflict_hunks(&result.content);
-                Ok(ContentMerge::Conflicted {
-                    bytes: result.content.into_bytes(),
-                    hunks,
-                    kind: ConflictKind::Hunks,
-                })
-            }
-        }
-        (Some(ours), None) => Ok(modify_delete(
-            base_text.unwrap_or(""),
-            ours,
-            &format!("{ours_name} (modified)"),
-            &format!("{theirs_name} (deleted)"),
-            ConflictKind::TheirsDeleted,
-        )),
-        (None, Some(theirs)) => Ok(modify_delete(
-            base_text.unwrap_or(""),
-            theirs,
-            &format!("{ours_name} (deleted)"),
-            &format!("{theirs_name} (modified)"),
-            ConflictKind::OursDeleted,
-        )),
-        (None, None) => Ok(ContentMerge::Merged(Vec::new())),
-    }
-}
-
-/// A modify/delete conflict is always a conflict: one block holding the
-/// surviving content against nothing, with the base in the middle.
-fn modify_delete(
-    base: &str,
-    kept: &str,
-    ours_label: &str,
-    theirs_label: &str,
-    kind: ConflictKind,
-) -> ContentMerge {
-    let base = if base.is_empty() || base.ends_with('\n') {
-        std::borrow::Cow::Borrowed(base)
-    } else {
-        std::borrow::Cow::Owned(format!("{base}\n"))
-    };
-    let kept = if kept.is_empty() || kept.ends_with('\n') {
-        std::borrow::Cow::Borrowed(kept)
-    } else {
-        std::borrow::Cow::Owned(format!("{kept}\n"))
-    };
-    let (ours_block, theirs_block) = match kind {
-        ConflictKind::TheirsDeleted => (kept.as_ref(), ""),
-        _ => ("", kept.as_ref()),
-    };
-    let content = format!(
-        "<<<<<<< {ours_label}\n{ours_block}||||||| original\n{base}=======\n{theirs_block}>>>>>>> {theirs_label}\n"
-    );
-    ContentMerge::Conflicted {
-        bytes: content.into_bytes(),
-        hunks: 1,
-        kind,
-    }
+    merge_bytes(
+        base,
+        ours,
+        theirs,
+        ours_name,
+        theirs_name,
+        ByteMergeLimits {
+            max_bytes: limits.max_file_bytes,
+        },
+    )
+    .map_err(|error| match error {
+        ByteMergeError::Binary => Reason::Binary,
+        ByteMergeError::TooLarge => Reason::TooLarge,
+    })
 }
 
 // ---------------------------------------------------------------------------
