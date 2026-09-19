@@ -150,11 +150,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     // the connect returns early when there is none, so recording afterwards
     // would silently stop working exactly when checkpointing is off.
     if event == HookEvent::PreTool {
-        let path = payload
-            .tool_input
-            .as_ref()
-            .and_then(|i| i.file_path.as_deref().or(i.path.as_deref()));
-        record_lease(repo, payload.tool_name.as_deref(), path);
+        record_pre_tool_lease(repo, &payload);
     }
 
     // A session start may spawn the daemon, but never waits for its first
@@ -168,7 +164,11 @@ pub fn run(repo: &Path, event: &str) -> i32 {
         "hook",
         "event {}: daemon spawn {}; pre-tool waits (bounded), post-tool enqueues (ack before capture)",
         event.as_arg(),
-        if matches!(spawn, Spawn::Allowed) { "allowed" } else { "never" }
+        if matches!(spawn, Spawn::Allowed) {
+            "allowed"
+        } else {
+            "never"
+        }
     );
     let mut client = match connect(repo, spawn) {
         Ok(client) => client,
@@ -284,6 +284,14 @@ fn parse_payload(raw: &str) -> Payload {
 ///
 /// Every failure is swallowed. A hook may not break a tool call, and a missing
 /// lease only means a speculator schedules more conservatively.
+fn record_pre_tool_lease(repo: &Path, payload: &Payload) {
+    let path = payload
+        .tool_input
+        .as_ref()
+        .and_then(|i| i.file_path.as_deref().or(i.path.as_deref()));
+    record_lease(repo, payload.tool_name.as_deref(), path);
+}
+
 fn record_lease(repo: &Path, tool: Option<&str>, path: Option<&str>) {
     use std::io::Write;
 
@@ -455,11 +463,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the only test that touches this variable, and nothing else in the process reads it"
+    )]
     fn the_kill_switch_writes_nothing() {
         let (_dir, repo) = scratch();
-        std::env::set_var("ACYCLIC_NO_LEASES", "1");
+        unsafe { std::env::set_var("ACYCLIC_NO_LEASES", "1") };
         record_lease(&repo, Some("Edit"), Some("src/report.py"));
-        std::env::remove_var("ACYCLIC_NO_LEASES");
+        unsafe { std::env::remove_var("ACYCLIC_NO_LEASES") };
         assert!(
             leases_of(&repo).is_empty(),
             "the off switch must be an off switch"

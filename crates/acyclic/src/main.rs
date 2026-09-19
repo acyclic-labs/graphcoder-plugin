@@ -1,4 +1,6 @@
 //! `acyclic` — checkpoints, rewind, and blast-radius diff for agent sessions.
+// The sdk workspace warns on missing docs and lints with -D warnings.
+#![allow(missing_docs, reason = "binary crate; nothing is exported")]
 #![cfg_attr(
     test,
     allow(
@@ -870,7 +872,9 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 _ => return Err("pass exactly one of <id>, --last, --session-start".into()),
             };
             if !yes {
-                eprint!("rewind will replace the working tree (a safety checkpoint is taken first). Continue? [y/N] ");
+                eprint!(
+                    "rewind will replace the working tree (a safety checkpoint is taken first). Continue? [y/N] "
+                );
                 let mut answer = String::new();
                 std::io::stdin()
                     .read_line(&mut answer)

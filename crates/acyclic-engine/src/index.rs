@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use acyclic_fs::{Digest, GenerationId};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{EngineError, Result};
 
@@ -118,7 +118,7 @@ impl CheckpointKind {
             other => {
                 return Err(EngineError::Store(format!(
                     "unknown checkpoint kind {other}"
-                )))
+                )));
             }
         })
     }
@@ -1002,10 +1002,12 @@ mod tests {
             .expect("q")
             .expect("some");
         assert_eq!(last.session_id, "old");
-        assert!(index
-            .last_session_with_checkpoints(Some("old"))
-            .expect("q")
-            .is_none());
+        assert!(
+            index
+                .last_session_with_checkpoints(Some("old"))
+                .expect("q")
+                .is_none()
+        );
     }
 
     #[test]

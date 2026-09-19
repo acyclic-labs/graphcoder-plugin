@@ -195,9 +195,11 @@ fn resolve_then_apply_session_lands_fork_changes() {
     });
 
     // The pre-apply diff already shows the new file, before anything landed.
-    assert!(diffable_base
-        .iter()
-        .any(|change| change.path == Path::new("fork-note.txt")));
+    assert!(
+        diffable_base
+            .iter()
+            .any(|change| change.path == Path::new("fork-note.txt"))
+    );
 
     let PromoteOutcome::Promoted { old_tree, .. } = outcome else {
         panic!("expected Promoted, got {outcome:?}");

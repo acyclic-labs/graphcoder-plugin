@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acyclic"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "acyclic-engine",
  "acyclic-fs",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "acyclic-engine"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "acyclic-fs",
  "blake3",
@@ -41,9 +41,10 @@ dependencies = [
 
 [[package]]
 name = "acyclic-fs"
-version = "0.2.0-rc.1"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=22b4e752f46d8f6db6e024b3137fe520ef64bcc1#22b4e752f46d8f6db6e024b3137fe520ef64bcc1"
+version = "0.2.0-rc.5"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=0de2d5c8eff4d42a8011458a2291cd09ea9b6e75#0de2d5c8eff4d42a8011458a2291cd09ea9b6e75"
 dependencies = [
+ "acyclic-native-runtime",
  "acyclic-objects",
  "acyclic-stream",
  "async-trait",
@@ -52,15 +53,18 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "cc",
+ "diffy",
  "fs2",
  "fuser",
  "futures",
  "hex",
+ "io-uring",
  "libc",
  "notify",
  "prost",
  "prost-types",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tonic",
@@ -72,15 +76,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "acyclic-objects"
-version = "1.0.0-rc.1"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=22b4e752f46d8f6db6e024b3137fe520ef64bcc1#22b4e752f46d8f6db6e024b3137fe520ef64bcc1"
+name = "acyclic-native-runtime"
+version = "0.1.0"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=0de2d5c8eff4d42a8011458a2291cd09ea9b6e75#0de2d5c8eff4d42a8011458a2291cd09ea9b6e75"
 dependencies = [
+ "block2",
+ "bytes",
+ "dispatch2",
+ "io-uring",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "acyclic-objects"
+version = "1.0.0-rc.4"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=0de2d5c8eff4d42a8011458a2291cd09ea9b6e75#0de2d5c8eff4d42a8011458a2291cd09ea9b6e75"
+dependencies = [
+ "acyclic-native-runtime",
  "async-trait",
  "blake3",
  "bytes",
  "fs2",
  "futures",
+ "getrandom 0.3.4",
+ "hex",
+ "imbl",
  "libc",
  "prost",
  "prost-types",
@@ -90,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "acyclic-proto"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -98,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "acyclic-qual"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "acyclic-engine",
  "acyclic-fs",
@@ -107,9 +128,10 @@ dependencies = [
 
 [[package]]
 name = "acyclic-stream"
-version = "1.0.0-rc.3"
-source = "git+https://github.com/acyclic-labs/sdk.git?rev=22b4e752f46d8f6db6e024b3137fe520ef64bcc1#22b4e752f46d8f6db6e024b3137fe520ef64bcc1"
+version = "1.0.0-rc.7"
+source = "git+https://github.com/acyclic-labs/sdk.git?rev=0de2d5c8eff4d42a8011458a2291cd09ea9b6e75#0de2d5c8eff4d42a8011458a2291cd09ea9b6e75"
 dependencies = [
+ "acyclic-native-runtime",
  "async-trait",
  "bytes",
  "fs2",
@@ -203,6 +225,12 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "archery"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
 
 [[package]]
 name = "arrayvec"
@@ -317,10 +345,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+
+[[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "bytes"
@@ -529,6 +572,18 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+]
+
+[[package]]
+name = "dispatch2"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
+dependencies = [
+ "bitflags",
+ "block2",
+ "libc",
+ "objc2",
 ]
 
 [[package]]
@@ -763,13 +818,27 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "libc",
+ "r-efi 5.3.0",
+ "wasip2",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi",
+ "r-efi 6.0.0",
 ]
 
 [[package]]
@@ -970,6 +1039,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "imbl"
+version = "7.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46bad832b9b463ed9398b8506488cc2e3b897a9d44f13af115f382aac71f4fec"
+dependencies = [
+ "archery",
+ "equivalent",
+ "imbl-sized-chunks",
+ "rand_core",
+ "rand_xoshiro",
+ "version_check",
+ "wide",
+]
+
+[[package]]
+name = "imbl-sized-chunks"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a0813be332553f857953298749fa19549e8b61b80589757c29b4e2a804fa9c6"
+
+[[package]]
 name = "indexmap"
 version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1022,6 +1112,17 @@ name = "io-lifetimes"
 version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
+
+[[package]]
+name = "io-uring"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3bd0ecfbb87805f538bb7b32e5239ca0763890c623e349860ecba69469f2bb"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "ipnet"
@@ -1208,6 +1309,21 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
 
 [[package]]
 name = "once_cell"
@@ -1453,9 +1569,30 @@ dependencies = [
 
 [[package]]
 name = "r-efi"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rand_core"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+dependencies = [
+ "rand_core",
+]
 
 [[package]]
 name = "ref-cast"
@@ -1644,6 +1781,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "safe_arch"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -2222,6 +2368,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wasip2"
+version = "1.0.4+wasi-0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "wasm-bindgen"
 version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2273,6 +2428,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "wide"
+version = "0.7.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]
@@ -2599,6 +2764,12 @@ dependencies = [
  "bitflags",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "zerocopy"

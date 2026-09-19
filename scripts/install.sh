@@ -3,10 +3,11 @@
 # GitHub release, verifies it against the release's SHA256SUMS, and installs
 # it into a user-writable bin directory. No sudo, no package manager.
 #
-#   curl -fsSL https://raw.githubusercontent.com/acyclic-labs/graphcoder-plugin/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/acyclic-labs/sdk/main/plugin/scripts/install.sh | sh
 #
 # Environment:
-#   ACYCLIC_VERSION      release to install, e.g. 0.0.2 (default: latest)
+#   ACYCLIC_VERSION      release to install, e.g. 0.0.3 (default: the version
+#                        named by plugin/LATEST on the sdk repo's main branch)
 #   ACYCLIC_INSTALL_DIR  where the binary goes (default: $HOME/.local/bin)
 #   ACYCLIC_RELEASE_URL  base URL of a release's assets (default: the GitHub
 #                        release for ACYCLIC_VERSION); file:// works, which is
@@ -14,10 +15,14 @@
 set -eu
 
 # This script is fetched on its own, so it cannot read product.toml. These
-# three lines mirror it; scripts/check-product-name.sh fails CI if they drift.
+# four lines mirror it; scripts/check-product-name.sh fails CI if they drift.
 NAME="acyclic"
-REPO="acyclic-labs/graphcoder-plugin"
+REPO="acyclic-labs/sdk"
 NPM_PACKAGE="@acyclic-labs/plugin"
+TAG_PREFIX="plugin-v"
+# The sdk repository hosts several release families, so "latest release" is
+# not necessarily this product's. main carries the current version in a file.
+LATEST_URL="https://raw.githubusercontent.com/$REPO/main/plugin/LATEST"
 INSTALL_DIR="${ACYCLIC_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '%s\n' "$*" >&2; }
@@ -35,14 +40,6 @@ case "$(uname -m)" in
 esac
 asset="$NAME-$os-$cpu"
 
-if [ -n "${ACYCLIC_RELEASE_URL:-}" ]; then
-  base="${ACYCLIC_RELEASE_URL%/}"
-elif [ -n "${ACYCLIC_VERSION:-}" ]; then
-  base="https://github.com/$REPO/releases/download/v${ACYCLIC_VERSION#v}"
-else
-  base="https://github.com/$REPO/releases/latest/download"
-fi
-
 fetch() {
   # fetch <url> <dest>
   if command -v curl >/dev/null 2>&1; then
@@ -53,6 +50,20 @@ fetch() {
     die "need curl or wget"
   fi
 }
+
+if [ -n "${ACYCLIC_RELEASE_URL:-}" ]; then
+  base="${ACYCLIC_RELEASE_URL%/}"
+else
+  version_wanted="${ACYCLIC_VERSION:-}"
+  if [ -z "$version_wanted" ]; then
+    latest_tmp="$(mktemp "${TMPDIR:-/tmp}/$NAME-latest.XXXXXX")"
+    fetch "$LATEST_URL" "$latest_tmp" || die "cannot read $LATEST_URL; set ACYCLIC_VERSION"
+    version_wanted="$(tr -d ' \r\n' < "$latest_tmp")"
+    rm -f "$latest_tmp"
+    [ -n "$version_wanted" ] || die "$LATEST_URL is empty; set ACYCLIC_VERSION"
+  fi
+  base="https://github.com/$REPO/releases/download/${TAG_PREFIX}${version_wanted#v}"
+fi
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -74,7 +85,7 @@ missing() {
   say "install.sh: cannot fetch $1"
   say ""
   say "No release asset at that URL. See which releases exist:"
-  say "  https://github.com/$REPO/releases"
+  say "  https://github.com/$REPO/releases?q=${TAG_PREFIX}"
   say "A release must carry both $asset and SHA256SUMS."
   say ""
   say "To install without a GitHub release:"

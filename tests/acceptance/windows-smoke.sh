@@ -18,7 +18,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-ACYCLIC="${ACYCLIC_BIN:-$ROOT/target/release/acyclic.exe}"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+[ -d "$TARGET_DIR" ] || TARGET_DIR="$ROOT/../target"
+ACYCLIC="${ACYCLIC_BIN:-$TARGET_DIR/release/acyclic.exe}"
 [ -x "$ACYCLIC" ] || { echo "windows-smoke: no binary at $ACYCLIC" >&2; exit 1; }
 
 WORK="$(mktemp -d)"

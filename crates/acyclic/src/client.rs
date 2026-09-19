@@ -308,17 +308,17 @@ fn wait_for_socket(
     let deadline = bound.unwrap_or(Duration::from_secs(30 * 60));
     let mut reported = false;
     loop {
-        if let Ok(stream) = ClientStream::connect(socket) {
-            if let Ok(mut client) = Client::from_stream(stream) {
-                // The daemon binds its socket before it opens the store, so
-                // a connect can succeed while the ping waits on the store
-                // open; bound the ping too so a caller with a bound never
-                // sits on it.
-                client.set_deadline(bound.unwrap_or(Duration::from_secs(60)));
-                if client.call(proto::Op::Ping).is_ok() {
-                    client.set_deadline(Duration::from_secs(24 * 60 * 60));
-                    return Ok(client);
-                }
+        if let Ok(stream) = ClientStream::connect(socket)
+            && let Ok(mut client) = Client::from_stream(stream)
+        {
+            // The daemon binds its socket before it opens the store, so
+            // a connect can succeed while the ping waits on the store
+            // open; bound the ping too so a caller with a bound never
+            // sits on it.
+            client.set_deadline(bound.unwrap_or(Duration::from_secs(60)));
+            if client.call(proto::Op::Ping).is_ok() {
+                client.set_deadline(Duration::from_secs(24 * 60 * 60));
+                return Ok(client);
             }
         }
         if bound.is_some_and(|bound| started.elapsed() > bound) {

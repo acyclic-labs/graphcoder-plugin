@@ -526,14 +526,18 @@ fn single_path_restore_leaves_the_rest_alone() {
         }
 
         // Escapes and the root are refused.
-        assert!(handle
-            .restore_path(target(v1.row_id), "../etc".into())
-            .await
-            .is_err());
-        assert!(handle
-            .restore_path(target(v1.row_id), ".".into())
-            .await
-            .is_err());
+        assert!(
+            handle
+                .restore_path(target(v1.row_id), "../etc".into())
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .restore_path(target(v1.row_id), ".".into())
+                .await
+                .is_err()
+        );
 
         // Each restore is recorded as a `manual` checkpoint, never as a
         // rewind (nothing is abandoned), and the pre-restore state (v2) is

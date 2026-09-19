@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use acyclic_fs::model::VolumeLimits;
-use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
     NativeWatchOptions, OperationId, WatchBatch, WatchChange, WatchEpoch, WatchSequence,
     WorkCounters,
 };
+use acyclic_fs::{CaptureOptions, capture_baseline, capture_root_identity, capture_watch_batch};
 use tokio::sync::{mpsc, oneshot};
 
 use std::sync::Arc;
@@ -250,7 +250,7 @@ pub struct PipelineHandle {
 }
 
 macro_rules! request {
-    ($self:ident, $variant:ident { $($field:ident : $value:expr),* $(,)? }) => {{
+    ($self:ident, $variant:ident { $($field:ident : $value:expr_2021),* $(,)? }) => {{
         let (reply, receiver) = oneshot::channel();
         $self
             .sender
@@ -395,7 +395,7 @@ impl PipelineHandle {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => return Ok(None),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(EngineError::Store("pipeline is gone".into()))
+                return Err(EngineError::Store("pipeline is gone".into()));
             }
         }
         let changes = receiver
@@ -976,19 +976,19 @@ impl Pipeline {
                 "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
             );
         }
-        if let WatchBatch::Changes { ref changes, .. } = batch {
-            if !changes.is_empty() {
-                capture_watch_batch(
-                    &mut self.store.checkout,
-                    batch,
-                    &self.options,
-                    WorkCounters::UNBOUNDED,
-                    &self.cancel,
-                )
-                .await
-                .map_err(EngineError::fs("capture rescan tail"))?;
-                self.scrub_exclusions().await?;
-            }
+        if let WatchBatch::Changes { ref changes, .. } = batch
+            && !changes.is_empty()
+        {
+            capture_watch_batch(
+                &mut self.store.checkout,
+                batch,
+                &self.options,
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("capture rescan tail"))?;
+            self.scrub_exclusions().await?;
         }
         let phase = Instant::now();
         self.commit_engine().await?;
@@ -2053,7 +2053,7 @@ impl Pipeline {
             other => {
                 return Err(EngineError::Fs(format!(
                     "unexpected fork commit outcome: {other:?}"
-                )))
+                )));
             }
         };
 

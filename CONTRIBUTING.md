@@ -44,7 +44,6 @@ Run these locally — CI enforces all of them:
 
 ```sh
 scripts/check-product-name.sh   # the public name only comes from product.toml
-scripts/check-no-secrets.sh     # no forbidden files or credential patterns
 scripts/check-code-quality.sh   # line width, TODO(topic) format, comment-block length, duplication
 cargo deny check                # dependency licenses, advisories, bans
 cargo fmt --all --check

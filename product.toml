@@ -8,10 +8,14 @@
 # (shell), .github/workflows (awk). scripts/check-product-name.sh fails CI if
 # the one self-contained file (scripts/install.sh) drifts from this.
 #
+# `release_tag_prefix` names this product's releases inside the shared sdk
+# repository (`plugin-v0.0.3`); other families there use their own prefixes.
+#
 # Crate and Cargo target names stay `acyclic*`: they are internal and never
 # shown to a user. The GitHub repo and npm scope are organisation identity,
 # not derived from `name`.
 name = "acyclic"
 npm_package = "@acyclic-labs/plugin"
 pypi_package = "acyclic-pydantic-ai"
-github_repo = "acyclic-labs/graphcoder-plugin"
+github_repo = "acyclic-labs/sdk"
+release_tag_prefix = "plugin-v"

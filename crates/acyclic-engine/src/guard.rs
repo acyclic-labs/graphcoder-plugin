@@ -466,6 +466,15 @@ impl MountFilesystem for GuardedMountFilesystem {
         self.guard(path)?;
         self.inner.capture_host_path(source_root, path)
     }
+
+    fn capture_host_subtree(
+        &self,
+        source_root: &Path,
+        path: &MountPath,
+    ) -> Result<(), MountSourceError> {
+        self.guard(path)?;
+        self.inner.capture_host_subtree(source_root, path)
+    }
 }
 
 #[cfg(test)]
@@ -532,8 +541,8 @@ mod tests {
     }
 
     #[test]
-    fn write_to_guarded_directory_is_rejected_at_any_depth(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_to_guarded_directory_is_rejected_at_any_depth()
+    -> Result<(), Box<dyn std::error::Error>> {
         let guard = guarded_source(&["migrations".to_owned()])?;
         let deep = test_path(&["migrations", "2024", "001_init.sql"]);
         assert!(matches!(
@@ -588,9 +597,11 @@ mod tests {
                 "sidecar {sidecar:?} must be refused"
             );
         }
-        assert!(guard
-            .create_file(&test_path(&["notes.txt"]), metadata())
-            .is_ok());
+        assert!(
+            guard
+                .create_file(&test_path(&["notes.txt"]), metadata())
+                .is_ok()
+        );
         Ok(())
     }
 
