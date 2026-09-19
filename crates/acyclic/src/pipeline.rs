@@ -835,54 +835,28 @@ impl Pipeline {
         let cancel = CancellationToken::new();
         let repo_root: PathBuf = store.repo_root.clone();
 
-        let mut watch = NativeWatch::open(
-            &repo_root,
-            NativeWatchOptions {
-                limits: VolumeLimits::default(),
-                maximum_queued_changes: WATCH_QUEUE,
-                recursive: true,
-            },
-        )
-        .map_err(EngineError::fs("open watcher"))?;
-        #[cfg(target_os = "windows")]
-        let admitted = Self::admit_continuity(&store, &index, &mut watch)?;
-        #[cfg(not(target_os = "windows"))]
-        let admitted = false;
-        if !admitted {
-            watch
-                .begin_rescan()
-                .map_err(EngineError::fs("begin rescan"))?;
-        }
-
         let options = CaptureOptions {
-            source_root: repo_root.clone(),
-            expected_root_identity: capture_root_identity(&repo_root)
-                .map_err(EngineError::fs("root identity"))?,
+            source_root: repo_root,
+            // First filesystem demand replaces this before any capture. Keeping
+            // startup free of native root access lets metadata-only consumers
+            // run even when the repository is temporarily unavailable.
+            expected_root_identity: acyclic_fs::NativeRootIdentity::from_bytes([0; 16]),
             maximum_paths: MAXIMUM_CAPTURE_PATHS,
             maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
         };
 
         let exclusions = Exclusions::parse(&config.exclude)?;
-        let latest = admitted.then(|| index.latest()).transpose()?.flatten();
         let pipeline = Self {
             store,
             index,
             config,
-            watch: Some(watch),
+            watch: None,
             options,
             exclusions,
             cancel,
-            state: if admitted {
-                State::Ready
-            } else {
-                State::NeedsBaseline
-            },
-            last_generation: latest
-                .as_ref()
-                .map_or(GenerationId::new(acyclic_fs::Digest::ZERO), |row| {
-                    row.generation
-                }),
-            last_checkpoint_row: latest.map(|row| row.id),
+            state: State::NeedsBaseline,
+            last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
+            last_checkpoint_row: None,
             checkpoints_since_commit: 0,
             last_activity: Instant::now(),
             watcher_health: WatcherHealth::default(),
@@ -922,6 +896,35 @@ impl Pipeline {
     async fn ensure_ready(&mut self) -> Result<()> {
         if self.state == State::Ready {
             return Ok(());
+        }
+        if self.watch.is_none() {
+            let repo_root = self.store.repo_root.clone();
+            self.options.expected_root_identity =
+                capture_root_identity(&repo_root).map_err(EngineError::fs("root identity"))?;
+            let mut watch = NativeWatch::open(
+                &repo_root,
+                NativeWatchOptions {
+                    limits: VolumeLimits::default(),
+                    maximum_queued_changes: WATCH_QUEUE,
+                    recursive: true,
+                },
+            )
+            .map_err(EngineError::fs("open watcher"))?;
+            #[cfg(target_os = "windows")]
+            if Self::admit_continuity(&self.store, &self.index, &mut watch)? {
+                let latest = self.index.latest()?.ok_or_else(|| {
+                    EngineError::Store("continuity admitted without an index row".into())
+                })?;
+                self.last_generation = latest.generation;
+                self.last_checkpoint_row = Some(latest.id);
+                self.watch = Some(watch);
+                self.state = State::Ready;
+                return Ok(());
+            }
+            watch
+                .begin_rescan()
+                .map_err(EngineError::fs("begin rescan"))?;
+            self.watch = Some(watch);
         }
         self.baseline(CheckpointKind::Baseline).await
     }

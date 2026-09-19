@@ -34,7 +34,7 @@ fn fast_config() -> Config {
 }
 
 #[test]
-fn startup_failure_is_reported_by_status() {
+fn native_startup_failure_is_deferred_until_filesystem_demand() {
     let repo = tempfile::tempdir().expect("repo");
     let stores = tempfile::tempdir().expect("stores");
     let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
@@ -46,11 +46,15 @@ fn startup_failure_is_reported_by_status() {
     std::fs::remove_dir(repo.path()).expect("remove empty repo before watcher opens");
     let (handle, thread) = pipeline::spawn(store, index, fast_config());
 
-    let error = runtime
+    let status = runtime
         .block_on(handle.status())
-        .expect_err("startup must fail");
-    assert!(error.to_string().contains("pipeline failed to start"));
-    drop(handle);
+        .expect("metadata-only startup remains available");
+    assert_eq!(status.state, pipeline::State::NeedsBaseline);
+    let error = runtime
+        .block_on(handle.checkpoint(CheckpointKind::Manual, Attribution::default()))
+        .expect_err("filesystem demand must fail");
+    assert!(error.to_string().contains("root identity"));
+    runtime.block_on(handle.shutdown()).expect("shutdown");
     thread.join().expect("pipeline thread");
 }
 
@@ -348,7 +352,10 @@ fn requested_checkpoint_records_changes_an_idle_tick_already_drained() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     let outcome = runtime.block_on(async {
-        handle.status().await.expect("status");
+        handle
+            .checkpoint(CheckpointKind::Manual, Attribution::default())
+            .await
+            .expect("establish baseline");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         tokio::time::sleep(Duration::from_millis(600)).await;
         let outcome = handle
