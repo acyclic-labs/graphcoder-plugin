@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // Only the Unix sweep names the product; on Windows there is no sweep.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use acyclic::product::NAME;
 use acyclic::spec::RunOutcome;
 use tokio::io::AsyncWriteExt;
@@ -356,7 +356,7 @@ impl Drop for OwnedJob {
 /// Matched on the recorded command name as well as the pid, so a reused pid
 /// belonging to something else is never signalled — the check costs one
 /// `ps` and removes the whole class of mistake.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[allow(
     unsafe_code,
     reason = "kill(pid, 0) only tests for the process's existence; the \
@@ -403,7 +403,7 @@ fn sweep_stale_runs(spec_runs: &Path) {
 /// that dies — however it dies — takes the run's whole tree with it.
 /// Whether the live process really is the run we recorded, rather than
 /// whatever inherited its pid.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn command_name_matches(pid: i32, expected: &str) -> bool {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
