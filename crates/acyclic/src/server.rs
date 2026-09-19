@@ -688,10 +688,7 @@ impl Server {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in scratch_ids {
-                    self.forks.lock().await.remove(&id);
-                    if let Err(error) = self.detach_route(&id).await {
-                        eprintln!("{NAME} daemon: drop scratch fork {id}: {error}");
-                    }
+                    self.remove_fork(&id).await?;
                 }
                 // The session that just ended is the one the NEXT session's
                 // brief will describe, and nothing is asking for it yet:
@@ -783,10 +780,7 @@ impl Server {
                 Ok(proto::Reply::Forks(entries))
             }
             proto::Op::ForkDrop { id } => {
-                let mut forks = self.forks.lock().await;
-                forks.remove(&id).ok_or(format!("no fork {id}"))?;
-                drop(forks);
-                self.detach_route(&id).await?;
+                self.remove_fork(&id).await?;
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Promote { id } => {
@@ -848,10 +842,11 @@ impl Server {
                     }
                     Ok(landed) => landed,
                 };
-                // Landed: the fork is consumed. Drop its mount route.
-                if let Err(error) = self.detach_route(&id).await {
-                    eprintln!("{NAME} daemon: discard fork {id} after promote: {error}");
-                }
+                // Landed: the fork is consumed. A teardown failure must be
+                // visible because the route is still live and the fork must
+                // remain tracked until a later drop can finish it.
+                self.forks.lock().await.insert(id.clone(), fork);
+                self.remove_fork(&id).await?;
                 match landed {
                     Landed::Replayed {
                         generation,
@@ -997,6 +992,17 @@ impl Server {
     /// Re-inserts a fork that did not land. Its route was never detached.
     async fn keep_fork(&self, id: String, fork: ForkState) -> Result<(), String> {
         self.forks.lock().await.insert(id, fork);
+        Ok(())
+    }
+
+    /// Detaches a fork's live route before forgetting its state. If teardown
+    /// fails, the entry remains visible and a caller can retry the drop.
+    async fn remove_fork(&self, id: &str) -> Result<(), String> {
+        if !self.forks.lock().await.contains_key(id) {
+            return Err(format!("no fork {id}"));
+        }
+        self.detach_route(id).await?;
+        self.forks.lock().await.remove(id);
         Ok(())
     }
 
@@ -1420,24 +1426,32 @@ impl Server {
     /// disappears) when the last route goes, freeing the FUSE-T pool slot.
     async fn detach_route(&self, id: &str) -> Result<(), String> {
         let mut mount = self.fork_mount.lock().await;
-        // Dropping a route drops its CheckoutMountSource, which owns a tokio
-        // runtime — runtimes must never be dropped on an async worker.
-        tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
-        // The kernel may hold a positive entry cache for the removed name
-        // (FSKit caches until told otherwise): invalidate it eagerly.
-        if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(&route_name(id)))
-            {
-                eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
-            }
-        }
-        if mount.router.is_empty() {
-            if let Some(mut session) = mount.session.take() {
+        let route = route_name(id);
+        let last_route = mount.router.route_count() == 1;
+        if last_route {
+            if let Some(session) = mount.session.as_mut() {
                 tokio::task::block_in_place(|| session.stop())
                     .map_err(|error| format!("unmount: {error:?}"))?;
             }
+            mount.session.take();
+        }
+        // Dropping a route drops its CheckoutMountSource, which owns a tokio
+        // runtime — runtimes must never be dropped on an async worker. For
+        // the last route, stop the fallible kernel session first so failure
+        // leaves both the route and fork state intact for an exact retry.
+        if !tokio::task::block_in_place(|| mount.router.remove_route(&route)) {
+            return Err(format!("fork {id} has no mount route"));
+        }
+        // The kernel may hold a positive entry cache for the removed name
+        // (FSKit caches until told otherwise): invalidate it eagerly.
+        if let Some(session) = mount.session.as_ref() {
+            tokio::task::block_in_place(|| session.invalidate(&route))
+                .map_err(|error| format!("invalidate {id}: {error:?}"))?;
+        }
+        if last_route {
             if let Some(root) = fork::forks_mount_root(&self.repo_root) {
-                let _ = std::fs::remove_dir_all(root);
+                std::fs::remove_dir_all(root)
+                    .map_err(|error| format!("remove fork mount root: {error}"))?;
             }
         }
         Ok(())
