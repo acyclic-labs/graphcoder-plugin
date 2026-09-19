@@ -322,11 +322,11 @@ pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
 
 /// Crash-recovery journal. Present on disk only while a swap is in flight.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Journal {
+struct LegacyJournal {
     pub target_generation: String,
     pub repo_root: PathBuf,
     pub tmp: PathBuf,
-    pub phase: Phase,
+    pub phase: LegacyPhase,
     /// Excluded paths (repo-relative) moved from the live tree into `tmp`
     /// before the swap. Absent in journals written before exclusions.
     #[serde(default)]
@@ -358,7 +358,7 @@ fn move_back(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Phase {
+enum LegacyPhase {
     /// Materializing into tmp; repo untouched. Recovery: delete tmp.
     Materializing,
     /// The prepared tree is complete and the SDK head is being restored.
@@ -392,9 +392,9 @@ pub async fn recover_workspace(store: &mut Store, recovered: RecoveredSwap) -> R
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let journal: Journal = serde_json::from_str(&text)
+    let journal: LegacyJournal = serde_json::from_str(&text)
         .map_err(|error| EngineError::Restore(format!("rewind journal: {error}")))?;
-    if journal.phase != Phase::RestoringHead {
+    if journal.phase != LegacyPhase::RestoringHead {
         return Ok(());
     }
     let locator = publish_locator(&journal.repo_root, &store.paths.rewind_journal())?;
@@ -546,11 +546,11 @@ pub(crate) async fn prepare<'a>(
     })?;
     write_journal(
         &staging_journal_path,
-        &Journal {
+        &LegacyJournal {
             target_generation: hex::encode(target.digest().as_bytes()),
             repo_root: repo.clone(),
             tmp: tmp.clone(),
-            phase: Phase::Materializing,
+            phase: LegacyPhase::Materializing,
             carried: Vec::new(),
         },
     )?;
@@ -686,9 +686,9 @@ fn recover_staging(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let journal: Journal = serde_json::from_str(&text)
+    let journal: LegacyJournal = serde_json::from_str(&text)
         .map_err(|error| EngineError::Restore(format!("rewind staging journal: {error}")))?;
-    if journal.phase != Phase::Materializing {
+    if journal.phase != LegacyPhase::Materializing {
         return Err(EngineError::Restore(
             "rewind staging journal has an invalid phase".into(),
         ));
@@ -699,7 +699,7 @@ fn recover_staging(path: &Path) -> Result<()> {
 }
 
 fn recover_legacy(journal_path: &Path, text: &str) -> Result<Option<RecoveredSwap>> {
-    let journal: Journal = serde_json::from_str(text)
+    let journal: LegacyJournal = serde_json::from_str(text)
         .map_err(|error| EngineError::Restore(format!("rewind journal: {error}")))?;
     let target = decode_generation(&journal.target_generation)?;
     #[cfg(windows)]
@@ -708,24 +708,24 @@ fn recover_legacy(journal_path: &Path, text: &str) -> Result<Option<RecoveredSwa
     let published = false;
     let mut old_tree = None;
     match journal.phase {
-        Phase::Materializing => {
+        LegacyPhase::Materializing => {
             // Repo untouched; the partial tmp tree is garbage.
             let _ = std::fs::remove_dir_all(&journal.tmp);
         }
-        Phase::RestoringHead => {
+        LegacyPhase::RestoringHead => {
             return Ok(Some(RecoveredSwap {
                 published,
                 old_tree,
                 target,
             }))
         }
-        Phase::Carrying => {
+        LegacyPhase::Carrying => {
             // Some excluded paths may already sit in tmp: bring them home,
             // then drop the unused new tree.
             move_back(&journal.tmp, &journal.repo_root, &journal.carried)?;
             let _ = std::fs::remove_dir_all(&journal.tmp);
         }
-        Phase::Swapping => {
+        LegacyPhase::Swapping => {
             #[cfg(windows)]
             let scratch = swap_scratch(&journal.repo_root);
             #[cfg(windows)]
@@ -823,7 +823,7 @@ fn path_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
+fn write_journal(path: &Path, journal: &LegacyJournal) -> Result<()> {
     let text = serde_json::to_string(journal)
         .map_err(|error| EngineError::Restore(format!("encode journal: {error}")))?;
     let tmp = path.with_extension("tmp");
@@ -1004,8 +1004,8 @@ mod tests {
             .any(|entry| std::fs::read(entry.path().join(file)).ok().as_deref() == Some(expected))
     }
 
-    fn journal(repo: &Path, tmp: &Path, phase: Phase) -> Journal {
-        Journal {
+    fn journal(repo: &Path, tmp: &Path, phase: LegacyPhase) -> LegacyJournal {
+        LegacyJournal {
             target_generation: "00".repeat(32),
             repo_root: repo.to_path_buf(),
             tmp: tmp.to_path_buf(),
@@ -1014,7 +1014,7 @@ mod tests {
         }
     }
 
-    fn write(path: &Path, value: &Journal) {
+    fn write(path: &Path, value: &LegacyJournal) {
         std::fs::write(path, serde_json::to_string(value).expect("encode")).expect("write");
     }
 
@@ -1026,7 +1026,7 @@ mod tests {
         std::fs::create_dir(&tmp).expect("tmp");
         std::fs::write(tmp.join("file.txt"), b"restored").expect("seed");
         let journal_path = work.path().join("journal.json");
-        write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
+        write(&journal_path, &journal(&repo, &tmp, LegacyPhase::Swapping));
 
         let recovered = recover(&journal_path)
             .expect("recover")
@@ -1050,7 +1050,10 @@ mod tests {
         std::fs::create_dir(&tmp).expect("tmp");
         std::fs::write(tmp.join("partial.txt"), b"half").expect("seed");
         let journal_path = work.path().join("journal.json");
-        write(&journal_path, &journal(&repo, &tmp, Phase::Materializing));
+        write(
+            &journal_path,
+            &journal(&repo, &tmp, LegacyPhase::Materializing),
+        );
 
         recover(&journal_path).expect("recover");
         assert_eq!(std::fs::read(repo.join("keep.txt")).expect("read"), b"live");
@@ -1069,7 +1072,10 @@ mod tests {
         std::fs::write(tmp.join("partial.txt"), b"half").expect("seed");
         let journal_path = work.path().join("journal.json");
         let staging_path = journal_path.with_extension("staging.json");
-        write(&staging_path, &journal(&repo, &tmp, Phase::Materializing));
+        write(
+            &staging_path,
+            &journal(&repo, &tmp, LegacyPhase::Materializing),
+        );
 
         recover(&journal_path).expect("recover");
         assert_eq!(std::fs::read(repo.join("keep.txt")).expect("read"), b"live");
@@ -1096,7 +1102,7 @@ mod tests {
         std::fs::write(tmp.join(".env"), b"LIVE").expect("moved");
         std::fs::write(repo.join("secrets/key.pem"), b"KEY").expect("unmoved");
         let journal_path = work.path().join("journal.json");
-        let mut entry = journal(&repo, &tmp, Phase::Carrying);
+        let mut entry = journal(&repo, &tmp, LegacyPhase::Carrying);
         entry.carried = vec![PathBuf::from(".env"), PathBuf::from("secrets/key.pem")];
         write(&journal_path, &entry);
 
@@ -1123,7 +1129,7 @@ mod tests {
         std::fs::write(tmp.join("file.txt"), b"new").expect("new");
         std::fs::write(tmp.join(".env"), b"LIVE").expect("carried");
         let journal_path = work.path().join("journal.json");
-        let mut entry = journal(&repo, &tmp, Phase::Swapping);
+        let mut entry = journal(&repo, &tmp, LegacyPhase::Swapping);
         entry.carried = vec![PathBuf::from(".env")];
         write(&journal_path, &entry);
 
@@ -1146,7 +1152,7 @@ mod tests {
         std::fs::write(repo.join(".env"), b"repo copy").expect("repo data");
         std::fs::write(tmp.join(".env"), b"staged copy").expect("staged data");
         let journal_path = work.path().join("journal.json");
-        let mut entry = journal(&repo, &tmp, Phase::Carrying);
+        let mut entry = journal(&repo, &tmp, LegacyPhase::Carrying);
         entry.carried = vec![PathBuf::from(".env")];
         write(&journal_path, &entry);
 
@@ -1175,7 +1181,7 @@ mod tests {
         std::fs::write(repo.join(".env"), b"LIVE").expect("carried");
         std::fs::write(tmp.join("file.txt"), b"old").expect("old");
         let journal_path = work.path().join("journal.json");
-        let mut entry = journal(&repo, &tmp, Phase::Swapping);
+        let mut entry = journal(&repo, &tmp, LegacyPhase::Swapping);
         entry.carried = vec![PathBuf::from(".env")];
         write(&journal_path, &entry);
 
@@ -1193,7 +1199,7 @@ mod tests {
     fn journals_written_before_exclusions_still_decode() {
         let text =
             r#"{"target_generation":"00","repo_root":"/r","tmp":"/t","phase":"Materializing"}"#;
-        let journal: Journal = serde_json::from_str(text).expect("decode");
+        let journal: LegacyJournal = serde_json::from_str(text).expect("decode");
         assert!(journal.carried.is_empty());
     }
 
@@ -1217,7 +1223,10 @@ mod tests {
         let store = work.path().join("custom-store");
         std::fs::create_dir(&store).expect("custom store");
         let journal_path = store.join("rewind-journal.json");
-        write(&journal_path, &journal(&repo, &staged, Phase::Swapping));
+        write(
+            &journal_path,
+            &journal(&repo, &staged, LegacyPhase::Swapping),
+        );
         let locator = locator_path(&repo).expect("locator path");
         write_locator(
             &locator,
@@ -1251,7 +1260,7 @@ mod tests {
         std::fs::create_dir(&scratch).expect("scratch");
         std::fs::write(scratch.join("file.txt"), b"old tree").expect("seed old");
         let journal_path = work.path().join("journal.json");
-        let mut entry = journal(&repo, &tmp, Phase::Swapping);
+        let mut entry = journal(&repo, &tmp, LegacyPhase::Swapping);
         entry.carried = vec![PathBuf::from(".env")];
         write(&journal_path, &entry);
 
