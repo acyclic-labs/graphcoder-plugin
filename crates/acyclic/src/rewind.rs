@@ -3,19 +3,19 @@
 //! beside the repository, and journal every phase so kill -9 leaves the repo fully-old or
 //! fully-new — never mixed.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::{
-    durable_rename, exchange_native_entries, materialize_checkout_host_path,
-    prepare_native_exchange_with_recovery, publish_native_exchange, recover_native_exchange,
-    IdempotencyKey, MaterializeError, MaterializeOptions, NativeExchangeJournal, RenameMode,
+    durable_rename, prepare_native_exchange_with_recovery, publish_native_exchange,
+    recover_native_exchange, HostPathReplacement, HostPathRestore, IdempotencyKey,
+    MaterializeOptions, NativeExchangeJournal, RenameMode,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
 use crate::exclude::Exclusions;
-use crate::store::{LocalCheckout, Store};
+use crate::store::{LocalGeneration, Store};
 use crate::{EngineError, Result};
 
 const MAXIMUM_DIRECTORY_ENTRIES: u32 = 1_024;
@@ -81,8 +81,8 @@ pub async fn restore_path(
     relative: &Path,
 ) -> Result<RestoreOutcome> {
     let root = store.repo_root.clone();
-    let mut checkout = store.checkout_exact(target).await?;
-    materialize_path_into_checkout(&mut checkout, &root, relative, PathReplace::Atomic).await
+    let generation = store.generation(target).await?;
+    materialize_path_from_generation(&generation, &root, relative, PathReplace::Atomic).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,166 +91,38 @@ pub(crate) enum PathReplace {
     LiveMount,
 }
 
-pub(crate) async fn materialize_path_into_checkout(
-    checkout: &mut LocalCheckout,
+pub(crate) async fn materialize_path_from_generation(
+    generation: &LocalGeneration,
     root: &Path,
     relative: &Path,
     replace: PathReplace,
 ) -> Result<RestoreOutcome> {
-    validate_relative(relative)?;
-    let normalized = normalized_relative(relative);
-    let destination = root.join(relative);
-    ensure_real_parents(root, relative)?;
-    let parent = destination
-        .parent()
-        .ok_or_else(|| EngineError::Restore("path has no parent".into()))?;
     let cancel = CancellationToken::new();
-    // The SDK requires an empty root and recreates the selected path below
-    // it. Keep ordinary restore staging outside the watched repository;
-    // live mounts must stage on the mount to permit the final rename.
-    let stage_parent = match replace {
-        PathReplace::Atomic => root
-            .parent()
-            .ok_or_else(|| EngineError::Restore("repository root has no parent".into()))?,
-        PathReplace::LiveMount => parent,
-    };
-    let stage_root = create_restore_stage(stage_parent)?;
-    let staged = stage_root.join(&normalized);
-    let materialized = materialize_checkout_host_path(
-        checkout,
-        &normalized,
-        &MaterializeOptions {
-            destination: stage_root.clone(),
-            maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
-            maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
-            transfer_bytes: TRANSFER_BYTES,
-        },
-        WorkCounters::UNBOUNDED,
-        &cancel,
-    )
-    .await;
-    if matches!(
-        materialized.as_ref().map_err(|failure| &failure.error),
-        Err(MaterializeError::MissingPath)
-    ) {
-        std::fs::remove_dir_all(&stage_root)?;
-        // Faithful restore of an absent path: remove it if it exists now.
-        return match std::fs::symlink_metadata(&destination) {
-            Ok(metadata) => {
-                if metadata.is_dir() {
-                    std::fs::remove_dir_all(&destination)?;
-                } else {
-                    std::fs::remove_file(&destination)?;
-                }
-                Ok(RestoreOutcome {
-                    path: relative.to_path_buf(),
-                    action: RestoreAction::Removed,
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match replace {
-                PathReplace::Atomic => Err(EngineError::Restore(format!(
-                    "{} does not exist at that checkpoint or in the tree",
-                    relative.display()
-                ))),
-                PathReplace::LiveMount => Ok(RestoreOutcome {
-                    path: relative.to_path_buf(),
-                    action: RestoreAction::Removed,
-                }),
+    let restored = generation
+        .restore_host_path(
+            relative,
+            match replace {
+                PathReplace::Atomic => HostPathReplacement::Atomic,
+                PathReplace::LiveMount => HostPathReplacement::LiveMount,
             },
-            Err(error) => Err(error.into()),
-        };
-    }
-    if let Err(error) = materialized {
-        let _ = std::fs::remove_dir_all(&stage_root);
-        return Err(EngineError::Restore(format!("materialize path: {error}")));
-    }
-    ensure_real_parents(root, relative)?;
-
-    // A live mount must observe ordinary remove/rename operations through
-    // its driver. A user restore exchanges an existing node atomically.
-    match std::fs::symlink_metadata(&destination) {
-        Ok(_) => match replace {
-            PathReplace::Atomic => {
-                // An exchange may have published the new node before a
-                // durability error. Keep both staged and scratch trees.
-                exchange_native_entries(&destination, &staged)
-                    .map_err(|error| EngineError::Restore(format!("exchange path: {error}")))?;
-            }
-            PathReplace::LiveMount => replace_live_mount(&staged, &destination, parent)?,
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let renamed = match replace {
-                PathReplace::Atomic => durable_rename(&staged, &destination, RenameMode::NoReplace),
-                PathReplace::LiveMount => std::fs::rename(&staged, &destination),
-            };
-            if let Err(error) = renamed {
-                return Err(error.into());
-            }
-        }
-        Err(error) => {
-            return Err(error.into());
-        }
-    }
-    std::fs::remove_dir_all(&stage_root)?;
-    #[cfg(unix)]
-    if replace == PathReplace::Atomic {
-        sync_parent(&stage_root)?;
-    }
+            &MaterializeOptions {
+                destination: root.to_path_buf(),
+                maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
+                maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
+                transfer_bytes: TRANSFER_BYTES,
+            },
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
+        .await
+        .map_err(|error| EngineError::Restore(error.to_string()))?;
     Ok(RestoreOutcome {
         path: relative.to_path_buf(),
-        action: RestoreAction::Restored,
+        action: match restored.value {
+            HostPathRestore::Restored => RestoreAction::Restored,
+            HostPathRestore::Removed => RestoreAction::Removed,
+        },
     })
-}
-
-fn replace_live_mount(staged: &Path, destination: &Path, parent: &Path) -> Result<()> {
-    let backup_root = create_restore_stage(parent)?;
-    let backup = backup_root.join("old");
-    if let Err(error) = std::fs::rename(destination, &backup) {
-        let _ = std::fs::remove_dir(&backup_root);
-        return Err(error.into());
-    }
-    if let Err(error) = std::fs::rename(staged, destination) {
-        if let Err(rollback) = std::fs::rename(&backup, destination) {
-            return Err(EngineError::Restore(format!(
-                "materialize rename failed: {error}; old node remains at {} after rollback failed: {rollback}",
-                backup.display()
-            )));
-        }
-        let _ = std::fs::remove_dir(&backup_root);
-        return Err(error.into());
-    }
-    remove_any(&backup)?;
-    std::fs::remove_dir(&backup_root)?;
-    Ok(())
-}
-
-fn normalized_relative(relative: &Path) -> PathBuf {
-    relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name),
-            _ => None,
-        })
-        .collect()
-}
-
-fn create_restore_stage(parent: &Path) -> Result<PathBuf> {
-    for _ in 0..16 {
-        let sequence = PARK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let stage = parent.join(format!(
-            ".{}-restore-{}-{sequence}",
-            crate::product::NAME,
-            std::process::id()
-        ));
-        match std::fs::create_dir(&stage) {
-            Ok(()) => return Ok(stage),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(EngineError::Restore(
-        "could not allocate a unique restore stage".into(),
-    ))
 }
 
 pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
@@ -267,48 +139,6 @@ pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
         .iter()
         .map(|name| name.as_bytes().to_vec())
         .collect())
-}
-
-/// Create missing ancestors one component at a time, refusing symlinks and
-/// Windows reparse points before a path restore touches its destination.
-fn ensure_real_parents(root: &Path, relative: &Path) -> Result<()> {
-    fn check_real_directory(path: &Path) -> Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        #[cfg(windows)]
-        let reparse = {
-            use std::os::windows::fs::MetadataExt;
-            metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
-        };
-        #[cfg(not(windows))]
-        let reparse = false;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() || reparse {
-            return Err(EngineError::Restore(format!(
-                "restore parent {} is not a real directory",
-                path.display()
-            )));
-        }
-        Ok(())
-    }
-
-    check_real_directory(root)?;
-    let mut cursor = root.to_path_buf();
-    if let Some(parent) = relative.parent() {
-        for component in parent.components() {
-            let Component::Normal(name) = component else {
-                continue;
-            };
-            cursor.push(name);
-            match std::fs::symlink_metadata(&cursor) {
-                Ok(_) => check_real_directory(&cursor)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(&cursor)?;
-                    check_real_directory(&cursor)?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
@@ -931,39 +761,6 @@ mod tests {
             parked.push(destination);
         }
         assert!(parked[0] != parked[1] && parked[1] != parked[2] && parked[0] != parked[2]);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn path_restore_rejects_symlinked_parent() -> Result<()> {
-        let work = tempfile::tempdir()?;
-        let root = work.path().join("repo");
-        let outside = work.path().join("outside");
-        std::fs::create_dir(&root)?;
-        std::fs::create_dir(&outside)?;
-        std::os::unix::fs::symlink(&outside, root.join("dir"))?;
-        assert!(ensure_real_parents(&root, Path::new("dir/file")).is_err());
-        assert!(!outside.join("file").exists());
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn path_restore_rejects_reparse_parent_when_symlinks_are_available() -> Result<()> {
-        let work = tempfile::tempdir()?;
-        let root = work.path().join("repo");
-        let outside = work.path().join("outside");
-        std::fs::create_dir(&root)?;
-        std::fs::create_dir(&outside)?;
-        if let Err(error) = std::os::windows::fs::symlink_dir(&outside, root.join("dir")) {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                return Ok(());
-            }
-            return Err(error.into());
-        }
-        assert!(ensure_real_parents(&root, Path::new("dir/file")).is_err());
-        assert!(!outside.join("file").exists());
         Ok(())
     }
 

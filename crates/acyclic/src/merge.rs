@@ -903,9 +903,8 @@ where
         if !page.has_more {
             break;
         }
-        after = Some(
-            next.ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?,
-        );
+        after =
+            Some(next.ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?);
     }
     Ok(children)
 }
@@ -1184,10 +1183,10 @@ pub async fn materialize_paths(
     dir: &Path,
     paths: &[PathBuf],
 ) -> Result<()> {
-    let mut checkout = store.checkout_exact(generation).await?;
+    let generation = store.generation(generation).await?;
     for path in paths {
-        crate::rewind::materialize_path_into_checkout(
-            &mut checkout,
+        crate::rewind::materialize_path_from_generation(
+            &generation,
             dir,
             path,
             crate::rewind::PathReplace::LiveMount,
