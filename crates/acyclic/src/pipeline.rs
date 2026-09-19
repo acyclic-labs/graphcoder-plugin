@@ -1928,16 +1928,13 @@ impl Pipeline {
     async fn scratch_checkout(&mut self, base: GenerationId) -> Result<Arc<SharedLocalCheckout>> {
         let checkout = self
             .store
-            .volume
+            .workspace
             .checkout(
                 acyclic_fs::model::GenerationSelector::Exact(base),
                 crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
             )
             .await
-            .map_err(EngineError::fs("scratch checkout"))?
-            .value;
+            .map_err(EngineError::fs("scratch checkout"))?;
         Ok(Arc::new(SharedLocalCheckout::with_publication(
             checkout,
             MountPublication::Manual,
@@ -1990,16 +1987,13 @@ impl Pipeline {
         // front of a fork.
         let checkout = self
             .store
-            .volume
+            .workspace
             .checkout(
                 acyclic_fs::model::GenerationSelector::Exact(base),
                 crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
             )
             .await
-            .map_err(EngineError::fs("fork checkout"))?
-            .value;
+            .map_err(EngineError::fs("fork checkout"))?;
         let config = checkout.volume_config();
         let volume_id = checkout.volume_id();
         Ok(ForkSeed {
@@ -2093,16 +2087,13 @@ impl Pipeline {
         self.state = State::Rewinding;
         self.store.checkout = self
             .store
-            .volume
+            .workspace
             .checkout(
                 acyclic_fs::model::GenerationSelector::Head,
                 crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
             )
             .await
-            .map_err(EngineError::fs("refresh checkout"))?
-            .value;
+            .map_err(EngineError::fs("refresh checkout"))?;
         let row = self.index.record(
             generation,
             CheckpointKind::Manual,

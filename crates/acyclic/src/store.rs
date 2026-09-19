@@ -22,8 +22,6 @@ use crate::{EngineError, Result};
 
 /// Concrete checkout type for the local backend.
 pub type LocalCheckout = Checkout<LocalAuthorityBackend, LocalObjectBackend>;
-/// Concrete volume type for the local backend.
-pub type LocalVolume = acyclic_fs::LocalVolume;
 /// Concrete workspace type for the local backend.
 pub type LocalWorkspace = acyclic_fs::Workspace<LocalAuthorityBackend, LocalObjectBackend>;
 
@@ -181,7 +179,6 @@ pub struct StoreMeta {
 pub struct Store {
     pub fs: LocalFs,
     pub workspace: LocalWorkspace,
-    pub volume: LocalVolume,
     pub checkout: LocalCheckout,
     pub volume_id: VolumeId,
     pub paths: StorePaths,
@@ -311,20 +308,15 @@ impl Store {
             .await
             .map_err(EngineError::fs("create volume"))?
             .value;
-        let checkout = volume
-            .checkout(
-                GenerationSelector::Head,
-                writable_head(),
-                WorkCounters::UNBOUNDED,
-                &cancel,
-            )
-            .await
-            .map_err(EngineError::fs("checkout head"))?
-            .value;
         let workspace = fs
             .open_volume_workspace("main", volume_id)
             .await
             .map_err(EngineError::fs("adopt workspace"))?;
+        let checkout = workspace
+            .checkout(GenerationSelector::Head, writable_head())
+            .await
+            .map_err(EngineError::fs("checkout head"))?;
+        drop(volume);
 
         let repo_root = repo_root.canonicalize()?;
         let meta = StoreMeta {
@@ -336,7 +328,6 @@ impl Store {
         Ok(Self {
             fs,
             workspace,
-            volume,
             checkout,
             volume_id,
             paths,
@@ -383,20 +374,15 @@ impl Store {
             .value;
         let volume_ms = crate::trace::ms(phase);
         let phase = std::time::Instant::now();
-        let checkout = volume
-            .checkout(
-                GenerationSelector::Head,
-                writable_head(),
-                WorkCounters::UNBOUNDED,
-                &cancel,
-            )
-            .await
-            .map_err(EngineError::fs("checkout head"))?
-            .value;
         let workspace = fs
             .open_volume_workspace("main", meta.volume_id)
             .await
             .map_err(EngineError::fs("adopt workspace"))?;
+        let checkout = workspace
+            .checkout(GenerationSelector::Head, writable_head())
+            .await
+            .map_err(EngineError::fs("checkout head"))?;
+        drop(volume);
         crate::trace!(
             "store",
             "open: object store {objects_ms:.1}ms, volume {volume_ms:.1}ms, head checkout {:.1}ms",
@@ -405,7 +391,6 @@ impl Store {
         Ok(Self {
             fs,
             workspace,
-            volume,
             checkout,
             volume_id: meta.volume_id,
             paths,
