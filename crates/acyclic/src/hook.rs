@@ -304,15 +304,20 @@ fn record_lease(repo: &Path, tool: Option<&str>, path: Option<&str>) {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    // Repo-relative, and no tab: the file is tab separated and a reader must
-    // never mis-split a line.
+    // Repo-relative with `/` separators whatever the host wrote, and no tab:
+    // a reader compares these against paths from `diff` and the file is tab
+    // separated, so a line must never mis-split.
     let path = path
         .map(|p| {
-            p.trim_start_matches(&*repo.to_string_lossy())
-                .trim_start_matches('/')
+            let p = Path::new(p);
+            let rel = p.strip_prefix(repo).unwrap_or(p);
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
         })
         .filter(|p| !p.is_empty() && !p.contains('\t'))
-        .unwrap_or("*");
+        .unwrap_or_else(|| "*".to_owned());
     let tool = tool.filter(|t| !t.contains('\t')).unwrap_or("?");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
