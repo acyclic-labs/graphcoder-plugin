@@ -1595,7 +1595,10 @@ impl Pipeline {
         if self.config.auto_checkpoint_idle_ms == 0 {
             return;
         }
-        if self.state == State::NeedsBaseline && self.ensure_ready().await.is_err() {
+        // An idle daemon must remain O(1) in repository size. The first
+        // consumer operation that needs authenticated contents performs the
+        // baseline; a timer alone is not such an operation.
+        if self.state == State::NeedsBaseline {
             return;
         }
         if self.state != State::Ready {
