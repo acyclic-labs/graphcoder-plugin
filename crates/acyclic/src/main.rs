@@ -91,6 +91,11 @@ enum Command {
     Turns {
         #[arg(long)]
         session: Option<String>,
+        /// Newest first, like `timeline --limit`. A long session has one turn
+        /// per prompt, so the default is the recent history rather than all of
+        /// it.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// One checkpoint resolved to its session, turn, and prompt.
     Show { checkpoint: i64 },
@@ -669,7 +674,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Turns { session } => {
+        Command::Turns { session, limit } => {
             let reply = client.call(proto::Op::Turns {
                 session_id: session,
             })?;
@@ -680,7 +685,11 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 println!("no turns recorded (the user-prompt hook records them)");
                 return Ok(());
             }
-            for turn in turns {
+            // Trimmed here rather than in the protocol: the daemon already
+            // answers with the session's turns, and a limit is a display
+            // concern. Newest first, matching `timeline`.
+            let hidden = turns.len().saturating_sub(limit);
+            for turn in turns.into_iter().take(limit) {
                 let range = match (turn.first_checkpoint, turn.last_checkpoint) {
                     (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
                     (Some(first), _) => format!("#{first}"),
@@ -694,6 +703,9 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     range,
                     brief::quote(&turn.prompt, 72),
                 );
+            }
+            if hidden > 0 {
+                println!("… {hidden} older turn(s) not shown (--limit)");
             }
             Ok(())
         }

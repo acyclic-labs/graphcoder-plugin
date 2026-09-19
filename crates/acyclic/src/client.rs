@@ -144,12 +144,26 @@ impl Client {
         self.stream
             .read_line(&mut response_line)
             .map_err(|error| format!("receive: {error}"))?;
-        let response: proto::Response =
-            serde_json::from_str(&response_line).map_err(|error| format!("decode: {error}"))?;
-        match response.payload {
-            proto::Payload::Ok(reply) => Ok(*reply),
-            proto::Payload::Err { message } => Err(message),
-        }
+        // A daemon that exits mid-answer closes the socket, so the read
+        // succeeds with nothing. Left to serde that surfaced as
+        // "decode: EOF while parsing a value at line 1 column 0", which reads
+        // like corruption rather than what it is: the daemon stopped. Anyone
+        // running `stop` and then any other verb hit it.
+        parse_response(&response_line)
+    }
+}
+
+/// One response line to a reply. Split out from the socket so the
+/// shutdown case can be tested without a daemon.
+fn parse_response(line: &str) -> Result<proto::Reply, String> {
+    if line.trim().is_empty() {
+        return Err("daemon stopped while answering; nothing was recorded".to_owned());
+    }
+    let response: proto::Response =
+        serde_json::from_str(line).map_err(|error| format!("decode: {error}"))?;
+    match response.payload {
+        proto::Payload::Ok(reply) => Ok(*reply),
+        proto::Payload::Err { message } => Err(message),
     }
 }
 
@@ -333,5 +347,63 @@ fn wait_for_socket(
             reported = true;
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_socket_says_the_daemon_stopped() {
+        // The regression: a daemon that exits mid-answer closes the socket, the
+        // read succeeds with nothing, and serde called that
+        // "decode: EOF while parsing a value at line 1 column 0" — which reads
+        // as corruption. Anyone running `stop` then any other verb saw it.
+        for line in ["", "\n", "   \n"] {
+            let error = parse_response(line).expect_err("empty must be an error");
+            assert!(
+                error.contains("daemon stopped"),
+                "unhelpful message for {line:?}: {error}"
+            );
+            assert!(!error.contains("decode"), "leaked serde wording: {error}");
+        }
+    }
+
+    #[test]
+    fn malformed_json_still_reports_a_decode_error() {
+        // Genuine corruption must stay distinguishable from a clean shutdown.
+        let error = parse_response("{not json").expect_err("must be an error");
+        assert!(error.starts_with("decode:"), "{error}");
+    }
+
+    #[test]
+    fn an_error_payload_surfaces_its_own_message() {
+        // Built from the protocol types and serialized, rather than a
+        // hand-written literal: the payload is flattened and renamed, so a
+        // literal here would test my guess at the wire format instead of the
+        // format. The first attempt did exactly that and failed.
+        let line = serde_json::to_string(&proto::Response {
+            id: 1,
+            payload: proto::Payload::Err {
+                message: "no such checkpoint".to_owned(),
+            },
+        })
+        .expect("serialize");
+        let error = parse_response(&line).expect_err("must be an error");
+        assert_eq!(error, "no such checkpoint");
+    }
+
+    #[test]
+    fn an_ok_payload_round_trips() {
+        let line = serde_json::to_string(&proto::Response {
+            id: 1,
+            payload: proto::Payload::Ok(Box::new(proto::Reply::Pong)),
+        })
+        .expect("serialize");
+        assert!(matches!(
+            parse_response(&line).expect("ok payload"),
+            proto::Reply::Pong
+        ));
     }
 }
