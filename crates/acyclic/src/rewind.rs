@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::{
     durable_rename, exchange_native_entries, materialize_checkout_host_path,
-    publish_native_exchange, IdempotencyKey, MaterializeError, MaterializeOptions, RenameMode,
+    prepare_native_exchange_with_recovery, publish_native_exchange, recover_native_exchange,
+    IdempotencyKey, MaterializeError, MaterializeOptions, NativeExchangeJournal, RenameMode,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ pub(crate) struct PreparedRewind<'a> {
     parent: PathBuf,
     name: String,
     journal_path: PathBuf,
+    staging_journal_path: PathBuf,
     carried: Vec<PathBuf>,
     trash_ttl_days: u32,
 }
@@ -526,10 +528,12 @@ pub(crate) async fn prepare<'a>(
     let nonce = std::process::id();
     let tmp = parent.join(format!(".{name}.{}-tmp-{nonce}", crate::product::NAME));
     let journal_path = store.paths.rewind_journal();
+    let staging_journal_path = journal_path.with_extension("staging.json");
 
     // A failed previous exchange may have left a complete tree in scratch.
     // Resolve its journal before reusing either the temporary name or journal.
     recover(&journal_path)?;
+    let _ = std::fs::remove_file(&staging_journal_path);
 
     // 1. Materialize the target into an empty sibling directory. A tmp left
     // by an earlier attempt that failed before the swap is stale by
@@ -541,7 +545,7 @@ pub(crate) async fn prepare<'a>(
         EngineError::Restore(format!("rewind: stage {}: {error}", tmp.display()))
     })?;
     write_journal(
-        &journal_path,
+        &staging_journal_path,
         &Journal {
             target_generation: hex::encode(target.digest().as_bytes()),
             repo_root: repo.clone(),
@@ -566,7 +570,7 @@ pub(crate) async fn prepare<'a>(
         .await
         .map_err(|error| {
             let _ = std::fs::remove_dir_all(&tmp);
-            let _ = std::fs::remove_file(&journal_path);
+            let _ = std::fs::remove_file(&staging_journal_path);
             EngineError::Restore(format!("materialize: {error:?}"))
         })?;
 
@@ -582,6 +586,7 @@ pub(crate) async fn prepare<'a>(
         parent: parent.to_path_buf(),
         name,
         journal_path,
+        staging_journal_path,
         carried,
         trash_ttl_days,
     })
@@ -589,23 +594,20 @@ pub(crate) async fn prepare<'a>(
 
 impl PreparedRewind<'_> {
     pub(crate) fn mark_restoring_head(&self) -> Result<()> {
-        write_journal(
+        std::fs::remove_file(&self.staging_journal_path)?;
+        prepare_native_exchange_with_recovery(
             &self.journal_path,
-            &Journal {
-                target_generation: hex::encode(self.target.digest().as_bytes()),
-                repo_root: self.store.repo_root.clone(),
-                tmp: self.tmp.clone(),
-                phase: Phase::RestoringHead,
-                carried: self.carried.clone(),
-            },
+            &self.store.repo_root,
+            &self.tmp,
+            publication_key(self.target)?,
+            self.carried.clone(),
+            self.target.digest().as_bytes().to_vec(),
         )
+        .map_err(|error| EngineError::Restore(format!("prepare tree publication: {error}")))
     }
 
     pub(crate) fn publish(self) -> Result<RewindOutcome> {
         let repo = &self.store.repo_root;
-        // The staging-only legacy phase has served its purpose. From this point
-        // the SDK owns the durable carry/exchange journal at the same path.
-        std::fs::remove_file(&self.journal_path)?;
         let locator = publish_locator(repo, &self.journal_path)?;
         let exchange = publish_native_exchange(
             &self.journal_path,
@@ -664,7 +666,21 @@ pub fn recover(journal_path: &Path) -> Result<Option<RecoveredSwap>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let journal: Journal = serde_json::from_str(&text)
+    if let Ok(journal) = serde_json::from_str::<NativeExchangeJournal>(&text) {
+        let target = decode_generation(&hex::encode(&journal.recovery))?;
+        let outcome = recover_native_exchange(journal_path)
+            .map_err(|error| EngineError::Restore(format!("recover native exchange: {error}")))?;
+        return Ok(Some(RecoveredSwap {
+            published: outcome.published,
+            old_tree: outcome.displaced,
+            target,
+        }));
+    }
+    recover_legacy(journal_path, &text)
+}
+
+fn recover_legacy(journal_path: &Path, text: &str) -> Result<Option<RecoveredSwap>> {
+    let journal: Journal = serde_json::from_str(text)
         .map_err(|error| EngineError::Restore(format!("rewind journal: {error}")))?;
     let target = decode_generation(&journal.target_generation)?;
     #[cfg(windows)]
