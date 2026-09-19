@@ -186,6 +186,32 @@ fn p(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[test]
+fn batch_reads_preserve_order_and_non_regular_absence() {
+    let rig = Rig::start();
+    rig.runtime.block_on(async {
+        let generation = rig.handle.publish_head().await.expect("head");
+        let contents = rig
+            .handle
+            .read_files(
+                generation,
+                vec![p("src/shared.txt"), p("missing"), p("src"), p("bin.dat")],
+            )
+            .await
+            .expect("batch read");
+        assert_eq!(
+            contents,
+            vec![
+                (p("src/shared.txt"), Some(b"1\n2\n3\n".to_vec())),
+                (p("missing"), None),
+                (p("src"), None),
+                (p("bin.dat"), Some(b"\x00\x01\x02".to_vec())),
+            ]
+        );
+    });
+    rig.finish();
+}
+
 /// The plan over a realistic overlap: disjoint paths on both sides, a file
 /// merged by content, an identical change, and independent additions under
 /// one directory. Then M = H + entries holds exactly the expected tree.

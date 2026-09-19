@@ -541,16 +541,26 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
     let record = lookup
         .record
         .ok_or_else(|| EngineError::Fs(format!("{}: absent", path.display())))?;
+    read_regular_record(checkout, &namespace, record, path).await
+}
+
+async fn read_regular_record(
+    checkout: &mut LocalCheckout,
+    namespace: &NamespacePath,
+    record: FileRecord,
+    display_path: &Path,
+) -> Result<Vec<u8>> {
     let length = match record.payload {
         acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
         acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
         _ => {
             return Err(EngineError::Fs(format!(
                 "{}: not a regular file",
-                path.display()
+                display_path.display()
             )))
         }
     };
+    let cancel = CancellationToken::new();
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
     let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
@@ -559,7 +569,7 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
         let take = chunk.min(length - offset);
         let read = checkout
             .read_file_range(
-                &namespace,
+                namespace,
                 ByteRange {
                     offset,
                     length: take,
@@ -576,26 +586,38 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
     Ok(out)
 }
 
-/// Content of `path` in `generation` if it is a regular file there.
-pub async fn read_file(
+/// Contents of regular files in one generation, preserving request order.
+/// Opens and authenticates the generation once and resolves every namespace
+/// path in one SDK batch; absent and non-regular entries remain `None`.
+pub async fn read_files(
     store: &Store,
     generation: GenerationId,
-    path: &Path,
-) -> Result<Option<Vec<u8>>> {
+    paths: &[PathBuf],
+) -> Result<Vec<Option<Vec<u8>>>> {
     let mut checkout = store.checkout_exact(generation).await?;
-    let cancel = CancellationToken::new();
-    let namespace = namespace_of(path)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("lookup"))?
-        .value;
-    match lookup.record {
-        Some(record) if record.kind == FileKind::Regular => {
-            Ok(Some(read_regular(&mut checkout, path).await?))
-        }
-        _ => Ok(None),
+    let namespaces = paths
+        .iter()
+        .map(|path| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    if namespaces.is_empty() {
+        return Ok(Vec::new());
     }
+    let cancel = CancellationToken::new();
+    let lookup = checkout
+        .lookup_batch_no_follow(&namespaces, WorkCounters::UNBOUNDED, &cancel)
+        .await
+        .map_err(EngineError::fs("batch lookup"))?
+        .value;
+    let mut contents = Vec::with_capacity(paths.len());
+    for ((path, namespace), entry) in paths.iter().zip(namespaces).zip(lookup.entries) {
+        match entry.record {
+            Some(record) if record.kind == FileKind::Regular => contents.push(Some(
+                read_regular_record(&mut checkout, &namespace, record, path).await?,
+            )),
+            _ => contents.push(None),
+        }
+    }
+    Ok(contents)
 }
 
 async fn read_mode(checkout: &mut LocalCheckout, path: &Path) -> Result<Option<u32>> {

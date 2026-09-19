@@ -1253,12 +1253,9 @@ impl Pipeline {
                 reply,
             } => {
                 let result = Box::pin(async {
-                    let mut out = Vec::with_capacity(paths.len());
-                    for path in paths {
-                        let bytes = crate::merge::read_file(&self.store, generation, &path).await?;
-                        out.push((path, bytes));
-                    }
-                    Ok(out)
+                    let contents =
+                        crate::merge::read_files(&self.store, generation, &paths).await?;
+                    Ok(paths.into_iter().zip(contents).collect())
                 })
                 .await;
                 let _ = reply.send(result);
