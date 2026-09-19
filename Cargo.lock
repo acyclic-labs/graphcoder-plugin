@@ -29,7 +29,6 @@ dependencies = [
 name = "acyclic-fs"
 version = "0.2.0-rc.5"
 dependencies = [
- "acyclic-linux-io",
  "acyclic-objects",
  "acyclic-stream",
  "async-trait",
@@ -42,6 +41,7 @@ dependencies = [
  "fuser",
  "futures",
  "hex",
+ "io-uring",
  "libc",
  "notify",
  "prost",
@@ -58,18 +58,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "acyclic-linux-io"
-version = "0.1.0-rc.1"
-dependencies = [
- "io-uring",
- "libc",
-]
-
-[[package]]
 name = "acyclic-objects"
 version = "1.0.0-rc.4"
 dependencies = [
- "acyclic-linux-io",
  "async-trait",
  "blake3",
  "bytes",
