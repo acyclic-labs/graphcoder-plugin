@@ -279,6 +279,8 @@ impl Request {
             Self::Status { .. }
                 | Self::TurnStarted { .. }
                 | Self::RecordGeneration { .. }
+                | Self::SessionStarted { .. }
+                | Self::SessionEnded { .. }
                 | Self::Shutdown { .. }
         )
     }
@@ -1304,7 +1306,10 @@ impl Pipeline {
                 let result = async {
                     self.index.session_started(&session_id, &host)?;
                     // Session start is a coarse boundary.
-                    self.commit_engine().await
+                    if self.state == State::Ready {
+                        self.commit_engine().await?;
+                    }
+                    Ok(())
                 }
                 .await;
                 let _ = reply.send(result);
@@ -1313,7 +1318,10 @@ impl Pipeline {
             Request::SessionEnded { session_id, reply } => {
                 let result = async {
                     self.index.session_ended(&session_id)?;
-                    self.commit_engine().await
+                    if self.state == State::Ready {
+                        self.commit_engine().await?;
+                    }
+                    Ok(())
                 }
                 .await;
                 let _ = reply.send(result);
@@ -2379,6 +2387,21 @@ mod readiness_tests {
             session_id: "session".to_owned(),
             prompt: "prompt".to_owned(),
             reply: turn_reply,
+        }
+        .requires_ready());
+
+        let (started_reply, _) = oneshot::channel();
+        assert!(!Request::SessionStarted {
+            session_id: "session".to_owned(),
+            host: "host".to_owned(),
+            reply: started_reply,
+        }
+        .requires_ready());
+
+        let (ended_reply, _) = oneshot::channel();
+        assert!(!Request::SessionEnded {
+            session_id: "session".to_owned(),
+            reply: ended_reply,
         }
         .requires_ready());
 
