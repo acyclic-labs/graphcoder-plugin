@@ -1007,7 +1007,7 @@ pub fn subtree_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     sorted.sort();
     let mut roots: Vec<PathBuf> = Vec::new();
     for path in sorted {
-        if !roots.iter().any(|root| path.starts_with(root)) {
+        if roots.last().is_none_or(|root| !path.starts_with(root)) {
             roots.push(path);
         }
     }
