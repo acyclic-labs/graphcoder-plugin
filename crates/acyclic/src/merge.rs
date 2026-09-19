@@ -22,8 +22,8 @@ use acyclic_fs::text_merge::{
     merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
 };
 use acyclic_fs::{
-    AuthoredMutation, ByteRange, CancellationToken, FileRecordRangeReadRequest, GenerationId,
-    WorkCounters,
+    AuthoredMutation, ByteRange, CancellationToken, DirectoryRecordPageRequest,
+    FileRecordRangeReadRequest, GenerationId, WorkCounters,
 };
 use bytes::Bytes;
 
@@ -849,34 +849,60 @@ fn child_path(
         .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
 }
 
-async fn list_children(
-    checkout: &mut LocalCheckout,
-    namespace: &NamespacePath,
+async fn list_child_paths(
+    checkout: &LocalCheckout,
+    directories: &[NamespacePath],
     cancel: &CancellationToken,
-) -> Result<Vec<acyclic_fs::kernel::LogicalName>> {
-    let mut names = Vec::new();
-    let mut after = None;
-    loop {
-        let page = checkout
-            .list_directory_records(
-                namespace,
-                after.as_ref(),
-                PAGE_ENTRIES,
+) -> Result<Vec<NamespacePath>> {
+    if directories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limits = checkout.volume_config().limits;
+    let reader = checkout
+        .pinned_reader()
+        .map_err(EngineError::fs("open directory reader"))?;
+    let mut pending = directories
+        .iter()
+        .cloned()
+        .map(|path| DirectoryRecordPageRequest {
+            path,
+            after: None,
+            maximum_entries: PAGE_ENTRIES,
+        })
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    while !pending.is_empty() {
+        let pages = reader
+            .list_directory_record_pages(
+                &pending,
+                FILE_READ_CONCURRENCY,
                 WorkCounters::UNBOUNDED,
                 cancel,
             )
             .await
-            .map_err(EngineError::fs("list directory"))?
+            .map_err(EngineError::fs("batch list directories"))?
             .value;
-        for entry in &page.entries {
-            names.push(entry.name.clone());
+        let mut next = Vec::new();
+        for (request, page) in pending.into_iter().zip(pages) {
+            for entry in &page.entries {
+                children.push(child_path(&request.path, &entry.name, limits)?);
+            }
+            if page.has_more {
+                let after = page
+                    .entries
+                    .last()
+                    .ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?
+                    .name
+                    .clone();
+                next.push(DirectoryRecordPageRequest {
+                    after: Some(after),
+                    ..request
+                });
+            }
         }
-        match page.entries.last() {
-            Some(last) if page.has_more => after = Some(last.name.clone()),
-            _ => break,
-        }
+        pending = next;
     }
-    Ok(names)
+    Ok(children)
 }
 
 /// Removes `namespace` from `dst`, recursively for directories; absent is
@@ -888,7 +914,6 @@ async fn remove_subtree(
     namespace: &NamespacePath,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let limits = dst.volume_config().limits;
     let mut frontier = vec![namespace.clone()];
     let mut levels = Vec::new();
     while !frontier.is_empty() {
@@ -905,14 +930,12 @@ async fn remove_subtree(
         if nodes.is_empty() {
             break;
         }
-        frontier = Vec::new();
-        for (path, record) in &nodes {
-            if record.kind == FileKind::Directory {
-                for name in list_children(dst, path, cancel).await? {
-                    frontier.push(child_path(path, &name, limits)?);
-                }
-            }
-        }
+        let directories = nodes
+            .iter()
+            .filter(|(_, record)| record.kind == FileKind::Directory)
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        frontier = list_child_paths(dst, &directories, cancel).await?;
         levels.push(nodes);
     }
     let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
@@ -944,7 +967,6 @@ async fn copy_node(
     namespace: &NamespacePath,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let limits = src.volume_config().limits;
     let mut frontier = vec![namespace.clone()];
     while !frontier.is_empty() {
         let lookup = src
@@ -974,7 +996,12 @@ async fn copy_node(
             .map_err(EngineError::fs("batch subtree metadata"))?
             .value;
         let regular = read_regular_frontier(&reader, &nodes, cancel).await?;
-        frontier = Vec::new();
+        let directories = nodes
+            .iter()
+            .filter(|(_, record)| record.kind == FileKind::Directory)
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        frontier = list_child_paths(src, &directories, cancel).await?;
         let mut mutations = Vec::with_capacity(nodes.len());
         for (index, ((path, record), metadata)) in nodes.into_iter().zip(metadata).enumerate() {
             match record.kind {
@@ -1001,13 +1028,7 @@ async fn copy_node(
                     });
                 }
                 FileKind::Directory => {
-                    mutations.push(AuthoredMutation::CreateDirectory {
-                        path: path.clone(),
-                        metadata,
-                    });
-                    for name in list_children(src, &path, cancel).await? {
-                        frontier.push(child_path(&path, &name, limits)?);
-                    }
+                    mutations.push(AuthoredMutation::CreateDirectory { path, metadata });
                 }
                 other => {
                     return Err(EngineError::Fs(format!(
