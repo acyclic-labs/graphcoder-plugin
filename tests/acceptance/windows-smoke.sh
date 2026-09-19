@@ -10,7 +10,7 @@
 #     (a daemon that inherits it never lets the caller see EOF)
 #   - capture and diff under UTF-16LE names, non-ASCII included
 #   - rewind, which renames the repo root and so trips every open handle
-#   - copy forks and promote while ProjFS imports remain unproven
+#   - ProjFS-accelerated forks when available, with copy fallback otherwise
 #
 # Runs under Git Bash on a GitHub windows runner. ACYCLIC_BIN overrides the
 # binary (default: target/release/acyclic.exe).
@@ -102,16 +102,19 @@ grep -q 'ORIGINAL CONTENT LINE' src/main.rs || fail "rewind did not restore main
 [ -d .git ] || fail "rewind lost .git"
 metric rewind
 
-echo "--- copy fork writes and promote land"
+echo "--- fork writes and promote land"
 "$ACYCLIC" fork -n 1 < /dev/null > /dev/null || fail "fork failed"
 fork_row="$("$ACYCLIC" forks < /dev/null | head -1)"
 fork_id="$(awk '{print $1}' <<< "$fork_row")"
 fork_mode="$(awk '{print $2}' <<< "$fork_row")"
 [ -n "$fork_id" ] || fail "no fork id"
-[ "$fork_mode" = copy ] || fail "Windows fork is not in verified copy mode: $fork_row"
-fork_dir="$(dirname "$REPO")/.$(basename "$REPO").forks/copy/$fork_id"
-[ -d "$fork_dir" ] || fail "no copy-fork directory at $fork_dir"
-metric copy_fork
+case "$fork_mode" in
+  mount) fork_dir="$(dirname "$REPO")/.$(basename "$REPO").forks/mnt/$fork_id" ;;
+  copy) fork_dir="$(dirname "$REPO")/.$(basename "$REPO").forks/copy/$fork_id" ;;
+  *) fail "Windows fork reported an unknown mode: $fork_row" ;;
+esac
+[ -d "$fork_dir" ] || fail "no $fork_mode fork directory at $fork_dir"
+metric "${fork_mode}_fork"
 printf 'FORK WORK\n' > "$fork_dir/note.txt"
 printf 'edited in fork\n' > "$fork_dir/a.txt"
 "$ACYCLIC" fork-diff "$fork_id" < /dev/null | grep -q 'note.txt' \

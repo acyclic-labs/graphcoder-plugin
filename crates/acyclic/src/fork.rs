@@ -68,9 +68,6 @@ impl MountCapability {
 }
 
 /// Live probe of the native mount provider.
-///
-/// Windows forks use copies until `ProjFS` can capture every admitted host
-/// mutation, including imports from outside its virtualized namespace.
 pub fn mount_capability() -> MountCapability {
     let probe = probe_native_mount();
     let provider = match probe.kind {
@@ -79,19 +76,6 @@ pub fn mount_capability() -> MountCapability {
         Some(NativeMountKind::WindowsProjFs) => "projfs",
         None => "none",
     };
-    #[cfg(windows)]
-    {
-        let _ = probe.available;
-        MountCapability {
-            provider,
-            available: false,
-            reason: Some(
-                "ProjFS cannot capture every external import into a writable fork; forks use copies"
-                    .to_owned(),
-            ),
-        }
-    }
-    #[cfg(not(windows))]
     MountCapability {
         provider,
         available: probe.available,
@@ -120,10 +104,11 @@ pub fn mount_setup_hint() -> &'static str {
         )
     } else if cfg!(windows) {
         concat!(
-            "forks use full copies on Windows. ProjFS cannot capture every\n",
-            "external import into a writable fork, so mounted forks are not\n",
-            "admitted. Safe Mode (dry_run) cannot shadow an existing Windows\n",
-            "directory with ProjFS.",
+            "forks will use full copies until the optional Windows Projected File System\n",
+            "feature is enabled and available to this process. Enable Client-ProjFS in\n",
+            "Windows Features to use accelerated forks. ProjFS safely rejects cross-root\n",
+            "directory moves that it cannot capture atomically. Safe Mode (dry_run) cannot\n",
+            "shadow an existing Windows directory with ProjFS.",
         )
     } else {
         "native mounts are not supported on this platform; forks use full copies \
