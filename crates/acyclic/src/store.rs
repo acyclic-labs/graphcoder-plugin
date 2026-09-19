@@ -3,9 +3,9 @@
 //! Everything lives OUTSIDE the working tree (capture snapshots the whole
 //! tree and fail-closes on sockets). The repo carries only `.acyclic/config.toml`.
 
-use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
-use std::{fs::OpenOptions, io::Write};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use acyclic_fs::model::{
     AccessMode, CheckoutMode, ConsistencyMode, GenerationSelector, Lifecycle, MutationMode,
@@ -469,7 +469,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(target_os = "windows")]
 pub(crate) fn durable_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("bin.tmp");
-    let mut file = OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -477,32 +477,7 @@ pub(crate) fn durable_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    let from: Vec<u16> = tmp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let to: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: both paths are terminated UTF-16 buffers live for this call.
-    #[allow(unsafe_code)]
-    let replaced = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    acyclic_fs::durable_rename(&tmp, path, true)?;
     Ok(())
 }
 
