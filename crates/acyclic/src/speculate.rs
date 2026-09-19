@@ -300,9 +300,6 @@ pub fn spawn(
     let thread_config = config.clone();
     let thread = std::thread::Builder::new()
         .name(format!("{}-speculate", acyclic::product::NAME))
-        // The fs futures a diff pulls in are large; match the pipeline's
-        // headroom rather than the 2 MiB default.
-        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             // `enable_all`, not just timers: a model run is a child
             // process, which needs the IO and signal drivers.

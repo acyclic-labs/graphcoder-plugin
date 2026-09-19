@@ -708,11 +708,6 @@ pub fn spawn(
     let (sender, receiver) = mpsc::channel(1024);
     let thread = std::thread::Builder::new()
         .name(format!("{}-pipeline", crate::product::NAME))
-        // The fs facade's futures are large and a few of them nest per
-        // request (a subtree copy, a restore); the 2 MiB default is tight
-        // in debug builds. Virtual reservation only: untouched pages cost
-        // nothing.
-        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
