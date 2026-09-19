@@ -7,44 +7,15 @@
 //! the volume); the daemon owns the mount sessions (they must live in the
 //! long-lived process).
 //!
-//! When the host has no mount provider (no usable `/dev/fuse` on Linux, or
-//! loopback NFS blocked on macOS) a fork degrades to a *copy*: the base
-//! generation is materialized into a real directory, and at promote time
-//! that directory is captured back into the fork's overlay so the same
-//! commit, conflict check, and swap run unchanged. The promise a fork makes
-//! — a writable tree that never touches the real one until promoted — holds
-//! either way; only the O(1) creation cost is lost.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::SharedCheckout;
 use acyclic_fs::{
-    capture_baseline, capture_root_identity, probe_native_mount, CancellationToken, CaptureOptions,
-    GenerationId, LocalAuthorityBackend, LocalObjectBackend, NativeMountKind, VolumeId,
-    WorkCounters,
+    probe_native_mount, GenerationId, LocalAuthorityBackend, LocalObjectBackend, NativeMountKind,
+    VolumeId,
 };
-
-use crate::{EngineError, Result};
-
-/// How a fork is realized on this host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ForkMode {
-    /// Routed native mount: O(1) creation, lazy hydration.
-    Mount,
-    /// Materialized directory: full copy up front, captured back at promote.
-    Copy,
-}
-
-impl ForkMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ForkMode::Mount => "mount",
-            ForkMode::Copy => "copy",
-        }
-    }
-}
 
 /// What the host can do for fork mounts, probed once at daemon start and
 /// reported by `status`/`init`.
@@ -55,16 +26,6 @@ pub struct MountCapability {
     pub available: bool,
     /// Why not, when unavailable.
     pub reason: Option<String>,
-}
-
-impl MountCapability {
-    pub fn fork_mode(&self) -> ForkMode {
-        if self.available {
-            ForkMode::Mount
-        } else {
-            ForkMode::Copy
-        }
-    }
 }
 
 /// Live probe of the native mount provider.
@@ -89,53 +50,26 @@ pub fn mount_capability() -> MountCapability {
 pub fn mount_setup_hint() -> &'static str {
     if cfg!(target_os = "linux") {
         concat!(
-            "forks will use full copies until /dev/fuse is usable. To enable mounts:\n",
+            "forks require usable /dev/fuse. To enable mounts:\n",
             "  sudo modprobe fuse                          # load the kernel module\n",
             "  sudo usermod -aG fuse \"$USER\"               # if /dev/fuse is group-restricted; log in again\n",
             "  docker run --device /dev/fuse --cap-add SYS_ADMIN ...   # inside a container",
         )
     } else if cfg!(target_os = "macos") {
         concat!(
-            "forks will use full copies: the built-in NFS mount tools (/sbin/mount_nfs, /sbin/umount)\n",
+            "forks require the built-in NFS mount tools (/sbin/mount_nfs, /sbin/umount), which\n",
             "are missing or blocked by policy. No extra software is needed on macOS;\n",
             "ask your administrator to allow loopback NFS mounts.",
         )
     } else if cfg!(windows) {
         concat!(
-            "forks will use full copies until the optional Windows Projected File System\n",
-            "feature is enabled and available to this process. Enable Client-ProjFS in\n",
-            "Windows Features to use accelerated forks. ProjFS safely rejects cross-root\n",
+            "forks require the optional Windows Projected File System feature. Enable\n",
+            "Client-ProjFS in Windows Features. ProjFS safely rejects cross-root\n",
             "directory moves that it cannot capture atomically.",
         )
     } else {
-        "native mounts are not supported on this platform; forks use full copies."
+        "native mounts are required for forks and are not supported on this platform."
     }
-}
-
-/// Root for copy-mode fork directories (a sibling of the mount root).
-pub fn forks_copy_root(repo_root: &Path) -> Option<PathBuf> {
-    Some(forks_root(repo_root)?.join("copy"))
-}
-
-/// Captures the current content of `root` into a fork's overlay, so that
-/// promote sees it exactly as it would see writes through a mount.
-/// The overlay must be pristine (a fresh fork seed): capture is a full-tree
-/// baseline against the checkout, so only paths that actually differ from
-/// the base become pending mutations.
-pub async fn capture_copy(shared: &SharedLocalCheckout, root: &Path) -> Result<()> {
-    let options = CaptureOptions {
-        source_root: root.to_path_buf(),
-        expected_root_identity: capture_root_identity(root)
-            .map_err(EngineError::fs("copy root identity"))?,
-        maximum_paths: 4_000_000,
-        maximum_extent_spans: 65_536,
-    };
-    let cancel = CancellationToken::new();
-    let mut guard = shared.lock().await;
-    capture_baseline(&mut guard, &options, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("capture copy fork"))?;
-    Ok(())
 }
 
 /// The mount-safe checkout wrapper for the local backend.
@@ -258,32 +192,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_names_a_provider_and_picks_a_mode() {
+    fn probe_names_a_provider() {
         let capability = mount_capability();
         assert_ne!(capability.provider, "");
         assert_eq!(capability.available, capability.reason.is_none());
-        assert_eq!(
-            capability.fork_mode(),
-            if capability.available {
-                ForkMode::Mount
-            } else {
-                ForkMode::Copy
-            }
-        );
         assert!(!mount_setup_hint().is_empty());
-    }
-
-    #[test]
-    fn copy_root_sits_beside_mount_root() {
-        let repo = Path::new("/work/my-repo");
-        assert_eq!(
-            forks_copy_root(repo).expect("copy"),
-            Path::new("/work/.my-repo.forks/copy")
-        );
-        assert_eq!(
-            forks_mount_root(repo).expect("mnt"),
-            Path::new("/work/.my-repo.forks/mnt")
-        );
     }
 
     #[test]

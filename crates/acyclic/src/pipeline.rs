@@ -200,19 +200,6 @@ enum Request {
         paths: Vec<PathBuf>,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// Restores one path from `target` into `root` (a copy fork's directory).
-    RestorePathInto {
-        target: GenerationId,
-        root: PathBuf,
-        path: PathBuf,
-        reply: oneshot::Sender<Result<RestoreOutcome>>,
-    },
-    /// Copy-mode fork: write `generation` out to `destination`.
-    Materialize {
-        generation: GenerationId,
-        destination: PathBuf,
-        reply: oneshot::Sender<Result<()>>,
-    },
     Promote {
         shared: Arc<SharedLocalCheckout>,
         base: GenerationId,
@@ -527,34 +514,6 @@ impl PipelineHandle {
         )?
     }
 
-    /// Restores one path from `target` into `root` rather than the working tree.
-    pub async fn restore_path_into(
-        &self,
-        target: GenerationId,
-        root: PathBuf,
-        path: PathBuf,
-    ) -> Result<RestoreOutcome> {
-        request!(
-            self,
-            RestorePathInto {
-                target: target,
-                root: root,
-                path: path
-            }
-        )?
-    }
-
-    /// Copy-mode fork: materializes `generation` into `destination`.
-    pub async fn materialize(&self, generation: GenerationId, destination: PathBuf) -> Result<()> {
-        request!(
-            self,
-            Materialize {
-                generation: generation,
-                destination: destination
-            }
-        )?
-    }
-
     pub async fn promote(
         &self,
         shared: Arc<SharedLocalCheckout>,
@@ -792,14 +751,12 @@ fn fail_request(request: Request, message: &str) {
         Request::Diff { reply, .. } => drop(reply.send(Err(error()))),
         Request::Fork { reply } => drop(reply.send(Err(error()))),
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
-        Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
         Request::ScratchCheckout { reply, .. } => drop(reply.send(Err(error()))),
         Request::PublishHead { reply } => drop(reply.send(Err(error()))),
         Request::MergePlan { reply, .. } => drop(reply.send(Err(error()))),
         Request::BuildGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplyToOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ReadFiles { reply, .. } => drop(reply.send(Err(error()))),
-        Request::RestorePathInto { reply, .. } => drop(reply.send(Err(error()))),
         Request::MaterializePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
@@ -1186,26 +1143,6 @@ impl Pipeline {
                 ))
                 .await;
                 let _ = reply.send(result);
-                false
-            }
-            Request::RestorePathInto {
-                target,
-                root,
-                path,
-                reply,
-            } => {
-                let result =
-                    Box::pin(rewind::restore_path_into(&self.store, target, &root, &path)).await;
-                let _ = reply.send(result);
-                false
-            }
-            Request::Materialize {
-                generation,
-                destination,
-                reply,
-            } => {
-                let _ = reply
-                    .send(rewind::materialize_into(&self.store, generation, &destination).await);
                 false
             }
             Request::Promote {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::ipc;
 use crate::proto;
 use acyclic::config::Config;
-use acyclic::fork::{self, ForkMode, MountCapability, SharedLocalCheckout};
+use acyclic::fork::{self, MountCapability, SharedLocalCheckout};
 use acyclic::guard::GuardedMountFilesystem;
 use acyclic::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic::merge::{self, Entry};
@@ -36,9 +36,6 @@ struct ForkState {
     /// head it was rebased onto.
     base: acyclic::GenerationId,
     entry: proto::ForkEntry,
-    /// Copy-mode forks only: the materialized directory the user works in.
-    /// Captured back into `shared` at promote, removed at drop/promote.
-    copy_dir: Option<PathBuf>,
     /// Set by a conflicting promote until the markers are gone.
     conflict: Option<OpenConflict>,
 }
@@ -203,16 +200,11 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     lap("pipeline thread spawn (baseline runs on it)");
 
     let shutdown = Arc::new(Notify::new());
-    let mut mounts = fork::mount_capability();
+    let mounts = fork::mount_capability();
     lap("native mount probe");
-    // Test hook: exercise the copy-fork paths on a host that has mounts.
-    if std::env::var_os("ACYCLIC_FORCE_COPY_FORKS").is_some() {
-        mounts.available = false;
-        mounts.reason = Some("ACYCLIC_FORCE_COPY_FORKS is set".into());
-    }
     if !mounts.available {
         eprintln!(
-            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies",
+            "{NAME} daemon: mounts unavailable ({}): forks are disabled",
             mounts.reason.as_deref().unwrap_or("unknown reason")
         );
     }
@@ -702,10 +694,8 @@ impl Server {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in scratch_ids {
-                    let fork = self.forks.lock().await.remove(&id);
-                    let copy_dir = fork.and_then(|fork| fork.copy_dir);
-                    if let Err(error) = self.discard_fork_workspace(&id, copy_dir.as_deref()).await
-                    {
+                    self.forks.lock().await.remove(&id);
+                    if let Err(error) = self.detach_route(&id).await {
                         eprintln!("{NAME} daemon: drop scratch fork {id}: {error}");
                     }
                 }
@@ -750,8 +740,13 @@ impl Server {
                 if count == 0 || count > 16 {
                     return Err("fork count must be 1..=16".into());
                 }
-                if self.mounts.fork_mode() == ForkMode::Copy {
-                    return self.fork_copies(count, session_id).await;
+                if !self.mounts.available {
+                    return Err(format!(
+                        "native {} mounts are unavailable: {}\n{}",
+                        self.mounts.provider,
+                        self.mounts.reason.as_deref().unwrap_or("unknown reason"),
+                        fork::mount_setup_hint()
+                    ));
                 }
                 let root = fork::forks_mount_root(&self.repo_root)
                     .ok_or("repo root has no parent for fork workspaces")?;
@@ -764,7 +759,7 @@ impl Server {
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
-                        mode: ForkMode::Mount.as_str().to_owned(),
+                        mode: "mount".to_owned(),
                         base: acyclic::generation_hex(seed.base),
                         created_at: unix_now(),
                         session_id: session_id.clone(),
@@ -777,7 +772,6 @@ impl Server {
                             shared: seed.shared,
                             base: seed.base,
                             entry: clone_entry(&entry),
-                            copy_dir: None,
                             conflict: None,
                         },
                     );
@@ -796,10 +790,9 @@ impl Server {
             }
             proto::Op::ForkDrop { id } => {
                 let mut forks = self.forks.lock().await;
-                let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
+                forks.remove(&id).ok_or(format!("no fork {id}"))?;
                 drop(forks);
-                self.discard_fork_workspace(&id, fork.copy_dir.as_deref())
-                    .await?;
+                self.detach_route(&id).await?;
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Promote { id } => {
@@ -861,12 +854,8 @@ impl Server {
                     }
                     Ok(landed) => landed,
                 };
-                // Landed: the fork is consumed. Drop its route (mount fork)
-                // or its directory (copy fork).
-                if let Err(error) = self
-                    .discard_fork_workspace(&id, fork.copy_dir.as_deref())
-                    .await
-                {
+                // Landed: the fork is consumed. Drop its mount route.
+                if let Err(error) = self.detach_route(&id).await {
                     eprintln!("{NAME} daemon: discard fork {id} after promote: {error}");
                 }
                 match landed {
@@ -909,12 +898,11 @@ impl Server {
                 }
             }
             proto::Op::ForkDiff { id } => {
-                let (base, shared, capture_dir) = {
+                let (base, overlay) = {
                     let forks = self.forks.lock().await;
                     let fork = forks.get(&id).ok_or(format!("no fork {id}"))?;
-                    (fork.base, Arc::clone(&fork.shared), fork.copy_dir.clone())
+                    (fork.base, Arc::clone(&fork.shared))
                 };
-                let overlay = self.fork_view(base, shared, capture_dir.as_deref()).await?;
                 let changes = if overlay.lock().await.has_pending_mutations() {
                     let generation = self
                         .handle
@@ -928,8 +916,6 @@ impl Server {
                 } else {
                     Vec::new()
                 };
-                // Timestamps differ on a copy fork by construction; only
-                // content is a blast radius.
                 Ok(proto::Reply::Diff(
                     self.annotate_ignored(
                         changes
@@ -945,79 +931,6 @@ impl Server {
         }
     }
 
-    /// Copy-mode forks: materialize the base generation into a real
-    /// directory per fork. Same ids, lifecycle, and promote semantics as
-    /// mounted forks; creation is O(tree) instead of O(1).
-    async fn fork_copies(
-        &self,
-        count: u32,
-        session_id: Option<String>,
-    ) -> Result<proto::Reply, String> {
-        let root = fork::forks_copy_root(&self.repo_root)
-            .ok_or("repo root has no parent for fork workspaces")?;
-        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-        let mut created = Vec::new();
-        for _ in 0..count {
-            let seed = self.handle.fork().await.map_err(stringify)?;
-            let id = short_id();
-            let dir = root.join(&id);
-            self.handle
-                .materialize(seed.base, dir.clone())
-                .await
-                .map_err(stringify)?;
-            let entry = proto::ForkEntry {
-                id: id.clone(),
-                path: dir.display().to_string(),
-                mode: ForkMode::Copy.as_str().to_owned(),
-                base: acyclic::generation_hex(seed.base),
-                created_at: unix_now(),
-                session_id: session_id.clone(),
-                conflict_paths: Vec::new(),
-                conflict: None,
-            };
-            self.forks.lock().await.insert(
-                id,
-                ForkState {
-                    shared: seed.shared,
-                    base: seed.base,
-                    entry: clone_entry(&entry),
-                    copy_dir: Some(dir),
-                    conflict: None,
-                },
-            );
-            created.push(entry);
-        }
-        Ok(proto::Reply::Forks(created))
-    }
-
-    /// Uses the live overlay for mounted forks. Copy forks are reconciled
-    /// from the host tree into a scratch checkout before diff or promotion.
-    async fn fork_view(
-        &self,
-        base: acyclic::GenerationId,
-        shared: Arc<SharedLocalCheckout>,
-        capture_dir: Option<&Path>,
-    ) -> Result<Arc<SharedLocalCheckout>, String> {
-        let Some(dir) = capture_dir else {
-            return Ok(shared);
-        };
-        let started = std::time::Instant::now();
-        let scratch = self
-            .handle
-            .scratch_checkout(base)
-            .await
-            .map_err(stringify)?;
-        let scratch_ms = acyclic::trace::ms(started);
-        let capture_started = std::time::Instant::now();
-        fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
-        acyclic::trace!(
-            "daemon",
-            "copy fork capture: scratch {scratch_ms:.1}ms, full-tree capture {:.1}ms",
-            acyclic::trace::ms(capture_started)
-        );
-        Ok(scratch)
-    }
-
     /// Lands a fork in place. The fork's paths are merged onto the current
     /// head (a three-way merge when the mainline moved; a plain write of
     /// the fork's paths when it did not) and written onto the real tree
@@ -1030,10 +943,7 @@ impl Server {
         fork: &ForkState,
         label: &str,
     ) -> Result<Landed, String> {
-        let capture_dir = fork.copy_dir.as_deref();
-        let overlay = self
-            .fork_view(fork.base, Arc::clone(&fork.shared), capture_dir)
-            .await?;
+        let overlay = Arc::clone(&fork.shared);
         // A rebased fork must have resolved its markers before it can land.
         if let Some(conflict) = fork.conflict.as_ref() {
             self.refuse_unresolved_markers(&overlay, conflict).await?;
@@ -1042,13 +952,8 @@ impl Server {
         let head = self.handle.publish_head().await.map_err(stringify)?;
         acyclic::trace!(
             "daemon",
-            "promote {id}: publish_head {:.1}ms; {} fork, mainline {} since the fork's base",
+            "promote {id}: publish_head {:.1}ms; mainline {} since the fork's base",
             acyclic::trace::ms(publish_started),
-            if fork.copy_dir.is_some() {
-                "copy"
-            } else {
-                "mount"
-            },
             if head == fork.base {
                 "UNMOVED (plain in-place write)"
             } else {
@@ -1056,14 +961,7 @@ impl Server {
             }
         );
         let landed = self
-            .merge_onto_head(
-                id,
-                overlay,
-                fork.base,
-                head,
-                fork.copy_dir.as_deref(),
-                label,
-            )
+            .merge_onto_head(id, overlay, fork.base, head, label)
             .await;
         acyclic::trace!(
             "daemon",
@@ -1227,7 +1125,6 @@ impl Server {
         overlay: Arc<SharedLocalCheckout>,
         base: acyclic::GenerationId,
         head: acyclic::GenerationId,
-        copy_dir: Option<&Path>,
         label: &str,
     ) -> Result<Landed, String> {
         let moved = head != base;
@@ -1398,7 +1295,7 @@ impl Server {
                 )
                 .await
                 .map_err(stringify)?;
-            self.rebase_fork(id, snapshot, rebased, copy_dir).await?;
+            self.rebase_fork(id, snapshot, rebased).await?;
             let mut files: Vec<proto::ConflictEntry> = plan
                 .conflicted
                 .iter()
@@ -1495,15 +1392,13 @@ impl Server {
         })
     }
 
-    /// Makes the fork workspace equal to `rebased`: writes R − F into the
-    /// fork's directory, through the mount for a mounted fork. The real
-    /// tree is never touched.
+    /// Makes the mounted fork equal to `rebased` by writing R − F through
+    /// the mount. The real tree is never touched.
     async fn rebase_fork(
         &self,
         id: &str,
         snapshot: acyclic::GenerationId,
         rebased: acyclic::GenerationId,
-        copy_dir: Option<&Path>,
     ) -> Result<(), String> {
         let changed: Vec<PathBuf> = content_changes(
             self.handle
@@ -1515,53 +1410,16 @@ impl Server {
         .map(|change| change.path)
         .collect();
         let roots = merge::subtree_roots(&changed);
-        if let Some(dir) = copy_dir {
-            for root in &roots {
-                self.handle
-                    .restore_path_into(rebased, dir.to_path_buf(), root.clone())
-                    .await
-                    .map_err(stringify)?;
-            }
-        } else {
-            // A mounted fork: write THROUGH the mount, never behind it.
-            // The driver and the kernel keep name and attribute caches
-            // that only their own operations update; a write via the
-            // checkout leaves a file the fork had deleted invisible for
-            // good, and the FUSE transport has no invalidation at all.
-            let dir = fork::forks_mount_root(&self.repo_root)
-                .ok_or("repo root has no parent for fork workspaces")?
-                .join(id);
-            self.handle
-                .materialize_paths(rebased, dir, roots)
-                .await
-                .map_err(stringify)?;
-        }
-        Ok(())
-    }
-
-    /// Drops whatever backs a fork: its route for mounted forks, its
-    /// directory for copy forks.
-    async fn discard_fork_workspace(
-        &self,
-        id: &str,
-        copy_dir: Option<&Path>,
-    ) -> Result<(), String> {
-        match copy_dir {
-            Some(dir) => {
-                std::fs::remove_dir_all(dir)
-                    .map_err(|error| format!("remove fork copy: {error}"))?;
-                Self::remove_if_empty(dir.parent());
-                Ok(())
-            }
-            None => self.detach_route(id).await,
-        }
-    }
-
-    fn remove_if_empty(dir: Option<&Path>) {
-        if let Some(dir) = dir {
-            let _ = std::fs::remove_dir(dir);
-            let _ = dir.parent().map(std::fs::remove_dir);
-        }
+        // Write THROUGH the mount, never behind it. The driver and kernel
+        // keep name and attribute caches that only their own operations
+        // update.
+        let dir = fork::forks_mount_root(&self.repo_root)
+            .ok_or("repo root has no parent for fork workspaces")?
+            .join(id);
+        self.handle
+            .materialize_paths(rebased, dir, roots)
+            .await
+            .map_err(stringify)
     }
 
     /// Removes one fork's route; the session unmounts (and the mount root

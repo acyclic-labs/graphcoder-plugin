@@ -61,19 +61,8 @@ pub async fn restore_path(
     relative: &Path,
 ) -> Result<RestoreOutcome> {
     let root = store.repo_root.clone();
-    restore_path_into(store, target, &root, relative).await
-}
-
-/// [`restore_path`] against an arbitrary root directory instead of the
-/// working tree: a copy-mode fork's directory during a rebase.
-pub async fn restore_path_into(
-    store: &Store,
-    target: GenerationId,
-    root: &Path,
-    relative: &Path,
-) -> Result<RestoreOutcome> {
     let mut checkout = store.checkout_exact(target).await?;
-    materialize_path_into_checkout(&mut checkout, root, relative, PathReplace::Atomic).await
+    materialize_path_into_checkout(&mut checkout, &root, relative, PathReplace::Atomic).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,35 +486,6 @@ pub fn recover_before_repo_open(repo_root: &Path) -> Result<PathBuf> {
     recover(&locator.journal, &locator.trash, locator.trash_ttl_days)?;
     std::fs::remove_file(locator_path)?;
     Ok(canonical)
-}
-
-/// Materializes `generation` into `destination`, which must not exist yet.
-/// Used for copy-mode forks; a rewind does the same into its temp sibling.
-pub async fn materialize_into(
-    store: &Store,
-    generation: GenerationId,
-    destination: &Path,
-) -> Result<()> {
-    std::fs::create_dir(destination)?;
-    let mut checkout = store.checkout_exact(generation).await?;
-    let cancel = CancellationToken::new();
-    materialize_checkout(
-        &mut checkout,
-        &MaterializeOptions {
-            destination: destination.to_path_buf(),
-            maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
-            maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
-            transfer_bytes: TRANSFER_BYTES,
-        },
-        WorkCounters::UNBOUNDED,
-        &cancel,
-    )
-    .await
-    .map_err(|error| {
-        let _ = std::fs::remove_dir_all(destination);
-        EngineError::Restore(format!("materialize: {error:?}"))
-    })?;
-    Ok(())
 }
 
 /// Executes a rewind against the store's repo. Called from the pipeline with
