@@ -189,7 +189,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;
     lap("index open");
     let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
-    lap("pipeline thread spawn (baseline runs on it)");
+    lap("pipeline metadata thread spawn");
 
     let shutdown = Arc::new(Notify::new());
     let mounts = fork::mount_capability();

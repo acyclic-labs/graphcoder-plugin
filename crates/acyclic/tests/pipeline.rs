@@ -54,6 +54,44 @@ fn startup_failure_is_reported_by_status() {
     thread.join().expect("pipeline thread");
 }
 
+/// Starting the daemon and polling metadata must stay constant in repository
+/// size. Even an enabled idle timer cannot authenticate content before a real
+/// content operation asks for it.
+#[test]
+fn idle_metadata_traffic_never_establishes_the_baseline() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("a.txt"), b"one\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let config = Config {
+        auto_checkpoint_idle_ms: 20,
+        ..fast_config()
+    };
+    let (handle, thread) = pipeline::spawn(store, index, config);
+
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+        while tokio::time::Instant::now() < deadline {
+            let status = handle.status().await.expect("status");
+            assert_eq!(status.state, pipeline::State::NeedsBaseline);
+            assert_eq!(status.last_checkpoint, None);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.shutdown().await.expect("shutdown");
+    });
+    thread.join().expect("pipeline thread");
+    assert!(read_only_index(&paths.index_db())
+        .latest()
+        .expect("query")
+        .is_none());
+}
+
 #[test]
 fn checkpoint_rewind_journey() {
     let repo = tempfile::tempdir().expect("repo");
