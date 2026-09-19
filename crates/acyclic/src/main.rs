@@ -547,14 +547,15 @@ fn init(repo: &Path) -> i32 {
                 .map_err(|error| error.to_string())?;
             println!("store created at {}", paths.root.display());
         }
-        // Spawning the daemon builds (or refreshes) the baseline.
+        // Spawning opens metadata and the watcher without scanning descendants.
+        // The first content-dependent operation establishes the baseline.
         let mut client = connect(repo, Spawn::Allowed).map_err(|error| match error {
             ConnectError::NoDaemon => "daemon failed to start".to_owned(),
             ConnectError::Starting => "daemon is still starting".to_owned(),
             ConnectError::Other(message) => message,
         })?;
         client.call(proto::Op::Ping)?;
-        println!("daemon ready — checkpointing is on");
+        println!("daemon ready — checkpointing activates on first use");
         print_mount_capability();
         Ok(())
     })();
