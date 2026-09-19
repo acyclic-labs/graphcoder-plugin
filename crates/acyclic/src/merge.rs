@@ -328,11 +328,51 @@ async fn regular_contents(
         .collect()
 }
 
+async fn record_modes(
+    store: &Store,
+    generation: GenerationId,
+    records: &BTreeMap<PathBuf, FileRecord>,
+) -> Result<BTreeMap<PathBuf, Option<u32>>> {
+    if records.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let checkout = store.checkout_exact(generation).await?;
+    let reader = checkout
+        .pinned_reader()
+        .map_err(EngineError::fs("open pinned reader"))?;
+    let metadata = reader
+        .read_record_metadata_batch(
+            &records.values().copied().collect::<Vec<_>>(),
+            FILE_READ_CONCURRENCY,
+            WorkCounters::UNBOUNDED,
+            &CancellationToken::new(),
+        )
+        .await
+        .map_err(EngineError::fs("batch read metadata"))?
+        .value;
+    Ok(records
+        .keys()
+        .cloned()
+        .zip(metadata)
+        .map(|(path, metadata)| {
+            let mode = match metadata.posix_mode {
+                MetadataField::Value(mode) => Some(mode & 0o7777),
+                MetadataField::Unavailable => None,
+            };
+            (path, mode)
+        })
+        .collect())
+}
+
 fn regular_content<'a>(contents: &'a BTreeMap<PathBuf, Vec<u8>>, path: &Path) -> Result<&'a [u8]> {
     contents
         .get(path)
         .map(Vec::as_slice)
         .ok_or_else(|| EngineError::Fs(format!("{}: regular content is absent", path.display())))
+}
+
+fn mode_at(modes: &BTreeMap<PathBuf, Option<u32>>, path: &Path) -> Option<u32> {
+    modes.get(path).copied().flatten()
 }
 
 async fn merge_inputs(
@@ -378,15 +418,14 @@ pub async fn plan(
         theirs_changed,
     } = inputs;
 
-    let (base_contents, theirs_contents, ours_contents) = tokio::try_join!(
+    let (base_contents, theirs_contents, ours_contents, base_modes, theirs_modes, ours_modes) = tokio::try_join!(
         regular_contents(store, base, &base_map),
         regular_contents(store, theirs, &theirs_map),
         regular_contents(store, ours, &ours_map),
+        record_modes(store, base, &base_map),
+        record_modes(store, theirs, &theirs_map),
+        record_modes(store, ours, &ours_map),
     )?;
-
-    let mut base_checkout = store.checkout_exact(base).await?;
-    let mut theirs_checkout = store.checkout_exact(theirs).await?;
-    let mut ours_checkout = store.checkout_exact(ours).await?;
 
     let mut plan = MergePlan::default();
     let mut decided_root: Option<PathBuf> = None;
@@ -443,9 +482,9 @@ pub async fn plan(
                 let ours_bytes = regular_content(&ours_contents, path)?;
                 let theirs_bytes = regular_content(&theirs_contents, path)?;
                 let mode = merged_mode(
-                    read_mode(&mut base_checkout, path).await?,
-                    read_mode(&mut ours_checkout, path).await?,
-                    read_mode(&mut theirs_checkout, path).await?,
+                    mode_at(&base_modes, path),
+                    mode_at(&ours_modes, path),
+                    mode_at(&theirs_modes, path),
                 );
                 push_content(
                     &mut plan,
@@ -469,13 +508,13 @@ pub async fn plan(
                     (
                         Some(regular_content(&ours_contents, path)?),
                         None,
-                        read_mode(&mut ours_checkout, path).await?,
+                        mode_at(&ours_modes, path),
                     )
                 } else {
                     (
                         None,
                         Some(regular_content(&theirs_contents, path)?),
-                        read_mode(&mut theirs_checkout, path).await?,
+                        mode_at(&theirs_modes, path),
                     )
                 };
                 push_content(
@@ -665,28 +704,6 @@ pub async fn read_files(
             .extend_from_slice(&read.bytes);
     }
     Ok(contents)
-}
-
-async fn read_mode(checkout: &mut LocalCheckout, path: &Path) -> Result<Option<u32>> {
-    let cancel = CancellationToken::new();
-    let namespace = namespace_of(path)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("lookup"))?
-        .value;
-    if lookup.record.is_none() {
-        return Ok(None);
-    }
-    let metadata = checkout
-        .read_metadata(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("read metadata"))?
-        .value;
-    Ok(match metadata.posix_mode {
-        MetadataField::Value(mode) => Some(mode & 0o7777),
-        MetadataField::Unavailable => None,
-    })
 }
 
 // ---------------------------------------------------------------------------
