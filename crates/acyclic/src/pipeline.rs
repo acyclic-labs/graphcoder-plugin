@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{
-    capture_baseline_with_policy, capture_root_identity, capture_subtree_with_policy,
+    capture_baseline_with_policy, capture_root_identity, capture_subtrees_with_policy,
     capture_watch_batch_with_policy, CaptureOptions,
 };
 use acyclic_fs::{
@@ -1787,19 +1787,20 @@ impl Pipeline {
     /// and checkout subtrees, so stale descendants are removed without waiting
     /// for the native watcher to enumerate the write.
     async fn capture_restored_subtrees(&mut self, paths: &[PathBuf]) -> Result<()> {
-        for path in paths {
-            let namespace = crate::merge::namespace_of(path)?;
-            capture_subtree_with_policy(
-                &mut self.store.checkout,
-                namespace,
-                &self.options,
-                &self.capture_policy,
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
-            )
-            .await
-            .map_err(EngineError::fs("capture restored subtree"))?;
-        }
+        let roots = paths
+            .iter()
+            .map(|path| crate::merge::namespace_of(path))
+            .collect::<Result<Vec<_>>>()?;
+        capture_subtrees_with_policy(
+            &mut self.store.checkout,
+            &roots,
+            &self.options,
+            &self.capture_policy,
+            WorkCounters::UNBOUNDED,
+            &self.cancel,
+        )
+        .await
+        .map_err(EngineError::fs("capture restored subtrees"))?;
         Ok(())
     }
 
