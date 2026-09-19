@@ -15,7 +15,7 @@ use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
 use crate::exclude::Exclusions;
-use crate::store::{LocalGeneration, Store};
+use crate::store::Store;
 use crate::{EngineError, Result};
 
 static PARK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -79,30 +79,12 @@ pub async fn restore_path(
 ) -> Result<RestoreOutcome> {
     let root = store.repo_root.clone();
     let generation = store.generation(target).await?;
-    materialize_path_from_generation(&generation, &root, relative, PathReplace::Atomic).await
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PathReplace {
-    Atomic,
-    LiveMount,
-}
-
-pub(crate) async fn materialize_path_from_generation(
-    generation: &LocalGeneration,
-    root: &Path,
-    relative: &Path,
-    replace: PathReplace,
-) -> Result<RestoreOutcome> {
     let cancel = CancellationToken::new();
     let restored = generation
         .restore_host_path(
             relative,
-            match replace {
-                PathReplace::Atomic => HostPathReplacement::Atomic,
-                PathReplace::LiveMount => HostPathReplacement::LiveMount,
-            },
-            &MaterializeOptions::native(root),
+            HostPathReplacement::Atomic,
+            &MaterializeOptions::native(&root),
             WorkCounters::UNBOUNDED,
             &cancel,
         )

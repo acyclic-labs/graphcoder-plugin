@@ -1184,15 +1184,15 @@ pub async fn materialize_paths(
     paths: &[PathBuf],
 ) -> Result<()> {
     let generation = store.generation(generation).await?;
-    for path in paths {
-        crate::rewind::materialize_path_from_generation(
-            &generation,
-            dir,
-            path,
-            crate::rewind::PathReplace::LiveMount,
+    generation
+        .restore_host_paths(
+            paths,
+            acyclic_fs::HostPathReplacement::LiveMount,
+            &acyclic_fs::MaterializeOptions::native(dir),
+            &acyclic_fs::CancellationToken::new(),
         )
-        .await?;
-    }
+        .await
+        .map_err(EngineError::fs("materialize paths"))?;
     Ok(())
 }
 
