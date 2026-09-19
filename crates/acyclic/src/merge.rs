@@ -734,7 +734,7 @@ pub async fn apply_entries(
         match entry {
             Entry::Regular { bytes, mode } => {
                 source = None;
-                remove_subtree(store, dst, namespace, &cancel).await?;
+                remove_subtree(dst, namespace, &cancel).await?;
                 let metadata = FileMetadata {
                     posix_mode: mode.map_or(MetadataField::Unavailable, MetadataField::Value),
                     ..FileMetadata::default()
@@ -765,7 +765,7 @@ pub async fn apply_entries(
                     .as_mut()
                     .ok_or_else(|| EngineError::Fs("source checkout missing".into()))?
                     .1;
-                remove_subtree(store, dst, namespace, &cancel).await?;
+                remove_subtree(dst, namespace, &cancel).await?;
                 copy_node(src, dst, namespace, &cancel).await?;
             }
         }
@@ -872,48 +872,83 @@ where
     Ok(children)
 }
 
+async fn resolved_children<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
+    directory: &NamespacePath,
+    limits: acyclic_fs::model::VolumeLimits,
+    cancel: &CancellationToken,
+) -> Result<Vec<(NamespacePath, acyclic_fs::ResolvedFile<A, O>)>>
+where
+    A: acyclic_fs::AsyncAuthorityStore,
+    O: acyclic_fs::AsyncObjectStore,
+{
+    let mut children = Vec::new();
+    let mut after = None;
+    loop {
+        let page = reader
+            .resolve_directory_page(
+                directory,
+                after.as_ref(),
+                PAGE_ENTRIES,
+                WorkCounters::UNBOUNDED,
+                cancel,
+            )
+            .await
+            .map_err(EngineError::fs("resolve subtree page"))?
+            .value;
+        let next = page.entries.last().map(|entry| entry.name.clone());
+        for entry in page.entries {
+            children.push((child_path(directory, &entry.name, limits)?, entry.file));
+        }
+        if !page.has_more {
+            break;
+        }
+        after = Some(
+            next.ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?,
+        );
+    }
+    Ok(children)
+}
+
 /// Removes `namespace` from `dst`, recursively for directories; absent is
 /// fine. Iterative (post-order over an explicit stack): the fs facade's
 /// futures are large, and nesting them on the pipeline thread's stack
 /// overflows it within a few levels.
 async fn remove_subtree(
-    store: &Store,
     dst: &mut LocalCheckout,
     namespace: &NamespacePath,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let mut frontier = vec![namespace.clone()];
+    let reader = dst.snapshot_reader();
+    let roots = reader
+        .resolve_files(&frontier, WorkCounters::UNBOUNDED, cancel)
+        .await
+        .map_err(EngineError::fs("resolve subtree root"))?
+        .value;
+    let mut nodes = frontier
+        .drain(..)
+        .zip(roots)
+        .filter_map(|(path, file)| file.map(|file| (path, file)))
+        .collect::<Vec<_>>();
     let mut levels = Vec::new();
-    while !frontier.is_empty() {
-        let lookup = dst
-            .lookup_batch_no_follow(&frontier, WorkCounters::UNBOUNDED, cancel)
-            .await
-            .map_err(EngineError::fs("batch subtree removal lookup"))?
-            .value;
-        let nodes = frontier
-            .into_iter()
-            .zip(lookup.entries)
-            .filter_map(|(path, entry)| entry.record.map(|record| (path, record)))
-            .collect::<Vec<_>>();
-        if nodes.is_empty() {
-            break;
-        }
-        let reader = store
-            .generation(dst.generation_id())
-            .await?
-            .reader()
-            .await
-            .map_err(EngineError::fs("open subtree reader"))?;
+    while !nodes.is_empty() {
         let limits = dst.volume_config().limits;
-        frontier = Vec::new();
+        let mut next = Vec::new();
         for directory in nodes
             .iter()
-            .filter(|(_, record)| record.kind == FileKind::Directory)
+            .filter(|(_, file)| file.description().kind == FileKind::Directory)
             .map(|(path, _)| path)
         {
-            frontier.extend(resolved_child_paths(&reader, directory, limits, cancel).await?);
+            next.extend(resolved_children(&reader, directory, limits, cancel).await?);
         }
-        levels.push(nodes);
+        levels.push(
+            nodes
+                .into_iter()
+                .map(|(path, file)| (path, file.file_id()))
+                .collect::<Vec<_>>(),
+        );
+        nodes = next;
     }
     let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
         .unwrap_or(usize::MAX)
@@ -921,9 +956,9 @@ async fn remove_subtree(
     for level in levels.into_iter().rev() {
         let removals = level
             .into_iter()
-            .map(|(path, record)| AuthoredMutation::Remove {
+            .map(|(path, file_id)| AuthoredMutation::Remove {
                 path,
-                expected_file_id: Some(record.file_id),
+                expected_file_id: Some(file_id),
             })
             .collect::<Vec<_>>();
         for chunk in removals.chunks(maximum) {
