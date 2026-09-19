@@ -300,6 +300,41 @@ struct MergeInputs {
     theirs_changed: BTreeSet<PathBuf>,
 }
 
+fn regular_paths(records: &BTreeMap<PathBuf, FileRecord>) -> Vec<PathBuf> {
+    records
+        .iter()
+        .filter(|(_, record)| record.kind == FileKind::Regular)
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+async fn regular_contents(
+    store: &Store,
+    generation: GenerationId,
+    records: &BTreeMap<PathBuf, FileRecord>,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let paths = regular_paths(records);
+    let contents = read_files(store, generation, &paths).await?;
+    paths
+        .into_iter()
+        .zip(contents)
+        .map(|(path, content)| {
+            content
+                .map(|content| (path.clone(), content))
+                .ok_or_else(|| {
+                    EngineError::Fs(format!("{}: regular file is absent", path.display()))
+                })
+        })
+        .collect()
+}
+
+fn regular_content<'a>(contents: &'a BTreeMap<PathBuf, Vec<u8>>, path: &Path) -> Result<&'a [u8]> {
+    contents
+        .get(path)
+        .map(Vec::as_slice)
+        .ok_or_else(|| EngineError::Fs(format!("{}: regular content is absent", path.display())))
+}
+
 async fn merge_inputs(
     store: &Store,
     base: GenerationId,
@@ -342,6 +377,12 @@ pub async fn plan(
         ours_changed,
         theirs_changed,
     } = inputs;
+
+    let (base_contents, theirs_contents, ours_contents) = tokio::try_join!(
+        regular_contents(store, base, &base_map),
+        regular_contents(store, theirs, &theirs_map),
+        regular_contents(store, ours, &ours_map),
+    )?;
 
     let mut base_checkout = store.checkout_exact(base).await?;
     let mut theirs_checkout = store.checkout_exact(theirs).await?;
@@ -389,7 +430,7 @@ pub async fn plan(
                     continue;
                 }
                 let base_bytes = match kind(b) {
-                    Some(FileKind::Regular) => Some(read_regular(&mut base_checkout, path).await?),
+                    Some(FileKind::Regular) => Some(regular_content(&base_contents, path)?),
                     None => None,
                     Some(_) => {
                         plan.refusals.push(Refusal {
@@ -399,8 +440,8 @@ pub async fn plan(
                         continue;
                     }
                 };
-                let ours_bytes = read_regular(&mut ours_checkout, path).await?;
-                let theirs_bytes = read_regular(&mut theirs_checkout, path).await?;
+                let ours_bytes = regular_content(&ours_contents, path)?;
+                let theirs_bytes = regular_content(&theirs_contents, path)?;
                 let mode = merged_mode(
                     read_mode(&mut base_checkout, path).await?,
                     read_mode(&mut ours_checkout, path).await?,
@@ -411,9 +452,9 @@ pub async fn plan(
                     path,
                     mode,
                     merge_file(
-                        base_bytes.as_deref(),
-                        Some(&ours_bytes),
-                        Some(&theirs_bytes),
+                        base_bytes,
+                        Some(ours_bytes),
+                        Some(theirs_bytes),
                         ours_name,
                         "mainline",
                         limits,
@@ -423,17 +464,17 @@ pub async fn plan(
             // Modify/delete in either direction.
             (Some(FileKind::Regular), Some(FileKind::Regular), None)
             | (Some(FileKind::Regular), None, Some(FileKind::Regular)) => {
-                let base_bytes = read_regular(&mut base_checkout, path).await?;
+                let base_bytes = regular_content(&base_contents, path)?;
                 let (ours_bytes, theirs_bytes, mode) = if f.is_some() {
                     (
-                        Some(read_regular(&mut ours_checkout, path).await?),
+                        Some(regular_content(&ours_contents, path)?),
                         None,
                         read_mode(&mut ours_checkout, path).await?,
                     )
                 } else {
                     (
                         None,
-                        Some(read_regular(&mut theirs_checkout, path).await?),
+                        Some(regular_content(&theirs_contents, path)?),
                         read_mode(&mut theirs_checkout, path).await?,
                     )
                 };
@@ -442,9 +483,9 @@ pub async fn plan(
                     path,
                     mode,
                     merge_file(
-                        Some(&base_bytes),
-                        ours_bytes.as_deref(),
-                        theirs_bytes.as_deref(),
+                        Some(base_bytes),
+                        ours_bytes,
+                        theirs_bytes,
                         ours_name,
                         "mainline",
                         limits,
@@ -530,63 +571,6 @@ pub(crate) fn namespace_of(path: &Path) -> Result<NamespacePath> {
     let config = crate::store::volume_config();
     acyclic_fs::host_path_to_namespace(path, config.profile, config.limits)
         .map_err(EngineError::fs("host path to namespace"))
-}
-
-/// Whole content of a regular file at `path` in `checkout`.
-pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> Result<Vec<u8>> {
-    let cancel = CancellationToken::new();
-    let namespace = namespace_of(path)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("lookup"))?
-        .value;
-    let record = lookup
-        .record
-        .ok_or_else(|| EngineError::Fs(format!("{}: absent", path.display())))?;
-    read_regular_record(checkout, &namespace, record, path).await
-}
-
-async fn read_regular_record(
-    checkout: &mut LocalCheckout,
-    namespace: &NamespacePath,
-    record: FileRecord,
-    display_path: &Path,
-) -> Result<Vec<u8>> {
-    let length = match record.payload {
-        acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
-        acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
-        _ => {
-            return Err(EngineError::Fs(format!(
-                "{}: not a regular file",
-                display_path.display()
-            )))
-        }
-    };
-    let cancel = CancellationToken::new();
-    let limits = checkout.volume_config().limits;
-    let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
-    let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-    let mut offset = 0;
-    while offset < length {
-        let take = chunk.min(length - offset);
-        let read = checkout
-            .read_file_range(
-                namespace,
-                ByteRange {
-                    offset,
-                    length: take,
-                },
-                WorkCounters::UNBOUNDED,
-                &cancel,
-            )
-            .await
-            .map_err(EngineError::fs("read file range"))?
-            .value;
-        out.extend_from_slice(&read.bytes);
-        offset += take;
-    }
-    Ok(out)
 }
 
 /// Contents of regular files in one generation, preserving request order.
