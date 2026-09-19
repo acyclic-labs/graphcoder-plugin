@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::{
-    durable_rename, exchange_native_entries, materialize_checkout, materialize_checkout_host_path,
+    durable_rename, exchange_native_entries, materialize_checkout_host_path,
     publish_native_exchange, IdempotencyKey, MaterializeError, MaterializeOptions, RenameMode,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
@@ -550,25 +550,25 @@ pub(crate) async fn prepare<'a>(
             carried: Vec::new(),
         },
     )?;
-    let mut checkout = store.checkout_exact(target).await?;
+    let generation = store.generation(target).await?;
     let cancel = CancellationToken::new();
-    materialize_checkout(
-        &mut checkout,
-        &MaterializeOptions {
-            destination: tmp.clone(),
-            maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
-            maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
-            transfer_bytes: TRANSFER_BYTES,
-        },
-        WorkCounters::UNBOUNDED,
-        &cancel,
-    )
-    .await
-    .map_err(|error| {
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_file(&journal_path);
-        EngineError::Restore(format!("materialize: {error:?}"))
-    })?;
+    generation
+        .materialize(
+            &MaterializeOptions {
+                destination: tmp.clone(),
+                maximum_directory_entries: MAXIMUM_DIRECTORY_ENTRIES,
+                maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
+                transfer_bytes: TRANSFER_BYTES,
+            },
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
+        .await
+        .map_err(|error| {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_file(&journal_path);
+            EngineError::Restore(format!("materialize: {error:?}"))
+        })?;
 
     let carried: Vec<PathBuf> = exclusions
         .host_paths()
