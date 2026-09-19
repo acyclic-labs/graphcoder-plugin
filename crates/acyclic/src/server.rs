@@ -166,12 +166,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // Finish or unwind any rewind that a crash interrupted BEFORE the store
     // opens and the pipeline baselines; sweep fork dirs a dead daemon left
     // mounted (fork sessions do not survive the daemon).
-    rewind::recover(
-        &paths.rewind_journal(),
-        &paths.trash(),
-        config.trash_ttl_days,
-    )
-    .map_err(|error| error.to_string())?;
+    rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     lap("rewind journal recovery");
     fork::sweep_stale_forks(&repo_root);
     lap("sweep stale forks");

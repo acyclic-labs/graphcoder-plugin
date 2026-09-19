@@ -8,8 +8,8 @@
 //! API, so they get `acyclic mcp` (see `crate::mcp`) registered as an MCP
 //! server in whatever config file that host reads — project-scoped and
 //! checked in where the host supports it, the user's global config where
-//! it doesn't. agents-md is the fallback for anything shell-capable: a
-//! cheatsheet block in AGENTS.md and no hooks at all.
+//! it doesn't. The agents-md adapter gives shell-capable hosts a cheatsheet
+//! block in AGENTS.md and no hooks.
 //!
 //! Each `HostAdapter` below documents exactly what its host gets. The
 //! README's per-host table is the user-facing version of the same list,
@@ -289,7 +289,7 @@ fn is_our_command(command: &str) -> bool {
 /// `~/.codex/config.toml` / `.codex/config.toml`. If that also means they
 /// share whatever fires `.codex/hooks.json`'s lifecycle events, this
 /// adapter may already cover the desktop app and IDE extension too, with no
-/// new code — verify that first. The MCP fallback is already known to
+/// new code — verify that first. MCP is already known to
 /// work (docs/manual-testing.md): `[mcp_servers.<name>]` with `command`,
 /// `args` and `default_tools_approval_mode = "approve"` (without it a
 /// non-interactive session rejects every call). It is TOML, so a writer
@@ -312,7 +312,7 @@ fn codex(repo: &Path) -> Result<(), String> {
 /// and `type` directly rather than Claude/Codex's nested `hooks` array),
 /// plus an always-applied project rule so the model has the CLI verbs in
 /// context. Cursor's hook events and payload shape differ from Claude
-/// Code/Codex (see `hook::Payload`'s `conversation_id`/`command` fallbacks
+/// Code/Codex (see `hook::Payload`'s host-specific fields
 /// and `hook::run`'s Cursor-only `{"permission":"allow"}` reply), so this
 /// writes Cursor's own event names rather than reusing `hook_events()`.
 fn cursor(repo: &Path) -> Result<(), String> {
@@ -1283,7 +1283,7 @@ After the final round: `{{name}} diff <first checkpoint> <latest>` and
 summarise the blast radius, ignoring `m` (metadata-only) lines. Mention
 anything a script or generator wrote.
 
-## 6. Failure and fallback
+## 6. Failure handling
 
 - A promote that reports `N file(s) conflict` has written conflict
   markers into THAT FORK (the mainline is untouched) and moved the fork

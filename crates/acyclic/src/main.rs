@@ -265,7 +265,7 @@ fn main() {
 
 /// True when `repo` (canonical) lies inside a store's trash (an ancestor
 /// named `trash` whose parent is a store root, marked by `meta.json`), or
-/// inside a rewind's sibling fallback trash directory (`.<name>.acyclic-trash-*`).
+/// inside a rewind's sibling trash directory (`.<name>.acyclic-trash-*`).
 fn stranded_in_trash(repo: &Path) -> bool {
     repo.ancestors().any(|ancestor| {
         let Some(name) = ancestor.file_name().map(|name| name.to_string_lossy()) else {

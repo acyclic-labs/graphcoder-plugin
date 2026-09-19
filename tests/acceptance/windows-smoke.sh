@@ -10,7 +10,7 @@
 #     (a daemon that inherits it never lets the caller see EOF)
 #   - capture and diff under UTF-16LE names, non-ASCII included
 #   - rewind, which renames the repo root and so trips every open handle
-#   - ProjFS-accelerated forks when available, with copy fallback otherwise
+#   - required ProjFS-accelerated forks
 #
 # Runs under Git Bash on a GitHub windows runner. ACYCLIC_BIN overrides the
 # binary (default: target/release/acyclic.exe).
