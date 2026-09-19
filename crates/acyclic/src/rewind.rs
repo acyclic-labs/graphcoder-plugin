@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::{
-    materialize_checkout, materialize_checkout_host_path, publish_native_exchange,
-    MaterializeError, MaterializeOptions,
+    exchange_native_entries, materialize_checkout, materialize_checkout_host_path,
+    publish_native_exchange, MaterializeError, MaterializeOptions,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
@@ -154,7 +154,8 @@ pub(crate) async fn materialize_path_into_checkout(
             PathReplace::Atomic => {
                 // An exchange may have published the new node before a
                 // durability error. Keep both staged and scratch trees.
-                atomic_exchange(&destination, &staged)?;
+                exchange_native_entries(&destination, &staged)
+                    .map_err(|error| EngineError::Restore(format!("exchange path: {error}")))?;
             }
             PathReplace::LiveMount => replace_live_mount(&staged, &destination, parent)?,
         },
@@ -854,117 +855,6 @@ pub(crate) fn swap_scratch(a: &Path) -> Option<PathBuf> {
     Some(parent.join(format!(".{name}.{}-swap", crate::product::NAME)))
 }
 
-/// Exchanges two directories on the same filesystem.
-///
-/// **Not atomic on Windows.** There is no `RENAME_EXCHANGE` equivalent: NTFS
-/// cannot swap two names in one operation, so this is three renames through
-/// a scratch name in `a`'s directory. Each rename is atomic; the sequence is
-/// not, and a crash can be observed between any two of them.
-///
-/// What still holds is the property rewind actually needs — the repo is
-/// never a mixture of the two trees. Every intermediate state has the repo
-/// path either absent or naming exactly one whole tree, and [`recover`]
-/// resolves each of them from the journal: the `Swapping` arm finishes the
-/// move when the repo path is missing, and clears the scratch either way.
-/// A crash during a journal-less [`restore_path`] may leave the same scratch
-/// behind; a later swap refuses to overwrite that potentially unique tree.
-#[cfg(windows)]
-fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
-    let scratch =
-        swap_scratch(a).ok_or_else(|| EngineError::Restore("swap path has no parent".into()))?;
-    // A preexisting scratch may be the only copy of the prior tree after a
-    // failed exchange. The caller must recover it before starting a new swap.
-    if path_exists(&scratch)? {
-        return Err(EngineError::Restore(format!(
-            "swap scratch {} is occupied; recover the previous exchange first",
-            scratch.display()
-        )));
-    }
-
-    durable_rename(a, &scratch, false).map_err(|error| {
-        EngineError::Restore(format!("swap: move aside {}: {error}", a.display()))
-    })?;
-    if let Err(error) = durable_rename(b, a, false) {
-        // Nothing has been published yet; put `a` back and fail clean.
-        let _ = durable_rename(&scratch, a, false);
-        return Err(EngineError::Restore(format!(
-            "swap: move {} into place: {error}",
-            b.display()
-        )));
-    }
-    durable_rename(&scratch, b, false).map_err(|error| {
-        // `a` already holds the new tree, so the exchange has effectively
-        // happened; only the old tree's parking spot is wrong. Leave the
-        // scratch for recovery rather than unwinding a published swap.
-        EngineError::Restore(format!("swap: park the replaced tree: {error}"))
-    })
-}
-
-/// Atomically exchanges two directories on the same filesystem.
-#[cfg(target_os = "macos")]
-#[allow(
-    unsafe_code,
-    reason = "renamex_np over two live NUL-terminated paths; RENAME_SWAP is atomic on APFS"
-)]
-fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    // SAFETY: both are live NUL-terminated paths; RENAME_SWAP exchanges them
-    // atomically on APFS.
-    let result = unsafe { libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP) };
-    if result == 0 {
-        sync_parent(a)?;
-        if a.parent() != b.parent() {
-            sync_parent(b)?;
-        }
-        Ok(())
-    } else {
-        Err(EngineError::Restore(format!(
-            "renamex_np: {}",
-            std::io::Error::last_os_error()
-        )))
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[allow(
-    unsafe_code,
-    reason = "renameat2 over two live NUL-terminated paths; RENAME_EXCHANGE is atomic where supported"
-)]
-fn atomic_exchange(a: &Path, b: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| EngineError::Restore("path contains NUL".into()))?;
-    // SAFETY: both are live NUL-terminated paths; RENAME_EXCHANGE swaps them
-    // atomically on filesystems that support it.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            a_c.as_ptr(),
-            libc::AT_FDCWD,
-            b_c.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if result == 0 {
-        sync_parent(a)?;
-        if a.parent() != b.parent() {
-            sync_parent(b)?;
-        }
-        Ok(())
-    } else {
-        Err(EngineError::Restore(format!(
-            "renameat2: {}",
-            std::io::Error::last_os_error()
-        )))
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,76 +1102,6 @@ mod tests {
             r#"{"target_generation":"00","repo_root":"/r","tmp":"/t","phase":"Materializing"}"#;
         let journal: Journal = serde_json::from_str(text).expect("decode");
         assert!(journal.carried.is_empty());
-    }
-
-    /// The contract every platform's exchange owes the caller, asserted
-    /// against whichever implementation this host compiled: after it, each
-    /// path names the other's tree. Windows reaches that through three
-    /// renames rather than one syscall, so it is the arm most worth pinning.
-    #[test]
-    fn exchange_swaps_two_directories() {
-        let work = tempfile::tempdir().expect("tempdir");
-        let left = work.path().join("left");
-        let right = work.path().join("right");
-        std::fs::create_dir(&left).expect("left");
-        std::fs::create_dir(&right).expect("right");
-        std::fs::write(left.join("who.txt"), b"left").expect("seed left");
-        std::fs::write(right.join("who.txt"), b"right").expect("seed right");
-
-        atomic_exchange(&left, &right).expect("exchange");
-
-        assert_eq!(std::fs::read(left.join("who.txt")).expect("left"), b"right");
-        assert_eq!(
-            std::fs::read(right.join("who.txt")).expect("right"),
-            b"left"
-        );
-    }
-
-    /// A failed exchange must leave the tree it was given untouched rather
-    /// than half-moved. On Windows this exercises the unwind between the
-    /// first and second rename, which is the window where the repo path is
-    /// vacated and nothing has replaced it yet.
-    #[test]
-    fn a_failed_exchange_leaves_the_live_tree_whole() {
-        let work = tempfile::tempdir().expect("tempdir");
-        let live = work.path().join("live");
-        std::fs::create_dir(&live).expect("live");
-        std::fs::write(live.join("keep.txt"), b"precious").expect("seed");
-        let missing = work.path().join("never-materialized");
-
-        atomic_exchange(&live, &missing).expect_err("exchange must fail");
-
-        assert!(live.is_dir(), "the live tree must still be a directory");
-        assert_eq!(
-            std::fs::read(live.join("keep.txt")).expect("content survives"),
-            b"precious"
-        );
-        #[cfg(windows)]
-        assert!(
-            !swap_scratch(&live).expect("scratch path").exists(),
-            "a failed exchange must not leave its scratch behind"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn exchange_refuses_to_overwrite_a_previous_scratch_tree() {
-        let work = tempfile::tempdir().expect("tempdir");
-        let live = work.path().join("live");
-        let staged = work.path().join("staged");
-        let scratch = swap_scratch(&live).expect("scratch");
-        for path in [&live, &staged, &scratch] {
-            std::fs::create_dir(path).expect("tree");
-        }
-        std::fs::write(scratch.join("only-copy"), b"old data").expect("scratch data");
-
-        atomic_exchange(&live, &staged).expect_err("scratch must block new swap");
-        assert!(live.exists());
-        assert!(staged.exists());
-        assert_eq!(
-            std::fs::read(scratch.join("only-copy")).expect("old data survived"),
-            b"old data"
-        );
     }
 
     /// A crash after Windows rename #1 must roll back to the old tree and
