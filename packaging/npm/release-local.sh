@@ -55,7 +55,13 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 version() {
-  awk '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f && /^version/ {gsub(/[" ]/,"",$3); print $3}' "$ROOT/Cargo.toml"
+  # Cargo resolves the crate's version whether it is literal or inherited
+  # from a workspace, in either repository layout.
+  (cd "$ROOT" && cargo pkgid -p acyclic) | sed 's/.*[@#]//'
+}
+target_dir() {
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then printf '%s\n' "$CARGO_TARGET_DIR"; return; fi
+  (cd "$ROOT" && cargo metadata --no-deps --format-version 1) | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
 }
 
 check_versions() {
@@ -82,7 +88,7 @@ build_one() {
   log "building $os $cpu ($target)"
   rustup target add "$target" >/dev/null
   (cd "$ROOT" && cargo build --release --locked -p acyclic --target "$target")
-  local bin="$ROOT/target/$target/release/acyclic"   # cargo target name is internal
+  local bin="$(target_dir)/$target/release/acyclic"   # cargo target name is internal
   mkdir -p "$BIN_DIR"
   cp "$bin" "$BIN_DIR/$NAME-$os-$cpu"
   # Only smoke-test what this machine can execute.

@@ -150,14 +150,19 @@ pub fn read_only() -> CheckoutMode {
     }
 }
 
-/// Barrier durability for both providers: a full device flush per journal
-/// frame costs ~5ms each on Apple SSDs and a small capture issues dozens,
-/// while the store only needs to survive a daemon crash — a torn tail after
-/// power loss just drops the newest checkpoint.
+/// Barrier durability for both providers on Apple targets: a full device
+/// flush per journal frame costs ~5ms each on Apple SSDs and a small capture
+/// issues dozens, while the store only needs to survive a daemon crash — a
+/// torn tail after power loss just drops the newest checkpoint. The barrier
+/// is `F_BARRIERFSYNC`, which only Apple platforms have; `acyclic-fs` fails
+/// closed rather than substitute weaker semantics, so elsewhere the store
+/// takes the default full flush.
 pub fn local_options(root: impl Into<PathBuf>) -> LocalOptions {
     let mut options = LocalOptions::new(root);
-    options.stream.durability = LocalStreamDurability::Barrier;
-    options.objects.durability = LocalObjectsDurability::Barrier;
+    if cfg!(target_vendor = "apple") {
+        options.stream.durability = LocalStreamDurability::Barrier;
+        options.objects.durability = LocalObjectsDurability::Barrier;
+    }
     options
 }
 

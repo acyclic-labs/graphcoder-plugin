@@ -8,14 +8,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.2"
-edition = "2021"
+version = "0.0.3"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/acyclic-labs/graphcoder-plugin"
 homepage = "https://acyclic.dev"
 
 [workspace.dependencies]
-acyclic-fs = { git = "https://github.com/acyclic-labs/sdk.git", rev = "22b4e752f46d8f6db6e024b3137fe520ef64bcc1", features = ["local", "native-watch", "native-mount"] }
+acyclic-fs = { git = "https://github.com/acyclic-labs/sdk.git", rev = "0de2d5c8eff4d42a8011458a2291cd09ea9b6e75", features = ["local", "native-watch", "native-mount"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 
 # Code-quality guards beyond clippy's defaults. CI runs clippy with

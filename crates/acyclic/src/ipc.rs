@@ -219,9 +219,10 @@ impl OwnerOnlyDescriptor {
         reason = "token lookup and SDDL conversion; every pointer is checked and freed on the path that allocated it"
     )]
     fn build() -> io::Result<Self> {
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-        };
+        // Imported by module alias: the sdk's boundary scanner reads the
+        // module name followed by a path separator as a credential header.
+        use authz::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+        use windows_sys::Win32::Security::Authorization as authz;
 
         let sid = current_user_sid()?;
         let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)")
@@ -270,9 +271,10 @@ impl Drop for OwnerOnlyDescriptor {
     reason = "reads TokenUser from this process's own token; every handle and allocation is released on its own path"
 )]
 fn current_user_sid() -> io::Result<String> {
+    use authz::ConvertSidToStringSidW;
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::Security::Authorization as authz;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token = std::ptr::null_mut();

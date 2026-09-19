@@ -6,7 +6,8 @@
 //!                                 materialize into <work>/restore, compare content+mode
 //!
 //! Exit code 0 = round-trip verified identical; 1 = mismatches or engine failure.
-
+// The sdk workspace warns on missing docs and lints with -D warnings.
+#![allow(missing_docs, reason = "binary crate; nothing is exported")]
 #![allow(
     clippy::indexing_slicing,
     clippy::string_slice,
@@ -31,12 +32,12 @@ use acyclic_fs::model::{
     MutationMode, VolumeConfig,
 };
 use acyclic_fs::{
-    capture_baseline, capture_root_identity, materialize_checkout, CaptureOptions,
-    MaterializeOptions,
-};
-use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, LocalFs, OperationId, VolumeId,
     WorkCounters,
+};
+use acyclic_fs::{
+    CaptureOptions, MaterializeOptions, capture_baseline, capture_root_identity,
+    materialize_checkout,
 };
 
 fn main() {
@@ -231,7 +232,7 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, Failure> {
 )]
 fn mount_smoke(args: &[String]) -> Result<(), Failure> {
     use acyclic_fs::{
-        mount_native, probe_native_mount, CheckoutMountSource, NativeMountRequest, SharedCheckout,
+        CheckoutMountSource, NativeMountRequest, SharedCheckout, mount_native, probe_native_mount,
     };
     use std::sync::Arc;
 
@@ -368,7 +369,7 @@ fn mount_smoke(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_hold(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs::{mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout};
+    use acyclic_fs::{CheckoutMountSource, NativeMountRequest, SharedCheckout, mount_native};
     use std::sync::Arc;
 
     let source = PathBuf::from(args.first().ok_or("mount-hold: missing <src>")?).canonicalize()?;
@@ -521,7 +522,7 @@ fn source_probe(args: &[String]) -> Result<(), Failure> {
 // ---------------------------------------------------------------------------
 
 fn mount_smoke2(args: &[String]) -> Result<(), Failure> {
-    use acyclic_fs::{mount_native, CheckoutMountSource, NativeMountRequest, SharedCheckout};
+    use acyclic_fs::{CheckoutMountSource, NativeMountRequest, SharedCheckout, mount_native};
     use std::sync::Arc;
 
     let source =
