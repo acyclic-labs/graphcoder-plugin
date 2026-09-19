@@ -390,11 +390,12 @@ mod tests {
     fn scratch() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join(".acyclic")).expect("repo");
+        std::fs::create_dir_all(repo.join(acyclic_engine::product::repo_config_dir()))
+            .expect("repo");
         let stores = dir.path().join("stores");
         std::fs::create_dir_all(&stores).expect("stores");
         std::fs::write(
-            repo.join(".acyclic/config.toml"),
+            repo.join(acyclic_engine::product::repo_config_file()),
             format!("store_dir = {:?}\n", stores.to_string_lossy()),
         )
         .expect("config");
