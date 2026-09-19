@@ -23,7 +23,7 @@ use acyclic_fs::text_merge::{
 };
 use acyclic_fs::{
     AuthoredMutation, ByteRange, CancellationToken, DirectoryPageRequest, GenerationId,
-    WorkCounters,
+    ResolvedFileRangeReadRequest, WorkCounters,
 };
 use bytes::Bytes;
 
@@ -645,7 +645,9 @@ pub async fn read_files(
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
     let mut contents = vec![None; paths.len()];
-    for (index, file) in files.into_iter().enumerate() {
+    let mut pending = Vec::new();
+    let mut destinations = Vec::new();
+    for (index, file) in files.iter().enumerate() {
         let Some(file) = file else {
             continue;
         };
@@ -663,28 +665,41 @@ pub async fn read_files(
                 display_path.display()
             ))
         })?;
-        let mut content = Vec::with_capacity(capacity);
-        let mut offset = 0_u64;
-        while offset < length {
-            let take = chunk.min(length - offset);
-            let read = file
-                .read_range(
-                    ByteRange {
-                        offset,
-                        length: take,
-                    },
-                    WorkCounters::UNBOUNDED,
-                    &cancel,
-                )
-                .await
-                .map_err(EngineError::fs("read resolved file range"))?;
-            content.extend_from_slice(&read.value.bytes);
-            offset += take;
-        }
         *contents
             .get_mut(index)
             .ok_or_else(|| EngineError::Fs("batch lookup returned too many entries".into()))? =
-            Some(content);
+            Some(Vec::with_capacity(capacity));
+        let mut offset = 0_u64;
+        while offset < length {
+            let take = chunk.min(length - offset);
+            pending.push(ResolvedFileRangeReadRequest {
+                file,
+                range: ByteRange {
+                    offset,
+                    length: take,
+                },
+            });
+            destinations.push(index);
+            offset += take;
+        }
+    }
+    let reads = reader
+        .read_resolved_ranges(
+            &pending,
+            FILE_READ_CONCURRENCY,
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
+        .await
+        .map_err(EngineError::fs("read resolved file ranges"))?
+        .value;
+    for (destination, read) in destinations.into_iter().zip(reads) {
+        contents
+            .get_mut(destination)
+            .ok_or_else(|| EngineError::Fs("resolved read has an invalid destination".into()))?
+            .as_mut()
+            .ok_or_else(|| EngineError::Fs("resolved read lost its destination".into()))?
+            .extend_from_slice(&read.bytes);
     }
     Ok(contents)
 }
@@ -964,7 +979,7 @@ async fn copy_node(
             .into_iter()
             .map(|file| file.ok_or_else(|| EngineError::Fs("subtree node is absent".into())))
             .collect::<Result<Vec<_>>>()?;
-        let regular = read_regular_frontier(&files, cancel).await?;
+        let regular = read_regular_frontier(&reader, &files, cancel).await?;
         let directories = nodes
             .iter()
             .filter(|(_, record)| record.kind == FileKind::Directory)
@@ -1021,6 +1036,7 @@ async fn copy_node(
 }
 
 async fn read_regular_frontier<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
     files: &[acyclic_fs::ResolvedFile<'_, A, O>],
     cancel: &CancellationToken,
 ) -> Result<Vec<Vec<u8>>>
@@ -1043,28 +1059,34 @@ where
                 continue;
             }
             let take = TRANSFER_BYTES.min(length - *offset);
-            pending.push((
+            pending.push(ResolvedFileRangeReadRequest {
                 file,
-                ByteRange {
+                range: ByteRange {
                     offset: *offset,
                     length: take,
                 },
-            ));
+            });
             destinations.push(index);
             *offset += take;
         }
         if pending.is_empty() {
             break;
         }
-        for (index, (file, range)) in destinations.into_iter().zip(pending) {
-            let chunk = file
-                .read_range(range, WorkCounters::UNBOUNDED, cancel)
-                .await
-                .map_err(EngineError::fs("read resolved subtree range"))?;
+        let chunks = reader
+            .read_resolved_ranges(
+                &pending,
+                FILE_READ_CONCURRENCY,
+                WorkCounters::UNBOUNDED,
+                cancel,
+            )
+            .await
+            .map_err(EngineError::fs("batch read resolved subtree ranges"))?
+            .value;
+        for (index, chunk) in destinations.into_iter().zip(chunks) {
             contents
                 .get_mut(index)
                 .ok_or_else(|| EngineError::Fs("batch read returned an invalid index".into()))?
-                .extend_from_slice(&chunk.value.bytes);
+                .extend_from_slice(&chunk.bytes);
         }
     }
     Ok(contents)
