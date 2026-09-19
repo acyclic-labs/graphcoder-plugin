@@ -32,7 +32,7 @@ Releases are built natively per target, carry SLSA build-provenance and SBOM att
 
 ### Per host
 
-Two adapter shapes exist. **Hook-based** hosts expose a lifecycle-hook API, so a checkpoint is taken automatically around every edit and command; the adapter is checked-in config the whole team inherits. **MCP-based** hosts have no such API; the adapter registers `acyclic mcp`, an MCP server that exposes `checkpoint`/`timeline`/`rewind`/`diff`/`restore`/`turns`/`brief` as tools the model calls explicitly, and the daemon's idle timer (`auto_checkpoint_idle_ms`) catches edits nothing asked to checkpoint.
+Three adapter shapes exist. **Capability-based**: Pydantic AI is a framework, not an app, so its adapter is a Python package (`acyclic-pydantic-ai`) whose `Acyclic` capability rides the agent's own lifecycle: a checkpoint before and after every mutating tool call, a turn per `agent.run`, the previous session's brief in the instructions, and rewind/timeline/diff as native tools. **Hook-based** hosts expose a lifecycle-hook API, so a checkpoint is taken automatically around every edit and command; the adapter is checked-in config the whole team inherits. **MCP-based** hosts have no such API; the adapter registers `acyclic mcp`, an MCP server that exposes `checkpoint`/`timeline`/`rewind`/`diff`/`restore`/`turns`/`brief` as tools the model calls explicitly, and the daemon's idle timer (`auto_checkpoint_idle_ms`) catches edits nothing asked to checkpoint.
 
 | Host | Surface | Shape | Command | What it writes | Verified |
 |---|---|---|---|---|---|
@@ -44,6 +44,7 @@ Two adapter shapes exist. **Hook-based** hosts expose a lifecycle-hook API, so a
 | VS Code (Copilot agent mode) | IDE | MCP | `acyclic install vscode` | `.vscode/mcp.json` — checked in and portable: bare `acyclic` from `PATH`, and the server finds the repo from its working directory | server side: `mcp-e2e.sh`; config shape from VS Code's docs, unit-tested. VS Code reading it: not yet |
 | OpenCode | CLI | MCP | `acyclic install opencode` | `opencode.json` (`mcp.acyclic`, `type: "local"`, command-as-array) + AGENTS.md cheatsheet — checked in and portable: bare `acyclic` from `PATH` | `opencode mcp list` reports `✓ acyclic connected` against the written config (2026-09-16); server side: `mcp-e2e.sh`. No in-chat tool call yet |
 | GitHub Copilot CLI | CLI | MCP | `acyclic install copilot` | `mcpServers.acyclic-<repo name>` in your global `~/.copilot/mcp-config.json` (`$COPILOT_HOME` moves it), one entry per repo — **per machine, not checked in** | server side: `mcp-e2e.sh`; config shape from GitHub's docs, unit-tested. A live `copilot` session: `mcp-clients-e2e.sh` runs it when the CLI is on `PATH` — not yet exercised here (CLI not installed) |
+| Pydantic AI | Python framework | capability (hooks) | `acyclic install pydantic-ai` | AGENTS.md cheatsheet — checked in; adds the `acyclic-pydantic-ai` PyPI package to the project **after a y/N prompt** (`--yes` for scripts). Attach with one line: `Agent(model, capabilities=[Acyclic()])` | real Pydantic AI agent on a scripted model, every run of `run-all.sh`: `pydantic-e2e.sh` (pydantic-ai 2.45.0). Live model: `ACYCLIC_E2E_PYDANTIC_MODEL=<model>` |
 | Copilot coding agent (cloud) | GitHub-hosted | MCP | `acyclic install copilot-agent` | `.github/workflows/copilot-setup-steps.yml` — checked in; the MCP entry itself is **printed to paste** into the repo's Copilot settings, since GitHub stores it there rather than in a file | not verified. The agent runs in a GitHub-hosted sandbox, so its checkpoints are that sandbox's timeline, not your local one — see the caveat below |
 
 The Copilot coding agent is the one host that is not a local integration: it runs on GitHub's infrastructure against its own checkout, so `acyclic` there records that sandbox's work, and nothing it checkpoints reaches your machine unless it lands on a branch. `install copilot-agent` prepares that sandbox and prints the config to paste; it does not pretend to give you local parity.
@@ -72,6 +73,8 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 | `store_dir` | `~/.local/share/acyclic/stores` | Where stores live. Never inside the repo. |
 
 Speculation is configured separately, in `~/.config/acyclic/speculate.toml` — per developer, never checked in, because turning it on can spend that developer's money. See [Speculation](#speculation).
+
+`exclude` matches **paths, not names**: `exclude = ["__pycache__"]` excludes a top-level `__pycache__/` and nothing else — it will not exclude `src/__pycache__/`. Name every path you mean (`"src/__pycache__"`), or exclude the directory that contains them. The wrong form fails silently and looks like it worked: the build output is captured anyway, and a Rust `target/` measured 1.4&nbsp;GB of store and +29&nbsp;s per build against 14&nbsp;MB and 35&nbsp;s with it excluded.
 
 Adding a path to `exclude` takes effect at the next daemon start; the baseline it builds is scrubbed, and every later checkpoint skips the path. Generations captured before the rule still hold it (see below).
 

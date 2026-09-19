@@ -18,6 +18,8 @@ pub const SPECULATE_CONFIG_ENV: &str = concat!(env!("PRODUCT_ENV_PREFIX"), "_SPE
 pub const NPM_PACKAGE: &str = env!("PRODUCT_NPM_PACKAGE");
 /// `owner/repo` on GitHub, for release and issue links.
 pub const GITHUB_REPO: &str = env!("PRODUCT_GITHUB_REPO");
+/// The `PyPI` package that carries the Pydantic AI capability.
+pub const PYPI_PACKAGE: &str = env!("PRODUCT_PYPI_PACKAGE");
 
 /// The checked-in per-repo config directory, `.<name>`.
 pub fn repo_config_dir() -> String {

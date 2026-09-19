@@ -54,6 +54,18 @@ Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
 
 ### Added
 
+- **Pydantic AI adapter.** `acyclic install pydantic-ai` writes the AGENTS.md
+  cheatsheet and offers (y/N on a terminal, `--yes` for scripts) to add the
+  new `acyclic-pydantic-ai` PyPI package to the project (uv, Poetry, a
+  requirements file, or a printed `pip install`). The package's `Acyclic`
+  capability is one line on an agent, `Agent(model, capabilities=[Acyclic()])`,
+  and gives it what the Claude Code hooks give Claude Code: a checkpoint
+  before and after every mutating tool call attributed to the tool and the
+  `agent.run` turn, the previous session's brief in the instructions, and
+  rewind/timeline/diff/restore/turns/brief/checkpoint as native tools. Every
+  hook is advisory and bounded; `ACYCLIC_DISABLED=1` turns it off.
+  `tests/acceptance/pydantic-e2e.sh` drives a real Pydantic AI agent on a
+  scripted model against the daemon on every `run-all.sh` pass.
 - `acyclic status` prints a `watcher:` line once the native watcher has lost
   its epoch: invalidation count, full-rescan count and cost, and the last
   reason. `ACYCLIC_TRACE=1` now names the invalidation reason, times each

@@ -88,6 +88,11 @@ enum Command {
     Turns {
         #[arg(long)]
         session: Option<String>,
+        /// Newest first, like `timeline --limit`. A long session has one turn
+        /// per prompt, so the default is the recent history rather than all of
+        /// it.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// One checkpoint resolved to its session, turn, and prompt.
     Show { checkpoint: i64 },
@@ -198,6 +203,10 @@ enum Command {
     Install {
         #[arg(value_enum)]
         host: install::Host,
+        /// Answer yes to anything the adapter would ask (today only
+        /// `pydantic-ai` asks: whether to add its package to your project).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// MCP stdio server: exposes checkpoint/timeline/rewind/diff/restore/
     /// turns/brief as tools for hosts that speak MCP (Claude Desktop, VS
@@ -326,7 +335,8 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                 1
             }
         },
-        Command::Install { host } => match install::run(repo, host) {
+        Command::Install { host, yes } => match install::run(repo, host, &install::Options { yes })
+        {
             Ok(()) => {
                 print_mount_capability();
                 0
@@ -663,7 +673,7 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
             }
             Ok(())
         }
-        Command::Turns { session } => {
+        Command::Turns { session, limit } => {
             let reply = client.call(proto::Op::Turns {
                 session_id: session,
             })?;
@@ -674,7 +684,11 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                 println!("no turns recorded (the user-prompt hook records them)");
                 return Ok(());
             }
-            for turn in turns {
+            // Trimmed here rather than in the protocol: the daemon already
+            // answers with the session's turns, and a limit is a display
+            // concern. Newest first, matching `timeline`.
+            let hidden = turns.len().saturating_sub(limit);
+            for turn in turns.into_iter().take(limit) {
                 let range = match (turn.first_checkpoint, turn.last_checkpoint) {
                     (Some(first), Some(last)) if first != last => format!("#{first}..#{last}"),
                     (Some(first), _) => format!("#{first}"),
@@ -688,6 +702,9 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                     range,
                     brief::quote(&turn.prompt, 72),
                 );
+            }
+            if hidden > 0 {
+                println!("… {hidden} older turn(s) not shown (--limit)");
             }
             Ok(())
         }

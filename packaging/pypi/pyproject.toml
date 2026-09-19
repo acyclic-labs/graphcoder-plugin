@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "acyclic-pydantic-ai"
+version = "0.0.1"
+description = "Checkpoint every Pydantic AI tool call with acyclic: rewind exactly, see the blast radius."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+# The capability lifecycle this rides on (before_run, wrap_tool_execute,
+# get_instructions, get_toolset) is what pydantic-ai 2.45 ships; nothing
+# older has been exercised.
+dependencies = ["pydantic-ai-slim>=2.45.0"]
+keywords = ["pydantic-ai", "checkpoint", "rewind", "agents"]
+
+[project.urls]
+Homepage = "https://acyclic.dev"
+Source = "https://github.com/acyclic-labs/graphcoder-plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/acyclic_pydantic_ai"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -70,7 +70,10 @@ is what exists, including where it diverged from the plan.
 ## Notes
 
 - Fork orchestration of subagents is uniquely plugin-shaped — it must live inside the host.
-- Filesystem-layer enforcement for guarded paths arrives with the mount option. Copy-mode forks cannot enforce this policy at the filesystem boundary.
+- `exclude` does not apply to paths created inside a fork: build output written into a mount is
+  captured in full and snapshotted by `promote`, which wedged a store in one live run. See
+  [fork-writes-bypass-exclude.md](fork-writes-bypass-exclude.md).
+- Filesystem-layer enforcement for Launch 4's guarded paths arrives with the mount option. This turned out to be the decisive argument: the mount shipped and reflinks never did, and Safe Mode refuses to start without a mount provider.
 
 ## Open questions (not yet settled)
 

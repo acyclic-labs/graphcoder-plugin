@@ -229,6 +229,7 @@ impl Client {
         };
         let mut line = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
         line.push(b'\n');
+
         let mut sent = 0;
         while sent < line.len() {
             self.stream
@@ -256,7 +257,7 @@ impl Client {
                 .fill_buf()
                 .map_err(|error| format!("receive: {error}"))?;
             if available.is_empty() {
-                return Err("receive: daemon closed the connection".to_owned());
+                return Err("daemon stopped while answering; nothing was recorded".to_owned());
             }
             let count = available
                 .iter()
@@ -272,8 +273,7 @@ impl Client {
                 break;
             }
         }
-        let response: proto::Response =
-            serde_json::from_slice(&response_line).map_err(|error| format!("decode: {error}"))?;
+        let response = parse_response(&response_line)?;
         if response.id != id {
             return Err(format!(
                 "receive: response id {} does not match request {id}",
@@ -282,6 +282,13 @@ impl Client {
         }
         Ok(response.payload)
     }
+}
+
+fn parse_response(line: &[u8]) -> Result<proto::Response, String> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Err("daemon stopped while answering; nothing was recorded".to_owned());
+    }
+    serde_json::from_slice(line).map_err(|error| format!("decode: {error}"))
 }
 
 fn unexpected_reply(operation: &str, reply: &proto::Reply) -> String {
@@ -537,5 +544,66 @@ fn wait_for_socket(
         }
         std::thread::sleep(retry_delay);
         retry_delay = (retry_delay * 2).min(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_socket_says_the_daemon_stopped() {
+        // The regression: a daemon that exits mid-answer closes the socket, the
+        // read succeeds with nothing, and serde called that
+        // "decode: EOF while parsing a value at line 1 column 0" — which reads
+        // as corruption. Anyone running `stop` then any other verb saw it.
+        for line in ["", "\n", "   \n"] {
+            let error = parse_response(line.as_bytes()).expect_err("empty must be an error");
+            assert!(
+                error.contains("daemon stopped"),
+                "unhelpful message for {line:?}: {error}"
+            );
+            assert!(!error.contains("decode"), "leaked serde wording: {error}");
+        }
+    }
+
+    #[test]
+    fn malformed_json_still_reports_a_decode_error() {
+        // Genuine corruption must stay distinguishable from a clean shutdown.
+        let error = parse_response(b"{not json").expect_err("must be an error");
+        assert!(error.starts_with("decode:"), "{error}");
+    }
+
+    #[test]
+    fn an_error_payload_surfaces_its_own_message() {
+        // Built from the protocol types and serialized, rather than a
+        // hand-written literal: the payload is flattened and renamed, so a
+        // literal here would test my guess at the wire format instead of the
+        // format. The first attempt did exactly that and failed.
+        let line = serde_json::to_string(&proto::Response {
+            id: 1,
+            payload: proto::Payload::Err {
+                message: "no such checkpoint".to_owned(),
+            },
+        })
+        .expect("serialize");
+        let response = parse_response(line.as_bytes()).expect("valid response");
+        let proto::Payload::Err { message } = response.payload else {
+            panic!("expected error payload");
+        };
+        assert_eq!(message, "no such checkpoint");
+    }
+
+    #[test]
+    fn an_ok_payload_round_trips() {
+        let line = serde_json::to_string(&proto::Response {
+            id: 1,
+            payload: proto::Payload::Ok(Box::new(proto::Reply::Pong)),
+        })
+        .expect("serialize");
+        assert!(matches!(
+            parse_response(line.as_bytes()).expect("ok payload").payload,
+            proto::Payload::Ok(reply) if matches!(*reply, proto::Reply::Pong)
+        ));
     }
 }

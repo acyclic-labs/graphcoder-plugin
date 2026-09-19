@@ -39,4 +39,8 @@ fn main() {
     );
     println!("cargo:rustc-env=PRODUCT_NPM_PACKAGE={}", get("npm_package"));
     println!("cargo:rustc-env=PRODUCT_GITHUB_REPO={}", get("github_repo"));
+    println!(
+        "cargo:rustc-env=PRODUCT_PYPI_PACKAGE={}",
+        get("pypi_package")
+    );
 }

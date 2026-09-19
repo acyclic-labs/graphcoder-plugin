@@ -40,6 +40,7 @@ tests/acceptance/claude-e2e.sh        # Claude Code hooks
 tests/acceptance/codex-e2e.sh         # Codex hooks
 tests/acceptance/cursor-e2e.sh        # cursor-agent hooks
 tests/acceptance/mcp-clients-e2e.sh   # MCP server driven by claude, codex, cursor-agent, opencode
+tests/acceptance/pydantic-e2e.sh      # Pydantic AI capability; scripted model, no credentials needed
 ```
 
 Each one installs the adapter into a throwaway repo, runs one short model
@@ -96,6 +97,30 @@ cursor-agent               # or open the repo in Cursor.app
 Cursor asks to trust the workspace before loading `.cursor/hooks.json`.
 The checks are the same as for Claude Code. `install cursor` also writes
 `.cursor/mcp.json`; the MCP section below covers approving it.
+
+### Pydantic AI (a capability inside the developer's Python process)
+
+```sh
+tests/acceptance/pydantic-e2e.sh      # scripted model, no credentials: the hook path itself
+ACYCLIC_E2E_PYDANTIC_MODEL=anthropic:claude-opus-5 tests/acceptance/pydantic-e2e.sh   # live
+```
+
+By hand, in a Python project (a venv with `pydantic-ai-slim` installed):
+
+```sh
+cd your-python-repo && acyclic init
+acyclic install pydantic-ai             # y at the prompt, or --yes
+```
+
+Expect: `AGENTS.md` carries the cheatsheet, and the package was added with
+the project's own manager (`uv add`, `poetry add`, a line in
+`requirements.txt`, or a printed `pip install` when there is nothing to
+write to). Piped stdin never prompts; it prints the command and moves on.
+Then attach `Acyclic()` to an agent as the install output shows and run it
+from the repo. `acyclic sessions` lists a `pydantic-ai` session,
+`acyclic timeline --session <id>` has `pre`/`post` rows named after the
+agent's own tools, and the model can call `acyclic_rewind`. A second
+process run afterwards receives the first one's brief in its instructions.
 
 ## MCP hosts (tools the model calls)
 
@@ -247,6 +272,7 @@ them by hand if the scratch repo goes away.
 | Claude Desktop | current | MCP | server started, `initialize` + `tools/list` succeeded on launch; in-chat tool call not exercised |
 | VS Code | 1.137.0 | MCP | config written; Copilot extension not installed here, not exercised |
 | GitHub Copilot CLI | — | MCP | not exercised: `copilot` not installed on this machine. Config shape unit-tested against GitHub's current docs |
+| Pydantic AI | 2.45.0 | capability (`pydantic-e2e.sh`) | pass, scripted model, 2026-09-18: pre/post rows with `write_file`/`run_shell` attribution, read-only tool skipped, diff, rewind |
 | Copilot coding agent | — | MCP | not exercised: needs the setup workflow on the default branch and a real agent run |
 
 Findings fixed during that pass: Codex 0.154 ignores a `hooks.json` without

@@ -75,7 +75,9 @@ which reads as though Launch 5 exists.
    answer it gives will be silently incomplete rather than refused. *No lean.*
 4. **Forks do not see excluded paths either**, which
    bears directly on "searches against a fork must answer from that tree's
-   state". *No lean.*
+   state". *No lean.* The converse is now a known gap: paths *created* inside
+   a fork are captured regardless of `exclude` — see
+   [fork-writes-bypass-exclude.md](fork-writes-bypass-exclude.md).
 5. **Does the name change?** Calling this "the index engine" collides with the
    shipped metadata index. *Current lean: rename this launch, not the shipped
    component.*

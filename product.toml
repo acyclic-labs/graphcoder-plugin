@@ -13,4 +13,5 @@
 # not derived from `name`.
 name = "acyclic"
 npm_package = "@acyclic-labs/plugin"
+pypi_package = "acyclic-pydantic-ai"
 github_repo = "acyclic-labs/graphcoder-plugin"
