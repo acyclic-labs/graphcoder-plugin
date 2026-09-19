@@ -21,7 +21,9 @@ pub use acyclic_fs::text_merge::{
 use acyclic_fs::text_merge::{
     merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
 };
-use acyclic_fs::{ByteRange, CancellationToken, GenerationId, WorkCounters};
+use acyclic_fs::{
+    ByteRange, CancellationToken, FileRecordRangeReadRequest, GenerationId, WorkCounters,
+};
 use bytes::Bytes;
 
 use crate::diff;
@@ -32,6 +34,7 @@ use crate::{EngineError, Result};
 /// Default `[merge] max_file_bytes`.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TRANSFER_BYTES: u64 = 8 * 1024 * 1024;
+const FILE_READ_CONCURRENCY: usize = 32;
 const PAGE_ENTRIES: u32 = 1_024;
 // ---------------------------------------------------------------------------
 // Per-path decision table
@@ -608,14 +611,74 @@ pub async fn read_files(
         .await
         .map_err(EngineError::fs("batch lookup"))?
         .value;
-    let mut contents = Vec::with_capacity(paths.len());
-    for ((path, namespace), entry) in paths.iter().zip(namespaces).zip(lookup.entries) {
-        match entry.record {
-            Some(record) if record.kind == FileKind::Regular => contents.push(Some(
-                read_regular_record(&mut checkout, &namespace, record, path).await?,
-            )),
-            _ => contents.push(None),
+    let limits = checkout.volume_config().limits;
+    let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
+    let mut contents = vec![None; paths.len()];
+    let mut requests = Vec::new();
+    let mut destinations = Vec::new();
+    for (index, entry) in lookup.entries.into_iter().enumerate() {
+        let Some(record) = entry
+            .record
+            .filter(|record| record.kind == FileKind::Regular)
+        else {
+            continue;
+        };
+        let length = match record.payload {
+            acyclic_fs::kernel::FilePayload::InlineRegular(inline) => {
+                inline.as_bytes().len() as u64
+            }
+            acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
+            _ => unreachable!("regular records have regular payloads"),
+        };
+        let display_path = paths
+            .get(index)
+            .ok_or_else(|| EngineError::Fs("batch lookup returned too many entries".into()))?;
+        let capacity = usize::try_from(length).map_err(|_| {
+            EngineError::Fs(format!(
+                "{}: file is too large for this host",
+                display_path.display()
+            ))
+        })?;
+        let content = contents
+            .get_mut(index)
+            .ok_or_else(|| EngineError::Fs("batch lookup returned too many entries".into()))?;
+        *content = Some(Vec::with_capacity(capacity));
+        let mut offset = 0;
+        while offset < length {
+            let take = chunk.min(length - offset);
+            requests.push(FileRecordRangeReadRequest {
+                record,
+                range: ByteRange {
+                    offset,
+                    length: take,
+                },
+            });
+            destinations.push(index);
+            offset += take;
         }
+    }
+    if requests.is_empty() {
+        return Ok(contents);
+    }
+    let reader = checkout
+        .pinned_reader()
+        .map_err(EngineError::fs("open pinned reader"))?;
+    let reads = reader
+        .read_file_record_ranges(
+            &requests,
+            FILE_READ_CONCURRENCY,
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
+        .await
+        .map_err(EngineError::fs("batch read file ranges"))?
+        .value;
+    for (destination, read) in destinations.into_iter().zip(reads) {
+        contents
+            .get_mut(destination)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| EngineError::Fs("batch read returned an invalid destination".into()))?
+            .extend_from_slice(&read.bytes);
     }
     Ok(contents)
 }
