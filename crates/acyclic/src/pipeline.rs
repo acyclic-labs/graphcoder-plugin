@@ -33,6 +33,50 @@ const MAXIMUM_EXTENT_SPANS: u32 = 65_536;
 const WATCH_QUEUE: u32 = 65_536;
 const POLL_CHANGES: u32 = 16_384;
 
+#[cfg(target_os = "windows")]
+const CONTINUITY_MAGIC: &[u8; 8] = b"ACCONT\0\x01";
+#[cfg(target_os = "windows")]
+const CONTINUITY_BYTES: usize = 88;
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct ContinuityRecord {
+    generation: GenerationId,
+    row: i64,
+    usn: acyclic_fs::WindowsUsnCheckpoint,
+}
+
+#[cfg(target_os = "windows")]
+impl ContinuityRecord {
+    fn encode(self) -> [u8; CONTINUITY_BYTES] {
+        let mut bytes = [0_u8; CONTINUITY_BYTES];
+        bytes[..8].copy_from_slice(CONTINUITY_MAGIC);
+        bytes[8..40].copy_from_slice(self.generation.digest().as_bytes());
+        bytes[40..48].copy_from_slice(&self.row.to_le_bytes());
+        bytes[48..].copy_from_slice(&self.usn.to_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != CONTINUITY_BYTES || !bytes.starts_with(CONTINUITY_MAGIC) {
+            return None;
+        }
+        let mut generation = [0_u8; 32];
+        generation.copy_from_slice(bytes.get(8..40)?);
+        let mut row = [0_u8; 8];
+        row.copy_from_slice(bytes.get(40..48)?);
+        let row = i64::from_le_bytes(row);
+        if row <= 0 {
+            return None;
+        }
+        Some(Self {
+            generation: GenerationId::new(acyclic_fs::Digest::from_bytes(generation)),
+            row,
+            usn: acyclic_fs::WindowsUsnCheckpoint::from_bytes(bytes.get(48..)?).ok()?,
+        })
+    }
+}
+
 fn fork_moved(base: GenerationId) -> PromoteOutcome {
     PromoteOutcome::Conflict {
         message: format!(
@@ -800,9 +844,15 @@ impl Pipeline {
             },
         )
         .map_err(EngineError::fs("open watcher"))?;
-        watch
-            .begin_rescan()
-            .map_err(EngineError::fs("begin rescan"))?;
+        #[cfg(target_os = "windows")]
+        let admitted = Self::admit_continuity(&store, &index, &mut watch)?;
+        #[cfg(not(target_os = "windows"))]
+        let admitted = false;
+        if !admitted {
+            watch
+                .begin_rescan()
+                .map_err(EngineError::fs("begin rescan"))?;
+        }
 
         let options = CaptureOptions {
             source_root: repo_root.clone(),
@@ -813,6 +863,7 @@ impl Pipeline {
         };
 
         let exclusions = Exclusions::parse(&config.exclude)?;
+        let latest = admitted.then(|| index.latest()).transpose()?.flatten();
         let pipeline = Self {
             store,
             index,
@@ -821,15 +872,51 @@ impl Pipeline {
             options,
             exclusions,
             cancel,
-            state: State::NeedsBaseline,
-            last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
-            last_checkpoint_row: None,
+            state: if admitted {
+                State::Ready
+            } else {
+                State::NeedsBaseline
+            },
+            last_generation: latest
+                .as_ref()
+                .map_or(GenerationId::new(acyclic_fs::Digest::ZERO), |row| {
+                    row.generation
+                }),
+            last_checkpoint_row: latest.map(|row| row.id),
             checkpoints_since_commit: 0,
             last_activity: Instant::now(),
             watcher_health: WatcherHealth::default(),
             auto_pending: None,
         };
         Ok(pipeline)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn admit_continuity(store: &Store, index: &Index, watch: &mut NativeWatch) -> Result<bool> {
+        let bytes = match std::fs::read(store.paths.continuity()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Ok(false),
+        };
+        let Some(record) = ContinuityRecord::decode(&bytes) else {
+            return Ok(false);
+        };
+        let Some(row) = index.latest()? else {
+            return Ok(false);
+        };
+        if !row.published
+            || row.id != record.row
+            || row.generation != record.generation
+            || store.checkout.generation_id() != record.generation
+        {
+            return Ok(false);
+        }
+        Ok(matches!(
+            watch
+                .accept_windows_usn_baseline(record.usn)
+                .map_err(EngineError::fs("admit Windows continuity"))?,
+            Ok(acyclic_fs::WindowsUsnContinuity::Unchanged)
+        ))
     }
 
     async fn ensure_ready(&mut self) -> Result<()> {
@@ -855,6 +942,8 @@ impl Pipeline {
         // A newly created hard link can race the rescan tail. Restart with a
         // fresh watcher so the next full capture sees every alias together.
         for attempt in 0..3 {
+            #[cfg(target_os = "windows")]
+            let continuity = acyclic_fs::capture_windows_usn_checkpoint(&self.store.repo_root).ok();
             // A baseline requires a clean checkout. Mid-session (watcher
             // invalidation, rewind) the overlay holds uncommitted captures:
             // publish them first. At startup this is a no-op.
@@ -941,6 +1030,18 @@ impl Pipeline {
             self.last_checkpoint_row = Some(row);
             let phase = Instant::now();
             self.commit_engine().await?;
+            #[cfg(target_os = "windows")]
+            if let Some(usn) = continuity {
+                crate::store::durable_replace(
+                    &self.store.paths.continuity(),
+                    &ContinuityRecord {
+                        generation,
+                        row,
+                        usn,
+                    }
+                    .encode(),
+                )?;
+            }
             let postcommit_ms = crate::trace::ms(phase);
             self.state = State::Ready;
             if kind == CheckpointKind::Recovered {
@@ -2157,6 +2258,58 @@ mod root_hint_tests {
         let (out, hint) = strip_root_hints(input);
         assert_eq!(hint, RootHint::None);
         assert!(matches!(out, WatchBatch::RescanRequired { .. }));
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod continuity_tests {
+    use super::*;
+
+    fn record() -> ContinuityRecord {
+        let mut bytes = [0_u8; 40];
+        bytes[..8].copy_from_slice(b"ACYUSN\0\x01");
+        bytes[8..24].copy_from_slice(&[7; 16]);
+        bytes[24..32].copy_from_slice(&19_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&23_u64.to_le_bytes());
+        let usn = acyclic_fs::WindowsUsnCheckpoint::from_bytes(&bytes).expect("canonical fixture");
+        ContinuityRecord {
+            generation: GenerationId::new(acyclic_fs::Digest::from_bytes([3; 32])),
+            row: 7,
+            usn,
+        }
+    }
+
+    #[test]
+    fn continuity_record_is_canonical_and_rejects_torn_state() {
+        let record = record();
+        let bytes = record.encode();
+        let decoded = ContinuityRecord::decode(&bytes).expect("canonical record");
+        assert_eq!(decoded.generation, record.generation);
+        assert_eq!(decoded.row, record.row);
+        assert_eq!(decoded.usn, record.usn);
+        assert!(ContinuityRecord::decode(&bytes[..CONTINUITY_BYTES - 1]).is_none());
+        let mut wrong_version = bytes;
+        wrong_version[0] ^= 0xff;
+        assert!(ContinuityRecord::decode(&wrong_version).is_none());
+        let mut invalid_row = bytes;
+        invalid_row[40..48].copy_from_slice(&0_i64.to_le_bytes());
+        assert!(ContinuityRecord::decode(&invalid_row).is_none());
+    }
+
+    #[test]
+    fn durable_replacement_keeps_only_the_complete_new_record() {
+        let directory = tempfile::tempdir().expect("store");
+        let path = directory.path().join("continuity.bin");
+        let first = record().encode();
+        crate::store::durable_replace(&path, &first).expect("first replace");
+        let mut second = record();
+        second.row += 1;
+        crate::store::durable_replace(&path, &second.encode()).expect("second replace");
+        let stored = std::fs::read(path).expect("read marker");
+        assert_eq!(
+            ContinuityRecord::decode(&stored).expect("complete").row,
+            second.row
+        );
     }
 }
 

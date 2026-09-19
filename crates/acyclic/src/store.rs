@@ -4,6 +4,8 @@
 //! tree and fail-closes on sockets). The repo carries only `.acyclic/config.toml`.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::{fs::OpenOptions, io::Write};
 
 use acyclic_fs::model::{
     AccessMode, CheckoutMode, ConsistencyMode, GenerationSelector, Lifecycle, MutationMode,
@@ -74,6 +76,8 @@ impl StorePaths {
             self.rewind_journal(),
             self.trash(),
             self.meta(),
+            #[cfg(target_os = "windows")]
+            self.continuity(),
             self.root.join("daemon.log"),
         ] {
             let resolved = canonicalize_planned(&path)?;
@@ -114,6 +118,10 @@ impl StorePaths {
     }
     pub fn meta(&self) -> PathBuf {
         self.root.join("meta.json")
+    }
+    #[cfg(target_os = "windows")]
+    pub fn continuity(&self) -> PathBuf {
+        self.root.join("continuity.bin")
     }
     /// Speculation cache. Deliberately NOT a table in `index_db`: the
     /// pipeline thread owns that connection and writes to it synchronously,
@@ -391,6 +399,46 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn durable_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("bin.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = tmp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both paths are terminated UTF-16 buffers live for this call.
+    #[allow(unsafe_code)]
+    let replaced = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
