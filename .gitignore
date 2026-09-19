@@ -7,3 +7,5 @@ target/
 build/
 .infisical.json
 .claude/worktrees/
+__pycache__/
+.pytest_cache/

@@ -15,7 +15,7 @@
 //! README's per-host table is the user-facing version of the same list,
 //! with how far each adapter has been verified.
 
-use acyclic_engine::product::{self, NAME, NPM_PACKAGE};
+use acyclic_engine::product::{self, NAME, NPM_PACKAGE, PYPI_PACKAGE};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -39,6 +39,8 @@ pub enum Host {
     OpenCode,
     Copilot,
     CopilotAgent,
+    #[value(name = "pydantic-ai")]
+    PydanticAi,
 }
 
 // TODO(more hosts): the two shapes this file already covers — lifecycle
@@ -67,11 +69,20 @@ pub enum Host {
 //   unresearched. Likely MCP-capable (most 2026-era agent tools are) but
 //   config location/shape unverified — do not assume any of them match
 //   Claude Desktop/Cursor's shape without checking.
-pub fn run(repo: &Path, host: Host) -> Result<(), String> {
+pub fn run(repo: &Path, host: Host, options: &Options) -> Result<(), String> {
     let adapter = adapter(host);
     adapter
-        .install(repo)
+        .install_with(repo, options)
         .map_err(|error| format!("{}: {error}", adapter.id()))
+}
+
+/// Flags shared by every adapter. Most ignore them: the checked-in hosts
+/// write files the whole team inherits and never ask anything. An adapter
+/// that touches something the developer owns personally (their project's
+/// dependency list) asks first, and `yes` is how a script answers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    pub yes: bool,
 }
 
 /// What every host's adapter does: name itself, and wire itself into a repo.
@@ -81,6 +92,12 @@ pub fn run(repo: &Path, host: Host) -> Result<(), String> {
 trait HostAdapter {
     fn id(&self) -> &'static str;
     fn install(&self, repo: &Path) -> Result<(), String>;
+    /// `install`, with the flags. The default ignores them, which is right
+    /// for every adapter that never asks a question.
+    fn install_with(&self, repo: &Path, options: &Options) -> Result<(), String> {
+        let _ = options;
+        self.install(repo)
+    }
 }
 
 /// The registry. Exhaustive, so a new `Host` variant without an adapter is a
@@ -96,6 +113,7 @@ fn adapter(host: Host) -> &'static dyn HostAdapter {
         Host::OpenCode => &OpenCode,
         Host::Copilot => &COPILOT_CLI,
         Host::CopilotAgent => &CopilotAgent,
+        Host::PydanticAi => &PydanticAi,
     }
 }
 
@@ -1040,6 +1058,237 @@ jobs:
         run: {{name}} init
 "#;
 
+/// Pydantic AI: an agent framework, not an app, so there is no host config
+/// file to write. The lifecycle hooks live in the developer's own Python
+/// process, delivered by the `{{pypi_package}}` package: a Pydantic AI
+/// *capability* that checkpoints before and after every mutating tool call,
+/// opens a turn per `agent.run`, injects the previous session's brief, and
+/// exposes rewind/timeline/diff as native tools. Attaching it is one line:
+///
+///     agent = Agent(model, capabilities=[Acyclic()])
+///
+/// What this adapter does is get the developer to that line: the AGENTS.md
+/// cheatsheet (checked in, as for every other host), then the dependency.
+/// Adding a package to someone's project is theirs to approve, so it asks
+/// on a terminal, treats no answer as no, and takes `--yes` from a script.
+/// Nothing here spawns a package manager without one of those.
+struct PydanticAi;
+
+impl HostAdapter for PydanticAi {
+    fn id(&self) -> &'static str {
+        "pydantic-ai"
+    }
+    fn install(&self, repo: &Path) -> Result<(), String> {
+        self.install_with(repo, &Options::default())
+    }
+    fn install_with(&self, repo: &Path, options: &Options) -> Result<(), String> {
+        pydantic_ai(repo, options, &mut TerminalPrompt)
+    }
+}
+
+/// How a yes/no question reaches the developer. The terminal one reads
+/// stdin only when stdin is a terminal; tests answer from a script.
+trait Confirm {
+    fn confirm(&mut self, question: &str) -> bool;
+}
+
+struct TerminalPrompt;
+
+impl Confirm for TerminalPrompt {
+    fn confirm(&mut self, question: &str) -> bool {
+        use std::io::{BufRead, IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        print!("{question} [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        if std::io::stdin().lock().read_line(&mut answer).is_err() {
+            return false;
+        }
+        matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
+    }
+}
+
+/// Which Python packaging setup a repo uses, and therefore how the package
+/// gets added. Detection is by lockfile and manifest, in the order a
+/// developer would expect: a `uv.lock` means uv even if a requirements file
+/// is also lying around.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PythonProject {
+    /// `uv add <pkg>`.
+    Uv,
+    /// `poetry add <pkg>`.
+    Poetry,
+    /// Append a line to this requirements file.
+    Requirements(PathBuf),
+    /// A `pyproject.toml` with no recognised manager: `pip install <pkg>`.
+    Pip,
+    /// Nothing that looks like a Python project.
+    None,
+}
+
+fn detect_python_project(repo: &Path) -> PythonProject {
+    let pyproject = repo.join("pyproject.toml");
+    if repo.join("uv.lock").is_file() {
+        return PythonProject::Uv;
+    }
+    if repo.join("poetry.lock").is_file() {
+        return PythonProject::Poetry;
+    }
+    if let Ok(text) = std::fs::read_to_string(&pyproject) {
+        if text.contains("[tool.uv") {
+            return PythonProject::Uv;
+        }
+        if text.contains("[tool.poetry") {
+            return PythonProject::Poetry;
+        }
+    }
+    for name in ["requirements.txt", "requirements.in"] {
+        let path = repo.join(name);
+        if path.is_file() {
+            return PythonProject::Requirements(path);
+        }
+    }
+    if pyproject.is_file() {
+        return PythonProject::Pip;
+    }
+    PythonProject::None
+}
+
+impl PythonProject {
+    /// The command that adds the package, as the developer would type it.
+    fn add_command(&self) -> Option<Vec<String>> {
+        let cmd = match self {
+            Self::Uv => vec!["uv", "add", PYPI_PACKAGE],
+            Self::Poetry => vec!["poetry", "add", PYPI_PACKAGE],
+            Self::Pip => vec!["pip", "install", PYPI_PACKAGE],
+            Self::Requirements(_) | Self::None => return None,
+        };
+        Some(cmd.into_iter().map(str::to_owned).collect())
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Uv => "a uv project".to_owned(),
+            Self::Poetry => "a Poetry project".to_owned(),
+            Self::Pip => "a pyproject.toml with no lockfile".to_owned(),
+            Self::Requirements(path) => format!(
+                "a {} file",
+                path.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            ),
+            Self::None => "no Python project files".to_owned(),
+        }
+    }
+}
+
+fn pydantic_ai(repo: &Path, options: &Options, prompt: &mut dyn Confirm) -> Result<(), String> {
+    agents_md(repo)?;
+
+    let project = detect_python_project(repo);
+    println!("pydantic-ai adapter: found {}", project.describe());
+    let added = match &project {
+        PythonProject::Requirements(path) => {
+            let question = format!("add {PYPI_PACKAGE} to {}?", path.display());
+            if options.yes || prompt.confirm(&question) {
+                append_requirement(path)?;
+                true
+            } else {
+                println!(
+                    "  skipped; add `{PYPI_PACKAGE}` to {} yourself",
+                    path.display()
+                );
+                false
+            }
+        }
+        PythonProject::None => {
+            println!("  no pyproject.toml or requirements file here; install the package where your agent runs:");
+            println!("    pip install {PYPI_PACKAGE}");
+            false
+        }
+        project => {
+            let command = project.add_command().unwrap_or_default();
+            let shown = command.join(" ");
+            if options.yes || prompt.confirm(&format!("run `{shown}` now?")) {
+                run_add_command(repo, &command)?;
+                true
+            } else {
+                println!("  skipped; run it yourself when ready:");
+                println!("    {shown}");
+                false
+            }
+        }
+    };
+
+    println!();
+    println!("attach it to your agent (one line):");
+    println!();
+    println!("    from pydantic_ai import Agent");
+    println!("    from acyclic_pydantic_ai import Acyclic");
+    println!();
+    println!("    agent = Agent(model, capabilities=[Acyclic()])");
+    println!();
+    println!("that checkpoints every mutating tool call, opens a turn per `agent.run`,");
+    println!("hands the model the previous session's brief, and gives it rewind, timeline,");
+    println!(
+        "diff and restore as tools. Tools that never touch the tree: `Acyclic(readonly=[...])`."
+    );
+    println!(
+        "Run your agent from this repo (or pass `Acyclic(repo=...)`); `{NAME} status` shows it."
+    );
+    if added {
+        println!("check AGENTS.md and the dependency change in so the whole team inherits it.");
+    } else {
+        println!("check AGENTS.md in so the whole team inherits the cheatsheet.");
+    }
+    Ok(())
+}
+
+/// One line, once: a second install must not duplicate it, and a pinned
+/// entry the developer already wrote (`{{pypi_package}}==0.0.1`) counts.
+fn append_requirement(path: &Path) -> Result<(), String> {
+    let existing = std::fs::read_to_string(path).map_err(stringify)?;
+    let present = existing.lines().any(|line| {
+        let spec = line.split('#').next().unwrap_or("").trim();
+        let name: String = spec
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .collect();
+        name.replace('_', "-").eq_ignore_ascii_case(PYPI_PACKAGE)
+    });
+    if present {
+        println!("  {} already lists {PYPI_PACKAGE}", path.display());
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(PYPI_PACKAGE);
+    content.push('\n');
+    write_atomic(path, &content)?;
+    println!("  added {PYPI_PACKAGE} to {}", path.display());
+    Ok(())
+}
+
+fn run_add_command(repo: &Path, command: &[String]) -> Result<(), String> {
+    let Some((program, args)) = command.split_first() else {
+        return Err("empty command".into());
+    };
+    println!("  running: {}", command.join(" "));
+    let status = std::process::Command::new(program)
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` exited with {status}", command.join(" ")))
+    }
+}
+
 fn stringify<E: std::fmt::Display>(error: E) -> String {
     error.to_string()
 }
@@ -1715,7 +1964,8 @@ mod tests {
             .filter(|host| !matches!(host, Host::ClaudeDesktop | Host::Copilot))
         {
             let dir = tempfile::tempdir().expect("tempdir");
-            run(dir.path(), host).unwrap_or_else(|error| panic!("{host:?}: {error}"));
+            run(dir.path(), host, &Options::default())
+                .unwrap_or_else(|error| panic!("{host:?}: {error}"));
         }
     }
 
@@ -1766,6 +2016,7 @@ mod tests {
             "opencode",
             "copilot",
             "copilot-agent",
+            "pydantic-ai",
         ] {
             assert!(names.contains(&documented), "{documented} went missing");
         }
@@ -2142,5 +2393,104 @@ mod tests {
         // A user command mentioning our phrase as an argument, not invoking
         // it, is left alone.
         assert!(!is_our_command(&format!("echo {NAME} hook mention")));
+    }
+
+    struct Answer(bool, usize);
+
+    impl Confirm for Answer {
+        fn confirm(&mut self, _question: &str) -> bool {
+            self.1 += 1;
+            self.0
+        }
+    }
+
+    #[test]
+    fn python_project_detection_prefers_the_lockfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        assert_eq!(detect_python_project(repo), PythonProject::None);
+
+        std::fs::write(repo.join("pyproject.toml"), "[project]\nname = \"x\"\n").expect("write");
+        assert_eq!(detect_python_project(repo), PythonProject::Pip);
+
+        std::fs::write(repo.join("requirements.txt"), "pydantic-ai\n").expect("write");
+        assert_eq!(
+            detect_python_project(repo),
+            PythonProject::Requirements(repo.join("requirements.txt"))
+        );
+
+        std::fs::write(repo.join("poetry.lock"), "").expect("write");
+        assert_eq!(detect_python_project(repo), PythonProject::Poetry);
+
+        std::fs::write(repo.join("uv.lock"), "").expect("write");
+        assert_eq!(detect_python_project(repo), PythonProject::Uv);
+        assert_eq!(
+            PythonProject::Uv.add_command().expect("command"),
+            vec!["uv", "add", PYPI_PACKAGE]
+        );
+    }
+
+    #[test]
+    fn pydantic_ai_install_asks_before_touching_requirements_and_appends_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let requirements = repo.join("requirements.txt");
+        std::fs::write(&requirements, "pydantic-ai>=2\n").expect("write");
+
+        // Declined: the cheatsheet lands, the dependency file is untouched.
+        let mut no = Answer(false, 0);
+        pydantic_ai(repo, &Options::default(), &mut no).expect("install");
+        assert_eq!(no.1, 1, "asked exactly once");
+        assert!(repo.join("AGENTS.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(&requirements).expect("read"),
+            "pydantic-ai>=2\n"
+        );
+
+        // Accepted, twice: one line, once.
+        let mut yes = Answer(true, 0);
+        pydantic_ai(repo, &Options::default(), &mut yes).expect("install");
+        pydantic_ai(repo, &Options::default(), &mut yes).expect("install");
+        assert_eq!(
+            std::fs::read_to_string(&requirements).expect("read"),
+            format!("pydantic-ai>=2\n{PYPI_PACKAGE}\n")
+        );
+
+        // --yes never asks.
+        let mut never = Answer(false, 0);
+        pydantic_ai(repo, &Options { yes: true }, &mut never).expect("install");
+        assert_eq!(never.1, 0);
+    }
+
+    #[test]
+    fn a_pinned_requirement_already_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requirements = dir.path().join("requirements.txt");
+        std::fs::write(
+            &requirements,
+            format!("{}==0.0.1  # pinned\n", PYPI_PACKAGE.replace('-', "_")),
+        )
+        .expect("write");
+        append_requirement(&requirements).expect("append");
+        assert_eq!(
+            std::fs::read_to_string(&requirements)
+                .expect("read")
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pydantic_ai_install_without_a_python_project_only_prints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut yes = Answer(true, 0);
+        pydantic_ai(dir.path(), &Options { yes: true }, &mut yes).expect("install");
+        assert_eq!(yes.1, 0);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["AGENTS.md"]);
     }
 }
