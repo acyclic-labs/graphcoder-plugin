@@ -1,10 +1,8 @@
 //! Blast-radius diff between two generations, keyed by path.
 //!
-//! `Volume::diff_generations` returns FileId-keyed changes with no path
-//! strings, so v1 walks both generations' directory records and compares
-//! records per path. Content addressing makes the comparison exact: equal
-//! payload object ids mean equal content. (Merkle-guided walking that skips
-//! identical subtrees needs an upstream cursor/path API — tracked.)
+//! Ordinary diffs use the SDK's Merkle-aware change set and resolve only
+//! changed directory identities to paths. The complete summary walker remains
+//! temporarily for three-way merge planning.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -88,43 +86,47 @@ pub async fn diff(
     if before == after {
         return Ok(Vec::new());
     }
-    let mut before_checkout = store.checkout_exact(before).await?;
-    let mut after_checkout = store.checkout_exact(after).await?;
-    let before_map = walk(&mut before_checkout).await?;
-    let after_map = walk(&mut after_checkout).await?;
-
-    let mut changes = Vec::new();
-    for (path, summary) in &before_map {
-        match after_map.get(path) {
-            None => changes.push(FileChange {
-                path: path.clone(),
-                change: ChangeKind::Removed,
-                file_kind: summary.kind,
-            }),
-            Some(other) if other == summary => {}
-            Some(other) => {
-                let change = if other.kind == summary.kind && other.payload == summary.payload {
-                    ChangeKind::MetadataOnly
-                } else {
-                    ChangeKind::Modified
-                };
-                changes.push(FileChange {
-                    path: path.clone(),
-                    change,
-                    file_kind: other.kind,
+    let before = store.generation(before).await?;
+    let after = store.generation(after).await?;
+    let set = before
+        .diff_to(&after, u32::MAX)
+        .await
+        .map_err(EngineError::fs("diff generations"))?;
+    let paths = set
+        .changed_paths(u32::MAX)
+        .await
+        .map_err(EngineError::fs("resolve changed paths"))?;
+    let mut changes = paths
+        .into_iter()
+        .filter_map(|path| {
+            let (change, file_kind) = match (&path.before, &path.after) {
+                (None, Some(after)) => (ChangeKind::Added, after.kind),
+                (Some(before), None) => (ChangeKind::Removed, before.kind),
+                (Some(before), Some(after)) => {
+                    let change = if before.kind == after.kind && before.payload == after.payload {
+                        ChangeKind::MetadataOnly
+                    } else {
+                        ChangeKind::Modified
+                    };
+                    (change, after.kind)
+                }
+                (None, None) => return None,
+            };
+            let path = path
+                .path
+                .components()
+                .iter()
+                .fold(PathBuf::new(), |mut path, component| {
+                    path.push(crate::names::bytes_to_os(component.as_bytes()));
+                    path
                 });
-            }
-        }
-    }
-    for (path, summary) in &after_map {
-        if !before_map.contains_key(path) {
-            changes.push(FileChange {
-                path: path.clone(),
-                change: ChangeKind::Added,
-                file_kind: summary.kind,
-            });
-        }
-    }
+            Some(FileChange {
+                path,
+                change,
+                file_kind,
+            })
+        })
+        .collect::<Vec<_>>();
     // Snapshots carry `.git` so rewind restores it, but a blast-radius
     // report is about the working tree: object and ref churn from ordinary
     // git commands would otherwise swamp the real changes.

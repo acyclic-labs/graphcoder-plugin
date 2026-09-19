@@ -24,6 +24,8 @@ use crate::{EngineError, Result};
 pub type LocalCheckout = Checkout<LocalAuthorityBackend, LocalObjectBackend>;
 /// Concrete workspace type for the local backend.
 pub type LocalWorkspace = acyclic_fs::Workspace<LocalAuthorityBackend, LocalObjectBackend>;
+/// Concrete immutable generation type for the local backend.
+pub type LocalGeneration = acyclic_fs::Generation<LocalAuthorityBackend, LocalObjectBackend>;
 
 /// Batch limits sized for large monorepos: the fs defaults (2,048) reject any
 /// baseline capture beyond ~2k paths. Immutable per volume — size generously.
@@ -220,14 +222,20 @@ pub fn read_only() -> CheckoutMode {
     }
 }
 
-/// Barrier durability for both providers: a full device flush per journal
-/// frame costs ~5ms each on Apple SSDs and a small capture issues dozens,
-/// while the store only needs to survive a daemon crash — a torn tail after
-/// power loss just drops the newest checkpoint.
+/// Exact local durability supported by this platform.
 pub fn local_options(root: impl Into<PathBuf>) -> LocalOptions {
     let mut options = LocalOptions::new(root);
-    options.stream.durability = LocalStreamDurability::Barrier;
-    options.objects.durability = LocalObjectsDurability::Barrier;
+    #[cfg(target_vendor = "apple")]
+    {
+        // Apple exposes an ordered barrier that does not drain the device cache.
+        options.stream.durability = LocalStreamDurability::Barrier;
+        options.objects.durability = LocalObjectsDurability::Barrier;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        options.stream.durability = LocalStreamDurability::FullFlush;
+        options.objects.durability = LocalObjectsDurability::FullFlush;
+    }
     options
 }
 
@@ -403,6 +411,17 @@ impl Store {
             .checkout(GenerationSelector::Exact(generation), read_only())
             .await
             .map_err(EngineError::fs("checkout exact"))
+    }
+
+    /// Opens one authenticated immutable generation handle.
+    pub async fn generation(
+        &self,
+        generation: acyclic_fs::GenerationId,
+    ) -> Result<LocalGeneration> {
+        self.workspace
+            .generation(generation)
+            .await
+            .map_err(EngineError::fs("open exact generation"))
     }
 }
 
