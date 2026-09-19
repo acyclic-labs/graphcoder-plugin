@@ -22,8 +22,8 @@ use acyclic_fs::text_merge::{
     merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
 };
 use acyclic_fs::{
-    AuthoredMutation, ByteRange, CancellationToken, DirectoryPageRequest,
-    FileRecordRangeReadRequest, GenerationId, WorkCounters,
+    AuthoredMutation, ByteRange, CancellationToken, DirectoryPageRequest, FileRangeReadRequest,
+    GenerationId, WorkCounters,
 };
 use bytes::Bytes;
 
@@ -346,13 +346,12 @@ async fn record_modes(
     let reader = checkout
         .pinned_reader()
         .map_err(EngineError::fs("open pinned reader"))?;
+    let paths = records
+        .keys()
+        .map(|path| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
     let metadata = reader
-        .read_record_metadata_batch(
-            &records.values().copied().collect::<Vec<_>>(),
-            FILE_READ_CONCURRENCY,
-            WorkCounters::UNBOUNDED,
-            &CancellationToken::new(),
-        )
+        .describe_files(&paths, WorkCounters::UNBOUNDED, &CancellationToken::new())
         .await
         .map_err(EngineError::fs("batch read metadata"))?
         .value;
@@ -360,11 +359,11 @@ async fn record_modes(
         .keys()
         .cloned()
         .zip(metadata)
-        .map(|(path, metadata)| {
-            let mode = match metadata.posix_mode {
+        .map(|(path, description)| {
+            let mode = description.and_then(|description| match description.metadata.posix_mode {
                 MetadataField::Value(mode) => Some(mode & 0o7777),
                 MetadataField::Unavailable => None,
-            };
+            });
             (path, mode)
         })
         .collect())
@@ -626,7 +625,7 @@ pub async fn read_files(
     generation: GenerationId,
     paths: &[PathBuf],
 ) -> Result<Vec<Option<Vec<u8>>>> {
-    let mut checkout = store.checkout_exact(generation).await?;
+    let checkout = store.checkout_exact(generation).await?;
     let namespaces = paths
         .iter()
         .map(|path| namespace_of(path))
@@ -635,30 +634,27 @@ pub async fn read_files(
         return Ok(Vec::new());
     }
     let cancel = CancellationToken::new();
-    let lookup = checkout
-        .lookup_batch_no_follow(&namespaces, WorkCounters::UNBOUNDED, &cancel)
+    let reader = checkout
+        .pinned_reader()
+        .map_err(EngineError::fs("open pinned reader"))?;
+    let descriptions = reader
+        .describe_files(&namespaces, WorkCounters::UNBOUNDED, &cancel)
         .await
-        .map_err(EngineError::fs("batch lookup"))?
+        .map_err(EngineError::fs("describe files"))?
         .value;
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
     let mut contents = vec![None; paths.len()];
     let mut requests = Vec::new();
     let mut destinations = Vec::new();
-    for (index, entry) in lookup.entries.into_iter().enumerate() {
-        let Some(record) = entry
-            .record
-            .filter(|record| record.kind == FileKind::Regular)
-        else {
+    for (index, description) in descriptions.into_iter().enumerate() {
+        let Some(description) = description else {
             continue;
         };
-        let length = match record.payload {
-            acyclic_fs::kernel::FilePayload::InlineRegular(inline) => {
-                inline.as_bytes().len() as u64
-            }
-            acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
-            _ => unreachable!("regular records have regular payloads"),
-        };
+        if description.kind != FileKind::Regular {
+            continue;
+        }
+        let length = description.logical_bytes;
         let display_path = paths
             .get(index)
             .ok_or_else(|| EngineError::Fs("batch lookup returned too many entries".into()))?;
@@ -675,8 +671,11 @@ pub async fn read_files(
         let mut offset = 0;
         while offset < length {
             let take = chunk.min(length - offset);
-            requests.push(FileRecordRangeReadRequest {
-                record,
+            let path = namespaces
+                .get(index)
+                .ok_or_else(|| EngineError::Fs("description returned too many entries".into()))?;
+            requests.push(FileRangeReadRequest {
+                path: path.clone(),
                 range: ByteRange {
                     offset,
                     length: take,
@@ -689,11 +688,8 @@ pub async fn read_files(
     if requests.is_empty() {
         return Ok(contents);
     }
-    let reader = checkout
-        .pinned_reader()
-        .map_err(EngineError::fs("open pinned reader"))?;
     let reads = reader
-        .read_file_record_ranges(
+        .read_file_ranges(
             &requests,
             FILE_READ_CONCURRENCY,
             WorkCounters::UNBOUNDED,
@@ -975,17 +971,21 @@ async fn copy_node(
         let reader = src
             .pinned_reader()
             .map_err(EngineError::fs("open pinned reader"))?;
-        let metadata = reader
-            .read_record_metadata_batch(
-                &nodes.iter().map(|(_, record)| *record).collect::<Vec<_>>(),
-                FILE_READ_CONCURRENCY,
-                WorkCounters::UNBOUNDED,
-                cancel,
-            )
+        let node_paths = nodes
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let descriptions = reader
+            .describe_files(&node_paths, WorkCounters::UNBOUNDED, cancel)
             .await
             .map_err(EngineError::fs("batch subtree metadata"))?
-            .value;
-        let regular = read_regular_frontier(&reader, &nodes, cancel).await?;
+            .value
+            .into_iter()
+            .map(|description| {
+                description.ok_or_else(|| EngineError::Fs("subtree node is absent".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let regular = read_regular_frontier(&reader, &node_paths, &descriptions, cancel).await?;
         let directories = nodes
             .iter()
             .filter(|(_, record)| record.kind == FileKind::Directory)
@@ -993,7 +993,10 @@ async fn copy_node(
             .collect::<Vec<_>>();
         frontier = list_child_paths(src, &directories, cancel).await?;
         let mut mutations = Vec::with_capacity(nodes.len());
-        for (index, ((path, record), metadata)) in nodes.into_iter().zip(metadata).enumerate() {
+        for (index, ((path, record), description)) in
+            nodes.into_iter().zip(descriptions).enumerate()
+        {
+            let metadata = description.metadata;
             match record.kind {
                 FileKind::Regular => {
                     let bytes = regular.get(index).ok_or_else(|| {
@@ -1007,7 +1010,7 @@ async fn copy_node(
                 }
                 FileKind::SymbolicLink => {
                     let target = reader
-                        .read_symbolic_link_record(record, WorkCounters::UNBOUNDED, cancel)
+                        .read_symbolic_link(&path, WorkCounters::UNBOUNDED, cancel)
                         .await
                         .map_err(EngineError::fs("read resolved symlink"))?
                         .value;
@@ -1042,33 +1045,33 @@ async fn copy_node(
 
 async fn read_regular_frontier<A, O>(
     reader: &acyclic_fs::PinnedReader<A, O>,
-    nodes: &[(NamespacePath, FileRecord)],
+    paths: &[NamespacePath],
+    descriptions: &[acyclic_fs::FileDescription],
     cancel: &CancellationToken,
 ) -> Result<Vec<Vec<u8>>>
 where
     A: acyclic_fs::AsyncAuthorityStore,
     O: acyclic_fs::AsyncObjectStore,
 {
-    let mut contents = vec![Vec::new(); nodes.len()];
-    let mut offsets = vec![0_u64; nodes.len()];
+    let mut contents = vec![Vec::new(); paths.len()];
+    let mut offsets = vec![0_u64; paths.len()];
     loop {
         let mut destinations = Vec::new();
         let mut requests = Vec::new();
-        for (index, ((_, record), offset)) in nodes.iter().zip(&mut offsets).enumerate() {
-            let length = match record.payload {
-                acyclic_fs::kernel::FilePayload::InlineRegular(inline) => {
-                    inline.as_bytes().len() as u64
-                }
-                acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
-                _ => continue,
-            };
+        for (index, ((path, description), offset)) in
+            paths.iter().zip(descriptions).zip(&mut offsets).enumerate()
+        {
+            if description.kind != FileKind::Regular {
+                continue;
+            }
+            let length = description.logical_bytes;
             if *offset >= length {
                 continue;
             }
             let take = TRANSFER_BYTES.min(length - *offset);
             destinations.push(index);
-            requests.push(FileRecordRangeReadRequest {
-                record: *record,
+            requests.push(FileRangeReadRequest {
+                path: path.clone(),
                 range: ByteRange {
                     offset: *offset,
                     length: take,
@@ -1080,7 +1083,7 @@ where
             break;
         }
         let read = reader
-            .read_file_record_ranges(
+            .read_file_ranges(
                 &requests,
                 FILE_READ_CONCURRENCY,
                 WorkCounters::UNBOUNDED,
