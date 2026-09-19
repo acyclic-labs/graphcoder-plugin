@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use acyclic_fs::model::VolumeLimits;
 use acyclic_fs::{
-    capture_baseline, capture_root_identity, capture_subtree, capture_watch_batch, CaptureOptions,
+    capture_baseline_with_policy, capture_root_identity, capture_subtree_with_policy,
+    capture_watch_batch_with_policy, CaptureOptions,
 };
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
@@ -729,6 +730,7 @@ struct Pipeline {
     options: CaptureOptions,
     /// Paths that never enter a checkpoint (`exclude` in the config).
     exclusions: Exclusions,
+    capture_policy: acyclic_fs::CapturePolicy,
     cancel: CancellationToken,
     state: State,
     last_generation: GenerationId,
@@ -848,6 +850,7 @@ impl Pipeline {
         };
 
         let exclusions = Exclusions::parse(&config.exclude)?;
+        let capture_policy = exclusions.capture_policy()?;
         let pipeline = Self {
             store,
             index,
@@ -855,6 +858,7 @@ impl Pipeline {
             watch: None,
             options,
             exclusions,
+            capture_policy,
             cancel,
             state: State::NeedsBaseline,
             last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
@@ -956,18 +960,16 @@ impl Pipeline {
             self.commit_engine().await?;
             let precommit_ms = crate::trace::ms(phase);
             let phase = Instant::now();
-            capture_baseline(
+            capture_baseline_with_policy(
                 &mut self.store.checkout,
                 &self.options,
+                &self.capture_policy,
                 WorkCounters::UNBOUNDED,
                 &self.cancel,
             )
             .await
             .map_err(EngineError::fs("capture baseline"))?;
             let capture_ms = crate::trace::ms(phase);
-            let phase = Instant::now();
-            self.scrub_exclusions().await?;
-            let scrub_ms = crate::trace::ms(phase);
             // Changes that raced the baseline arrive as the rescan-completion
             // batch; fold them in before declaring Ready.
             let batch = self
@@ -997,10 +999,11 @@ impl Pipeline {
             }
             if let WatchBatch::Changes { ref changes, .. } = batch {
                 if !changes.is_empty() {
-                    let captured = capture_watch_batch(
+                    let captured = capture_watch_batch_with_policy(
                         &mut self.store.checkout,
                         batch,
                         &self.options,
+                        &self.capture_policy,
                         WorkCounters::UNBOUNDED,
                         &self.cancel,
                     )
@@ -1022,7 +1025,6 @@ impl Pipeline {
                         }
                         return Err(EngineError::fs("capture rescan tail")(failure));
                     }
-                    self.scrub_exclusions().await?;
                 }
             }
             let phase = Instant::now();
@@ -1058,7 +1060,7 @@ impl Pipeline {
             crate::trace!(
                 "pipeline",
                 "baseline phases: pre-commit {precommit_ms:.1}ms, full capture {capture_ms:.1}ms, \
-             scrub {scrub_ms:.1}ms, snapshot {snapshot_ms:.1}ms, post-commit {postcommit_ms:.1}ms"
+             snapshot {snapshot_ms:.1}ms, post-commit {postcommit_ms:.1}ms"
             );
             crate::trace!(
                 "pipeline",
@@ -1430,7 +1432,6 @@ impl Pipeline {
                     "drain: watcher hinted at the volume root ({root:?}); dropped"
                 );
             }
-            let (batch, scrub) = self.exclusions.filter_batch(batch);
             if root == RootHint::Structural {
                 // The repo directory itself changed identity (a mount came
                 // or went): re-baseline on a fresh watcher rather than apply
@@ -1447,10 +1448,11 @@ impl Pipeline {
                 WatchBatch::Changes { ref changes, .. } if !changes.is_empty() => {
                     batches += 1;
                     hints += changes.len();
-                    let captured = capture_watch_batch(
+                    let captured = capture_watch_batch_with_policy(
                         &mut self.store.checkout,
                         batch,
                         &self.options,
+                        &self.capture_policy,
                         WorkCounters::UNBOUNDED,
                         &self.cancel,
                     )
@@ -1467,9 +1469,6 @@ impl Pipeline {
                             return Ok(true);
                         }
                         return Err(EngineError::fs("capture watch batch")(failure));
-                    }
-                    if scrub {
-                        self.scrub_exclusions().await?;
                     }
                     changed = true;
                     last_change = Some(Instant::now());
@@ -1516,19 +1515,6 @@ impl Pipeline {
                 }
             }
         }
-    }
-
-    /// Drops excluded paths a capture may have pulled into the checkout,
-    /// before the generation they would otherwise land in is checkpointed.
-    async fn scrub_exclusions(&mut self) -> Result<()> {
-        let removed = self.exclusions.scrub(&mut self.store.checkout).await?;
-        if removed > 0 {
-            crate::trace!(
-                "pipeline",
-                "exclusions: scrubbed {removed} excluded path(s) from the checkout"
-            );
-        }
-        Ok(())
     }
 
     /// `checkpoint()`: snapshot without authority publish. The fast path.
@@ -1766,7 +1752,7 @@ impl Pipeline {
                 &parent,
             )?));
         }
-        let captured = capture_watch_batch(
+        let captured = capture_watch_batch_with_policy(
             &mut self.store.checkout,
             WatchBatch::Changes {
                 epoch: WatchEpoch::from_u64(0),
@@ -1775,6 +1761,7 @@ impl Pipeline {
                 changes: hints,
             },
             &self.options,
+            &self.capture_policy,
             WorkCounters::UNBOUNDED,
             &self.cancel,
         )
@@ -1792,7 +1779,7 @@ impl Pipeline {
             }
             return Err(EngineError::fs("capture restored paths")(failure));
         }
-        self.scrub_exclusions().await
+        Ok(())
     }
 
     /// Reconciles exact restored roots immediately, including all descendants
@@ -1802,17 +1789,18 @@ impl Pipeline {
     async fn capture_restored_subtrees(&mut self, paths: &[PathBuf]) -> Result<()> {
         for path in paths {
             let namespace = crate::merge::namespace_of(path)?;
-            capture_subtree(
+            capture_subtree_with_policy(
                 &mut self.store.checkout,
                 namespace,
                 &self.options,
+                &self.capture_policy,
                 WorkCounters::UNBOUNDED,
                 &self.cancel,
             )
             .await
             .map_err(EngineError::fs("capture restored subtree"))?;
         }
-        self.scrub_exclusions().await
+        Ok(())
     }
 
     /// Restores `paths` from `target` as one event: at most one safety row
