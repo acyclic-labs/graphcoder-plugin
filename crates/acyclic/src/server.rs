@@ -168,7 +168,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // mounted (fork sessions do not survive the daemon).
     rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
     lap("rewind journal recovery");
-    fork::sweep_stale_forks(&repo_root);
+    fork::sweep_stale_forks(&repo_root)?;
     lap("sweep stale forks");
     // Same reason as the fork sweep, and the same moment: a model run a
     // crashed daemon left behind is still running, and still billing.

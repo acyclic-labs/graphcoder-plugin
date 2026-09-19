@@ -111,43 +111,52 @@ pub fn forks_mount_root(repo_root: &Path) -> Option<PathBuf> {
     Some(forks_root(repo_root)?.join("mnt"))
 }
 
-/// Best-effort cleanup of fork dirs left by a dead daemon: unmount anything
-/// still attached, then remove the directories. Mount sessions do not
-/// survive the daemon in v1.
-pub fn sweep_stale_forks(repo_root: &Path) {
+/// Removes the single routed mount and workspace directory a dead daemon
+/// left behind. An absent root is the only successful no-op.
+pub fn sweep_stale_forks(repo_root: &Path) -> Result<(), String> {
     let Some(root) = forks_root(repo_root) else {
-        return;
+        return Err("repo root has no parent for fork workspaces".to_owned());
     };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
-    };
+    if !root.try_exists().map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mount = root.join("mnt");
     // FUSE-T's go-nfsv4 helpers outlive a killed daemon and wedge the
     // vendor's tiny shared NFS port pool for every future mount on the
     // host — reap any helper serving one of OUR workspaces first.
     #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("pkill")
+    if mount.try_exists().map_err(|error| error.to_string())? {
+        let status = std::process::Command::new("pkill")
             .arg("-f")
-            .arg(format!("go-nfsv4.*{}", root.display()))
-            .status();
-    }
-    for entry in entries.flatten() {
-        let path = entry.path();
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("umount")
-            .arg("-f")
-            .arg(&path)
-            .status();
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("fusermount")
-                .arg("-u")
-                .arg(&path)
-                .status();
+            .arg(format!("go-nfsv4.*{}", mount.display()))
+            .status()
+            .map_err(|error| format!("stop stale NFS helper: {error}"))?;
+        if !status.success() && status.code() != Some(1) {
+            return Err(format!("stop stale NFS helper: {status}"));
         }
-        let _ = std::fs::remove_dir_all(&path);
+        let status = std::process::Command::new("umount")
+            .arg("-f")
+            .arg(&mount)
+            .status()
+            .map_err(|error| format!("unmount stale fork workspace: {error}"))?;
+        if !status.success() {
+            return Err(format!("unmount stale fork workspace: {status}"));
+        }
     }
-    let _ = std::fs::remove_dir(&root);
+    #[cfg(target_os = "linux")]
+    if mount.try_exists().map_err(|error| error.to_string())? {
+        let status = std::process::Command::new("fusermount")
+            .arg("-u")
+            .arg(&mount)
+            .status()
+            .map_err(|error| format!("unmount stale fork workspace: {error}"))?;
+        if !status.success() {
+            return Err(format!("unmount stale fork workspace: {status}"));
+        }
+    }
+    std::fs::remove_dir_all(&root)
+        .map_err(|error| format!("remove stale fork workspace {}: {error}", root.display()))
 }
 
 #[cfg(test)]
@@ -177,7 +186,15 @@ mod tests {
         std::fs::create_dir_all(root.join("dead-fork")).expect("stale");
         std::fs::write(root.join("dead-fork/leftover"), b"x").expect("file");
 
-        sweep_stale_forks(&repo);
+        sweep_stale_forks(&repo).expect("sweep");
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn sweeping_an_absent_root_is_a_no_op() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        sweep_stale_forks(&repo).expect("absent root");
     }
 }
