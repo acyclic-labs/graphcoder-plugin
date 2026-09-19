@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use acyclic_fs::model::VolumeLimits;
-use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
+use acyclic_fs::{
+    capture_baseline, capture_root_identity, capture_subtree, capture_watch_batch, CaptureOptions,
+};
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
     NativeWatchOptions, OperationId, WatchBatch, WatchChange, WatchEpoch, WatchSequence,
@@ -1793,6 +1795,26 @@ impl Pipeline {
         self.scrub_exclusions().await
     }
 
+    /// Reconciles exact restored roots immediately, including all descendants
+    /// of a directory that was replaced or removed. The SDK unions the host
+    /// and checkout subtrees, so stale descendants are removed without waiting
+    /// for the native watcher to enumerate the write.
+    async fn capture_restored_subtrees(&mut self, paths: &[PathBuf]) -> Result<()> {
+        for path in paths {
+            let namespace = crate::merge::namespace_of(path)?;
+            capture_subtree(
+                &mut self.store.checkout,
+                namespace,
+                &self.options,
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("capture restored subtree"))?;
+        }
+        self.scrub_exclusions().await
+    }
+
     /// Restores `paths` from `target` as one event: at most one safety row
     /// before, one drain and one row after, however many paths land.
     async fn restore_paths(
@@ -1853,10 +1875,9 @@ impl Pipeline {
         // later. The echo is harmless when it comes: a modified hint on a
         // path whose content already matches captures nothing, and the
         // staged sibling's create+rename resolves to an absent path.
-        // Direct capture describes each path with one hint, which is exact
-        // for a regular file or symlink and wrong for a subtree (a removed
-        // or replaced directory needs a hint per descendant). Anything
-        // else waits for the native watcher, which delivers those.
+        // Leaf batches avoid directory traversal. Directory and absent roots
+        // use the SDK subtree reconciler, which unions live and stored
+        // descendants and therefore captures replacements and removals exactly.
         let post_started = Instant::now();
         let all_leaves = paths.iter().all(|path| {
             std::fs::symlink_metadata(self.store.repo_root.join(path))
@@ -1866,8 +1887,8 @@ impl Pipeline {
             self.capture_paths_directly(paths).await?;
             "direct capture"
         } else {
-            self.drain_watcher().await?;
-            "watcher drain (a path is a directory or absent)"
+            self.capture_restored_subtrees(paths).await?;
+            "direct subtree capture"
         };
         let post_ms = crate::trace::ms(post_started);
         let capture_started = Instant::now();
