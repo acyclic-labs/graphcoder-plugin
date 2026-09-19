@@ -54,7 +54,7 @@ impl Exclusions {
                     _ => {
                         return Err(EngineError::Config(format!(
                             "exclude rule {pattern:?} must be a relative path inside the repo"
-                        )))
+                        )));
                     }
                 }
             }

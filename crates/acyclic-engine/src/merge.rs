@@ -693,7 +693,7 @@ pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> R
             return Err(EngineError::Fs(format!(
                 "{}: not a regular file",
                 path.display()
-            )))
+            )));
         }
     };
     let limits = checkout.volume_config().limits;
@@ -1011,7 +1011,7 @@ async fn copy_node(
             other => {
                 return Err(EngineError::Fs(format!(
                     "cannot copy a {other:?} node (only files, symlinks, and directories)"
-                )))
+                )));
             }
         }
         if let MetadataField::Value(mode) = metadata.posix_mode {

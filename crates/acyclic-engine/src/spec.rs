@@ -655,13 +655,13 @@ impl SpeculateConfig {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return (Self::default(), None)
+                return (Self::default(), None);
             }
             Err(error) => {
                 return (
                     Self::default(),
                     Some(format!("{}: {error}; speculation off", path.display())),
-                )
+                );
             }
         };
         match toml::from_str(&text) {
@@ -989,13 +989,17 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the only test that touches this variable, and nothing else in the process reads it"
+    )]
     fn a_malformed_config_disables_rather_than_failing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("speculate.toml");
         std::fs::write(&path, "enabled = true\nnot_a_key = 1\n").expect("write");
-        std::env::set_var(crate::product::SPECULATE_CONFIG_ENV, &path);
+        unsafe { std::env::set_var(crate::product::SPECULATE_CONFIG_ENV, &path) };
         let (config, reason) = SpeculateConfig::load();
-        std::env::remove_var(crate::product::SPECULATE_CONFIG_ENV);
+        unsafe { std::env::remove_var(crate::product::SPECULATE_CONFIG_ENV) };
         assert_eq!(config, SpeculateConfig::default());
         assert!(!config.enabled, "a typo must not leave speculation on");
         assert!(reason.is_some_and(|reason| reason.contains("speculation off")));

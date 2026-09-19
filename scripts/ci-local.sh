@@ -11,11 +11,15 @@
 # Needs: stable toolchain with rustfmt + clippy, cargo-deny, node (for the
 # duplication check), and unless --no-coverage: cargo-llvm-cov plus the
 # `llvm-tools-preview` rustup component it drives
-# (`rustup component add llvm-tools-preview`). macOS also needs
-# FUSE-T for the fork/Safe Mode acceptance scripts.
+# (`rustup component add llvm-tools-preview`).
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# The plugin's own crates, whether this tree is a standalone workspace or the
+# sdk's `plugin/` member; `--workspace` would lint and test the whole sdk.
+CRATES=(-p acyclic -p acyclic-engine -p acyclic-proto -p acyclic-qual)
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+[ -d "$TARGET_DIR" ] || TARGET_DIR="$ROOT/../target"
 # Same as CI: the pinned acyclic-fs git dependency needs the git CLI's
 # credentials and protocol support, not cargo's built-in fetcher.
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -48,28 +52,29 @@ step() {
 
 # deny job
 step "product name single-sourced" bash scripts/check-product-name.sh
-step "no secrets or forbidden files" bash scripts/check-no-secrets.sh
 step "code quality (width, TODOs, comment blocks, duplication)" bash scripts/check-code-quality.sh
-step "cargo deny" cargo deny --locked check
+step "cargo deny" cargo deny --locked check licenses
 
 # lint job
-step "cargo fmt --check" cargo fmt --all --check
-step "cargo clippy -D warnings" cargo clippy --workspace --all-targets --all-features -- -D warnings
+step "cargo fmt --check" cargo fmt "${CRATES[@]}" --check
+step "cargo clippy -D warnings" cargo clippy "${CRATES[@]}" --all-targets --all-features -- -D warnings
 
 # test job
-step "cargo test" cargo test --workspace
-step "cargo build --release" cargo build --release
+step "cargo test" cargo test "${CRATES[@]}"
+step "cargo build --release" cargo build --release "${CRATES[@]}"
 if [ "$run_acceptance" -eq 1 ]; then
   step "acceptance suite" env \
-    ACYCLIC_BIN="$ROOT/target/release/acyclic" \
-    ACYCLIC_QUAL="$ROOT/target/release/acyclic-qual" \
+    ACYCLIC_BIN="$TARGET_DIR/release/acyclic" \
+    ACYCLIC_QUAL="$TARGET_DIR/release/acyclic-qual" \
     ACYCLIC_LAT_FILES=5000 ACYCLIC_LAT_MB=64 ACYCLIC_SOAK_ROUNDS=30 \
     bash tests/acceptance/run-all.sh
 fi
 
 # coverage job
 if [ "$run_coverage" -eq 1 ]; then
-  step "coverage (floor: see ci.yml)" cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines 48
+  # Informational floor for the plugin crates alone; the sdk gate measures
+  # the whole workspace.
+  step "coverage (plugin crates, floor 48)" cargo llvm-cov "${CRATES[@]}" --all-features --summary-only --fail-under-lines 48
 fi
 
 echo

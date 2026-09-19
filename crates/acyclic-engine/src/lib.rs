@@ -9,7 +9,12 @@
 //!    boundaries (it proves closure over the whole tree).
 //! 2. All engine state (store, socket, index) lives outside the working tree.
 //! 3. Volume limits are raised at creation and the `VolumeId` is persisted.
-
+// The sdk workspace warns on missing docs and lints with -D warnings.
+#![allow(
+    missing_docs,
+    reason = "engine internals consumed only by the acyclic binary; \
+              per-item docs are tracked as a follow-up"
+)]
 #![cfg_attr(
     test,
     allow(

@@ -17,11 +17,11 @@ use acyclic_engine::pipeline::{self, PipelineHandle};
 use acyclic_engine::product::NAME;
 use acyclic_engine::spec::SpeculateConfig;
 use acyclic_engine::store::{Store, StorePaths};
-use acyclic_engine::{rewind, EngineError};
+use acyclic_engine::{EngineError, rewind};
 use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::{
-    mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
-    NativeMountRequest, NativeMountSession, RoutedMountSource,
+    CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
+    RoutedMountSource, mount_native, mount_native_over_existing,
 };
 use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -337,7 +337,7 @@ impl Server {
         let name = op_name(&op);
         let started = std::time::Instant::now();
         acyclic_engine::trace!("daemon", "op {name} received");
-        let payload = match self.dispatch_inner(op).await {
+        match self.dispatch_inner(op).await {
             Ok(reply) => {
                 acyclic_engine::trace!(
                     "daemon",
@@ -356,8 +356,7 @@ impl Server {
                 );
                 err(message)
             }
-        };
-        payload
+        }
     }
 
     /// True when nothing has needed this daemon for `idle`: no request, no
@@ -1767,11 +1766,10 @@ impl Server {
         tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
         // The kernel may hold a positive entry cache for the removed name
         // (FSKit caches until told otherwise): invalidate it eagerly.
-        if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(&route_name(id)))
-            {
-                eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
-            }
+        if let Some(session) = mount.session.as_ref()
+            && let Err(error) = tokio::task::block_in_place(|| session.invalidate(&route_name(id)))
+        {
+            eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
         }
         if mount.router.is_empty() {
             if let Some(mut session) = mount.session.take() {
@@ -1952,11 +1950,11 @@ impl Server {
             return compute_brief(index, &self.handle, current).await;
         };
         let key = crate::speculate::brief_key(&index, spec.config(), current).ok();
-        if let Some(key) = key.as_ref().and_then(Option::as_ref) {
-            if let Some(mut info) = spec.claim_brief(key) {
-                self.attach_summary(&mut info).await;
-                return Ok(info);
-            }
+        if let Some(key) = key.as_ref().and_then(Option::as_ref)
+            && let Some(mut info) = spec.claim_brief(key)
+        {
+            self.attach_summary(&mut info).await;
+            return Ok(info);
         }
         drop(index);
         let index = self.open_index()?;

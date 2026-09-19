@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use acyclic_fs::kernel::MetadataField;
 use acyclic_fs::kernel::{FileKind, FilePayload, LogicalName, NamespacePath};
-use acyclic_fs::{materialize_checkout, ByteRange, MaterializeOptions};
+use acyclic_fs::{ByteRange, MaterializeOptions, materialize_checkout};
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
 
@@ -186,7 +186,7 @@ pub(crate) fn write_node<'a>(
                     _ => {
                         return Err(EngineError::Restore(
                             "regular file with foreign payload".into(),
-                        ))
+                        ));
                     }
                 };
                 let mut file = std::fs::File::create(host)?;
@@ -304,7 +304,7 @@ pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
                 return Err(EngineError::Restore(format!(
                     "{}: path must be relative to the repo root and stay inside it",
                     relative.display()
-                )))
+                )));
             }
         }
     }
@@ -864,9 +864,11 @@ mod tests {
     #[test]
     fn recover_with_no_journal_is_a_noop() {
         let work = tempfile::tempdir().expect("tempdir");
-        assert!(recover(&work.path().join("missing.json"))
-            .expect("recover")
-            .is_none());
+        assert!(
+            recover(&work.path().join("missing.json"))
+                .expect("recover")
+                .is_none()
+        );
     }
 
     #[test]

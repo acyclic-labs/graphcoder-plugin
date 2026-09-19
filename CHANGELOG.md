@@ -9,6 +9,24 @@ Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
 
 ### Changed
 
+- **Prepared for the move into `acyclic-labs/sdk` as `plugin/`.** Releases
+  will be cut from that repository as `plugin-v<version>` tags, so
+  `scripts/install.sh` now targets them and reads the current version from
+  `plugin/LATEST` on the sdk's `main` branch (`product.toml` gained
+  `release_tag_prefix`, guarded by `check-product-name.sh`). The acceptance
+  harness, `ci-local.sh`, `docker-linux.sh` and `release-local.sh` locate the
+  cargo target directory and the plugin's own crates in either layout. The
+  crates build with edition 2024 and the sdk's stricter lint set.
+- **FUSE-T is no longer required on macOS.** `acyclic-fs` mounts through its
+  vendored `darwinfuse` NFSv4 server, so the `fuse3` pkg-config shim, the
+  rpath link flag and the CI installer step are gone.
+- **`acyclic-fs` is pinned to the sdk's `main` line** (the Darwin
+  unpaired-rename, subtree-removal and `O_EXCL` fixes landed there as sdk
+  PR #99); the guard forwards the new `capture_host_subtree` mount hook, and
+  the store asks for barrier durability only on Apple targets, since the sdk
+  now fails closed where `F_BARRIERFSYNC` does not exist instead of falling
+  back to a full flush.
+
 - **A cold daemon no longer delays the agent's first turn.** The session-start
   hook waits at most 300ms for the daemon; past that it prints a one-line
   notice and returns while the first snapshot builds in the background (251s

@@ -4,8 +4,12 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="${ACYCLIC_BIN:-$REPO_ROOT/target/debug/acyclic}"
-QUAL="${ACYCLIC_QUAL:-$REPO_ROOT/target/debug/acyclic-qual}"
+# Binaries default to the cargo target directory: this tree's own when it is
+# a standalone workspace, the parent's when it is the sdk's `plugin/` member.
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+[ -d "$TARGET_DIR" ] || TARGET_DIR="$REPO_ROOT/../target"
+BIN="${ACYCLIC_BIN:-$TARGET_DIR/debug/acyclic}"
+QUAL="${ACYCLIC_QUAL:-$TARGET_DIR/debug/acyclic-qual}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/acyclic-acceptance.XXXXXX")"
 # Canonicalize: macOS TMPDIR ends in "/" and /var -> /private/var, so the

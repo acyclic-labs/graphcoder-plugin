@@ -41,7 +41,7 @@ pub fn ms(since: Instant) -> f64 {
 
 #[macro_export]
 macro_rules! trace {
-    ($scope:expr, $($arg:tt)*) => {
+    ($scope:expr_2021, $($arg:tt)*) => {
         if $crate::trace::enabled() {
             $crate::trace::emit($scope, format_args!($($arg)*));
         }

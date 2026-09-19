@@ -18,12 +18,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::SharedCheckout;
+use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::{
-    capture_baseline, capture_root_identity, probe_native_mount, CancellationToken, CaptureOptions,
-    GenerationId, LocalAuthorityBackend, LocalObjectBackend, NativeMountKind, VolumeId,
-    WorkCounters,
+    CancellationToken, CaptureOptions, GenerationId, LocalAuthorityBackend, LocalObjectBackend,
+    NativeMountKind, VolumeId, WorkCounters, capture_baseline, capture_root_identity,
+    probe_native_mount,
 };
 
 use crate::{EngineError, Result};

@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 use acyclic_engine::product::{self, NAME};
 use acyclic_proto as proto;
 use rmcp::{
+    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo},
+    model::{ErrorCode, Implementation, InitializeResult, ServerCapabilities},
     tool, tool_handler, tool_router,
     transport::stdio,
-    ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -512,8 +512,10 @@ call `diff` and review the blast radius.";
 
 #[tool_handler]
 impl ServerHandler for McpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    // `InitializeResult` is the concrete type; the `ServerInfo` alias is
+    // deprecated from rmcp 3.4.
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(NAME, env!("CARGO_PKG_VERSION")))
             .with_instructions(product::render(MCP_INSTRUCTIONS))
     }
