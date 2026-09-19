@@ -121,7 +121,7 @@ impl HookEvent {
     }
 }
 
-pub fn run(repo: &Path, event: &str) -> i32 {
+pub fn run(repo: &Path, event: &str, host: Option<String>) -> i32 {
     let Some(event) = HookEvent::parse(event) else {
         acyclic_engine::trace!("hook", "unknown event {event:?}: ignored");
         return 0;
@@ -130,7 +130,9 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let mut payload = parse_payload(&raw);
-    let host = std::env::var("ACYCLIC_HOST").unwrap_or_else(|_| "claude-code".into());
+    let host = host
+        .or_else(|| std::env::var("ACYCLIC_HOST").ok())
+        .unwrap_or_else(|| "claude-code".into());
 
     // A session start may spawn the daemon, but never waits for its first
     // snapshot: the agent's first turn is behind this hook.
