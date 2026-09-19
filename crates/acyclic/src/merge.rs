@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use acyclic_fs::kernel::{FileKind, FileMetadata, FileRecord, MetadataField, NamespacePath};
-use acyclic_fs::model::GenerationSelector;
 pub use acyclic_fs::text_merge::{
     conflict_hunks, has_conflict_markers, ByteConflictKind as ConflictKind,
 };
@@ -30,7 +29,7 @@ use bytes::Bytes;
 
 use crate::diff;
 use crate::rewind::validate_relative;
-use crate::store::{read_only, LocalCheckout, LocalWorkspace, Store};
+use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
 
 /// Default `[merge] max_file_bytes`.
@@ -735,7 +734,7 @@ pub async fn apply_entries(
         match entry {
             Entry::Regular { bytes, mode } => {
                 source = None;
-                remove_subtree(&store.workspace, dst, namespace, &cancel).await?;
+                remove_subtree(store, dst, namespace, &cancel).await?;
                 let metadata = FileMetadata {
                     posix_mode: mode.map_or(MetadataField::Unavailable, MetadataField::Value),
                     ..FileMetadata::default()
@@ -766,7 +765,7 @@ pub async fn apply_entries(
                     .as_mut()
                     .ok_or_else(|| EngineError::Fs("source checkout missing".into()))?
                     .1;
-                remove_subtree(&store.workspace, dst, namespace, &cancel).await?;
+                remove_subtree(store, dst, namespace, &cancel).await?;
                 copy_node(src, dst, namespace, &cancel).await?;
             }
         }
@@ -878,7 +877,7 @@ where
 /// futures are large, and nesting them on the pipeline thread's stack
 /// overflows it within a few levels.
 async fn remove_subtree(
-    workspace: &LocalWorkspace,
+    store: &Store,
     dst: &mut LocalCheckout,
     namespace: &NamespacePath,
     cancel: &CancellationToken,
@@ -899,12 +898,11 @@ async fn remove_subtree(
         if nodes.is_empty() {
             break;
         }
-        let pinned = workspace
-            .checkout(GenerationSelector::Exact(dst.generation_id()), read_only())
+        let reader = store
+            .generation(dst.generation_id())
+            .await?
+            .reader()
             .await
-            .map_err(EngineError::fs("open subtree checkout"))?;
-        let reader = pinned
-            .pinned_reader()
             .map_err(EngineError::fs("open subtree reader"))?;
         let limits = dst.volume_config().limits;
         frontier = Vec::new();
