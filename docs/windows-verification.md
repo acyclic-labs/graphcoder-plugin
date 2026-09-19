@@ -168,15 +168,14 @@ correct.
 
 ## Known limits
 
-- **Forks are always copies.** `ProjFS` mounts and
+- **Forks require a writable native mount.** `ProjFS` mounts and
   projects a fork correctly — the tree appears and reads back fine — but
   writes into the projection stop at the `ProjFS` local cache and never reach
   the overlay checkout. A mounted fork therefore looked like it worked while
   `fork-diff` reported no changes and `promote` landed nothing: it silently
-  ate the work. `mount_capability()` now reports mounts unavailable on
-  Windows, so forks take the copy path, which is verified end to end (write,
-  `fork-diff`, `promote` all behave). Revisit if the sdk's `ProjFS` provider
-  gains write-back.
+  ate the work. `mount_capability()` reports mounts unavailable on Windows
+  until the SDK's `ProjFS` provider gains write-back, and fork creation fails
+  explicitly instead of materializing a full-tree compatibility copy.
 
 - **The tree exchange is not atomic.** `RENAME_EXCHANGE` has no Windows
   equivalent, so `atomic_exchange` does three renames through a scratch

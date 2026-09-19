@@ -317,9 +317,6 @@ pub struct SummaryInfo {
 pub struct ForkEntry {
     pub id: String,
     pub path: String,
-    /// "mount" (routed native mount) or "copy" (materialized directory).
-    #[serde(default = "default_fork_mode")]
-    pub mode: String,
     /// Hex of the published generation the fork was cut from.
     pub base: String,
     pub created_at: i64,
@@ -586,8 +583,4 @@ pub struct DiffEntry {
     /// shown, since rewind restores it, but not blast radius.
     #[serde(default)]
     pub ignored: bool,
-}
-
-fn default_fork_mode() -> String {
-    "mount".to_owned()
 }

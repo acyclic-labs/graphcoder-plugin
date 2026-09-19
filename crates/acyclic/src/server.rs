@@ -733,7 +733,6 @@ impl Server {
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
-                        mode: "mount".to_owned(),
                         base: acyclic::generation_hex(seed.base),
                         created_at: unix_now(),
                         session_id: session_id.clone(),
@@ -1932,7 +1931,6 @@ fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
     proto::ForkEntry {
         id: entry.id.clone(),
         path: entry.path.clone(),
-        mode: entry.mode.clone(),
         base: entry.base.clone(),
         created_at: entry.created_at,
         session_id: entry.session_id.clone(),

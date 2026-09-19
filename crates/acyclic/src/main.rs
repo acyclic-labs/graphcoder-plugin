@@ -891,7 +891,7 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                 return Err("unexpected reply".into());
             };
             for entry in &entries {
-                println!("fork {}  ({})  {}", entry.id, entry.mode, entry.path);
+                println!("fork {}  {}", entry.id, entry.path);
             }
             println!(
                 "{} fork(s) ready — work in them freely; `{NAME} promote <id>` keeps a winner",
@@ -918,9 +918,8 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                     )
                 };
                 println!(
-                    "{}  {}  {}  {}  base {}{conflict}",
+                    "{}  {}  {}  base {}{conflict}",
                     entry.id,
-                    entry.mode,
                     age(entry.created_at),
                     entry.path,
                     short_hex(&entry.base)
@@ -991,7 +990,7 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                 println!("mounts:        {} (forks mount)", info.mount_provider);
             } else {
                 println!(
-                    "mounts:        unavailable ({}) — forks copy",
+                    "mounts:        unavailable ({}) — forks disabled",
                     info.mount_reason.as_deref().unwrap_or("unknown reason")
                 );
             }

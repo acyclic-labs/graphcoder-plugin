@@ -1194,9 +1194,7 @@ effective values in ONE line before the first fork, e.g.
 Depth starts at 1 and increases by one per round.
 
 1. `{{name}} fork -n <fan_out>`. It records the fork base as a checkpoint
-   itself, so do not checkpoint first. Note each id and path and whether
-   it says `(mount)` or `(copy)`. Copy forks cost time proportional to
-   the tree: keep them few and short-lived.
+   itself, so do not checkpoint first. Note each id and mounted path.
 2. Dispatch ALL subagents in one turn, one per fork, using the CHILD
    PROMPT below. Do not keep one approach for yourself.
 3. **Freeze.** Make NO edits to the real tree while forks are live. A
