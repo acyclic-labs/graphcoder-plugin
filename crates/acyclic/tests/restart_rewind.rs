@@ -20,7 +20,7 @@ fn cli_recovers_a_missing_repo_before_loading_config() -> Result<(), Box<dyn std
         std::fs::write(
             &journal,
             serde_json::json!({
-                "target_generation": "00",
+                "target_generation": "00".repeat(32),
                 "repo_root": repo,
                 "tmp": staged,
                 "phase": "Swapping",
