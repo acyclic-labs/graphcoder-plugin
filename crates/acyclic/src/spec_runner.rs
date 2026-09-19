@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // Only the Unix sweep names the product; on Windows there is no sweep.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use acyclic::product::NAME;
 use acyclic::spec::RunOutcome;
 use tokio::io::AsyncWriteExt;
@@ -403,7 +403,7 @@ fn sweep_stale_runs(spec_runs: &Path) {
 /// that dies — however it dies — takes the run's whole tree with it.
 /// Whether the live process really is the run we recorded, rather than
 /// whatever inherited its pid.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn command_name_matches(pid: i32, expected: &str) -> bool {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
