@@ -73,7 +73,7 @@ which reads as though Launch 5 exists.
 3. **`exclude` blinds any future index.** Excluded paths never enter a
    checkpoint, so a Merkle-aware index can never answer for them, and the
    answer it gives will be silently incomplete rather than refused. *No lean.*
-4. **Forks and Safe Mode sessions do not see excluded paths either**, which
+4. **Forks do not see excluded paths either**, which
    bears directly on "searches against a fork must answer from that tree's
    state". *No lean.*
 5. **Does the name change?** Calling this "the index engine" collides with the

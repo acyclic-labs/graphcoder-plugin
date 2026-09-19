@@ -77,8 +77,7 @@ Unmounts, discards the overlay, removes the workspace dir. Unknown id → error.
    onto the real tree one at a time with the same atomic single-path
    restore, checkpointed and published; a `manual` row labeled
    `promote <id> (N path(s) written in place)` records it. The repo
-   directory is never replaced by a promote (Safe Mode `session-apply`
-   still swaps and says so). Gitignored files included.
+   directory is never replaced by a promote. Gitignored files included.
 
 ### Daemon stop / crash
 Stop unmounts all forks and removes workspace dirs before the pipeline
@@ -107,6 +106,6 @@ remove) at next start, before the store opens.
 | U2: stale sweep removes dirs | `fork.rs::sweep_removes_stale_directories` | unit | ✅ |
 
 Out of scope (documented): rename detection, semantic merges, conflict
-markers on the mainline, Safe Mode `apply_session` onto a moved mainline,
-fork persistence across daemon restarts, subagent orchestration, per-fork
+markers on the mainline, fork persistence across daemon restarts,
+subagent orchestration, per-fork
 port/env provisioning.

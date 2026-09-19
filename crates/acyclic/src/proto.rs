@@ -62,7 +62,7 @@ mod domain_wire_tests {
     }
 }
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The kinds a client may ask for. Bookkeeping kinds (`baseline`,
 /// `noop`, `auto`, ...) exist only on replies: the daemon decides those.
@@ -239,26 +239,6 @@ pub enum Op {
         #[serde(rename = "fork")]
         id: String,
     },
-    /// Safe Mode: forks one checkout and mounts it directly at the repo
-    /// root for the session's duration (see `dry_run` in `.acyclic/config.toml`).
-    SessionFork {
-        session_id: String,
-    },
-    /// Safe Mode: unmounts the session's shadow mount, commits its overlay,
-    /// and returns the resulting diff without touching the real tree yet.
-    /// The fork is held pending `SessionApply`/`SessionDiscard`.
-    SessionResolve {
-        session_id: String,
-    },
-    /// Safe Mode: applies a `SessionResolve`d session's changes to the real
-    /// tree (the deferred half of promote).
-    SessionApply {
-        session_id: String,
-    },
-    /// Safe Mode: discards a `SessionResolve`d session without applying it.
-    SessionDiscard {
-        session_id: String,
-    },
 }
 
 fn default_fork_count() -> u32 {
@@ -313,8 +293,6 @@ pub enum Reply {
     Summary(SummaryInfo),
     Forks(Vec<ForkEntry>),
     Promote(PromoteInfo),
-    /// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`.
-    SessionPending(SessionPendingInfo),
 }
 
 /// One turn's summary, and where it came from.
@@ -333,12 +311,6 @@ pub struct SummaryInfo {
     /// How far ahead of the request it landed, when it was waiting.
     #[serde(default)]
     pub lead_ms: Option<i64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SessionPendingInfo {
-    pub session_id: String,
-    pub diff: Vec<DiffEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -419,7 +391,7 @@ pub struct StatusInfo {
     pub unpublished: u64,
     pub store_bytes: u64,
     pub repo_root: String,
-    /// Mount provider this daemon would use for forks and Safe Mode.
+    /// Mount provider this daemon would use for forks.
     #[serde(default)]
     pub mount_provider: String,
     #[serde(default)]

@@ -2,8 +2,7 @@
 
 **Status: verified on real Windows hardware.** Checks 1–8 below were run on
 Windows 11 (26200) with the MSVC toolchain, against a release build of this
-branch. Two capabilities are deliberately *not* offered on Windows — mounted
-forks and Safe Mode — for a reason recorded under [Known
+branch. Mounted forks have platform-specific limits recorded under [Known
 limits](#known-limits); everything else behaves as it does on POSIX.
 
 `tests/acceptance/windows-smoke.sh` is the executable form of checks 3–7,
@@ -52,8 +51,8 @@ That is one decision, not two, and it reaches further than capture. The
 `ProjFS` provider decodes every entry name it is handed as UTF-16LE, so a
 name that arrives in any other encoding is *projected as mojibake rather
 than rejected* — fork route ids passed as raw ASCII came back as six garbage
-characters. The Safe Mode guard has the sharper version of the same problem:
-it compares configured prefixes byte-for-byte against mount path components,
+characters. Guarded fork paths have the sharper version of the same problem:
+they compare configured prefixes byte-for-byte against mount path components,
 and a guard that never matches **fails open**. `crates/acyclic-engine/src/names.rs`
 exists so there is exactly one place this can be got wrong.
 
@@ -169,15 +168,14 @@ correct.
 
 ## Known limits
 
-- **Forks are always copies, and Safe Mode is off.** `ProjFS` mounts and
+- **Forks are always copies.** `ProjFS` mounts and
   projects a fork correctly — the tree appears and reads back fine — but
   writes into the projection stop at the `ProjFS` local cache and never reach
   the overlay checkout. A mounted fork therefore looked like it worked while
   `fork-diff` reported no changes and `promote` landed nothing: it silently
   ate the work. `mount_capability()` now reports mounts unavailable on
   Windows, so forks take the copy path, which is verified end to end (write,
-  `fork-diff`, `promote` all behave). Safe Mode needs a real mount and is
-  unavailable for the same reason. Revisit if the sdk's `ProjFS` provider
+  `fork-diff`, `promote` all behave). Revisit if the sdk's `ProjFS` provider
   gains write-back.
 
 - **The tree exchange is not atomic.** `RENAME_EXCHANGE` has no Windows

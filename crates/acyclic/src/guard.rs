@@ -5,7 +5,7 @@
 //! interposition, and its routing is single-level and non-overlaying — it
 //! cannot layer a read-only view over part of a writable fork. Guarding
 //! therefore wraps the *inner* source (a fork's `CheckoutMountSource`)
-//! directly, before it is ever registered as a route or shadow mount, so
+//! directly, before it is registered as a fork route, so
 //! guarded prefixes work at any depth.
 
 use acyclic_fs::kernel::FileMetadata;
@@ -99,7 +99,7 @@ impl GuardedMountFilesystem {
     /// Whether a mutating call to `path` must be refused: either it falls
     /// under a configured guarded prefix, or its leaf is a macOS `AppleDouble`
     /// sidecar (`._X`). Sidecars are written by the macOS client over the
-    /// mount to carry a file's xattrs / resource fork; in a Safe Mode or fork
+    /// mount to carry a file's xattrs / resource fork; in a fork
     /// projection they are pure transport noise that would otherwise pollute
     /// the session diff and litter the real tree on apply, and a guarded
     /// file's metadata must not leak into one either. Dropping every sidecar

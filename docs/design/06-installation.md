@@ -206,7 +206,7 @@ The two adapter shapes above — lifecycle hooks, and JSON-based MCP registratio
 
 ## Configuration
 
-- Per-repo: `.acyclic/config.toml` — checked in, so teams share policy: checkpoint granularity, guarded paths, dry-run default, store size caps, retention TTLs.
+- Per-repo: `.acyclic/config.toml` — checked in, so teams share policy: checkpoint granularity, guarded paths, store size caps, retention TTLs.
 - Per-machine: `~/.config/acyclic/` — defaults.
 - Zero config is a supported state — defaults are safe everywhere.
 

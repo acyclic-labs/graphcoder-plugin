@@ -8,7 +8,7 @@ Please do not open public issues for security vulnerabilities. Email **security@
 
 The engine (`acyclic` CLI and daemon), the host-tool adapters (Claude Code, Codex, OpenCode), and the release pipeline (signed artifacts, SBOM, provenance).
 
-Of particular interest: snapshot-store data exposure (secrets retained in checkpoints), interposition bypasses (guarded paths, dry-run escapes), and supply-chain issues in the adapters.
+Of particular interest: snapshot-store data exposure (secrets retained in checkpoints), guarded fork interposition bypasses, and supply-chain issues in the adapters.
 
 ## Supported versions
 

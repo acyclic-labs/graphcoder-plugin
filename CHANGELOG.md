@@ -9,6 +9,15 @@ Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
 
 ### Changed
 
+- **The unfinished session-shadowing feature was removed.** It depended on
+  replacing the live repository with a native mount, was not wired into host
+  approval flows, and could not work consistently across platforms. Existing
+  `dry_run` configuration is now rejected; explicit forks remain available.
+  Before replacing the old binary, use that binary to stop every daemon with
+  an active shadow mount. A new protocol-v2 CLI cannot stop a protocol-v1
+  daemon. If the old daemon already crashed, recover the real tree with
+  `fusermount3 -u <repo>` (or `fusermount -u <repo>`) on Linux, or
+  `umount -f <repo>` (then `diskutil unmount force <repo>` if needed) on macOS.
 - **A cold daemon no longer delays the agent's first turn.** The session-start
   hook waits at most 300ms for the daemon; past that it prints a one-line
   notice and returns while the first snapshot builds in the background (251s
@@ -19,8 +28,8 @@ Pre-1.0; `main` is the only supported line (see `SECURITY.md`).
   O(tree) (7s per fork and 6s per promote on 5,000 files); it now runs on the
   existing idle and every-N timers, like every other checkpoint. A fork is cut
   at its exact base generation, published or not.
-- **The daemon exits after an hour idle** with no session, fork, or Safe Mode
-  session (`daemon_idle_exit_ms`, 0 disables). Twenty daemons were found alive
+- **The daemon exits after an hour idle** with no session or fork
+  (`daemon_idle_exit_ms`, 0 disables). Twenty daemons were found alive
   on one machine, eleven for repos that no longer existed.
 - `acyclic status` reports the store size from a cache refreshed in the
   background instead of walking the object directory on every call.
@@ -67,8 +76,6 @@ were 0.0.1. Host coverage, Speculation and Windows are what this release adds.
   the conversation, not just by commit.
 - **Forks** (Launch 3) — copy-on-write materialization for running parallel attempts, with
   promotion back via three-way merge.
-- **Safe Mode** (Launch 4) — session redirection and interposition so agent mistakes land in a
-  redirected session rather than the working tree; needs the native mount layer.
 - **Speculation** — the daemon computes what the agent is about to ask for while nobody is
   waiting: the previous-session brief when a session ends, and (optionally, with a model
   command the developer names) a summary of each turn at the turn boundary. Results are keyed
@@ -79,10 +86,10 @@ were 0.0.1. Host coverage, Speculation and Windows are what this release adds.
 - Published to npm as `@acyclic-labs/plugin`.
 - **Windows x64 support** — the daemon transport gains a named-pipe implementation alongside the
   Unix domain socket, and host names are encoded per platform (UTF-16LE on Windows) so capture,
-  diff, exclusions and the Safe Mode guard agree with the filesystem. Verified on Windows 11 and
-  covered by a `windows-2022` CI job. Two caveats: forks are always full copies there (ProjFS
-  projects a fork but does not carry writes back, so a mounted fork would silently lose work) and
-  Safe Mode needs a real mount, so it is unavailable. See `docs/windows-verification.md`.
+  diff, exclusions and guarded fork paths agree with the filesystem. Verified on Windows 11 and
+  covered by a `windows-2022` CI job. Forks use full copies there because ProjFS projects a fork
+  but does not carry writes back, so a mounted fork would silently lose work. See
+  `docs/windows-verification.md`.
 
 ### Fixed
 

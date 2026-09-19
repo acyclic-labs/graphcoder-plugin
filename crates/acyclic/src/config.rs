@@ -28,18 +28,15 @@ pub struct Config {
     /// records nothing. Zero disables it.
     pub auto_checkpoint_idle_ms: u64,
     /// The daemon exits after this long (ms) with no request, no live
-    /// session, no live fork and no Safe Mode session. It restarts on the
+    /// session and no live fork. It restarts on the
     /// next session start. Zero keeps it alive forever.
     pub daemon_idle_exit_ms: u64,
     /// Days a rewound-away tree is kept in the store's trash.
     pub trash_ttl_days: u32,
     /// Override for the store directory (defaults to the per-machine root).
     pub store_dir: Option<String>,
-    /// Safe Mode: root every session in a fork by default, gated on an
-    /// approved diff before anything reaches the real tree.
-    pub dry_run: bool,
-    /// Safe Mode: path prefixes (relative to the repo root) no fork or
-    /// scratch tree may write to, enforced at the native mount layer.
+    /// Path prefixes (relative to the repo root) that mounted forks may not
+    /// write to, enforced at the native mount layer.
     pub guarded_paths: Vec<String>,
     /// Snapshot exclusions: repo-relative paths (a file, or a directory and
     /// everything under it) that never enter a checkpoint. For secrets and
@@ -123,7 +120,6 @@ impl Default for Config {
             daemon_idle_exit_ms: 3_600_000,
             trash_ttl_days: 7,
             store_dir: None,
-            dry_run: false,
             guarded_paths: Vec::new(),
             exclude: Vec::new(),
             decompose: Decompose::default(),
@@ -233,16 +229,15 @@ mod tests {
     }
 
     #[test]
-    fn safe_mode_fields_parse_from_repo_config() {
+    fn guarded_paths_parse_from_repo_config() {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
         std::fs::write(
             repo.path().join(crate::product::repo_config_file()),
-            "dry_run = true\nguarded_paths = [\".env\", \"migrations/\"]\n",
+            "guarded_paths = [\".env\", \"migrations/\"]\n",
         )
         .expect("write");
         let config = Config::load_layered(None, repo.path()).expect("load");
-        assert!(config.dry_run);
         assert_eq!(config.guarded_paths, vec![".env", "migrations/"]);
     }
 
@@ -298,6 +293,18 @@ mod tests {
         std::fs::write(
             repo.path().join(crate::product::repo_config_file()),
             "quiesce_millis = 10\n",
+        )
+        .expect("write");
+        assert!(Config::load_layered(None, repo.path()).is_err());
+    }
+
+    #[test]
+    fn removed_dry_run_key_is_rejected() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(repo.path().join(crate::product::repo_config_dir())).expect("dir");
+        std::fs::write(
+            repo.path().join(crate::product::repo_config_file()),
+            "dry_run = true\n",
         )
         .expect("write");
         assert!(Config::load_layered(None, repo.path()).is_err());

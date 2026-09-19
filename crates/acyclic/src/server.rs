@@ -8,9 +8,7 @@ use std::time::{Duration, Instant};
 use crate::ipc;
 use crate::proto;
 use acyclic::config::Config;
-use acyclic::fork::{
-    self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
-};
+use acyclic::fork::{self, ForkMode, MountCapability, SharedLocalCheckout};
 use acyclic::guard::GuardedMountFilesystem;
 use acyclic::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use acyclic::merge::{self, Entry};
@@ -21,8 +19,8 @@ use acyclic::store::{Store, StorePaths};
 use acyclic::{rewind, EngineError};
 use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::{
-    mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
-    NativeMountRequest, NativeMountSession, RoutedMountSource,
+    mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
+    RoutedMountSource,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify};
@@ -50,27 +48,6 @@ struct ForkState {
 #[derive(Clone, Debug)]
 struct OpenConflict {
     paths: Vec<PathBuf>,
-}
-
-/// One Safe Mode session: its fork and the shadow mount that projects it
-/// directly at the real repo root for the session's duration. Only one can
-/// be active at a time -- shadowing is a whole-path substitution, so two
-/// sessions can't both shadow the same repo root concurrently.
-struct DrySession {
-    fork_id: String,
-    session_id: String,
-    shared: Arc<SharedLocalCheckout>,
-    base: acyclic::GenerationId,
-    mount: NativeMountSession,
-}
-
-/// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`. Its
-/// overlay is already committed to the store under `generation`; nothing
-/// has touched the real tree yet.
-struct PendingSession {
-    generation: acyclic::GenerationId,
-    base: acyclic::GenerationId,
-    label: String,
 }
 
 /// The one native session projecting every fork through the router.
@@ -169,11 +146,6 @@ fn spawn_speculation(
 }
 
 pub fn run(repo_root: &Path) -> Result<(), String> {
-    // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
-    // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
-    // that wedges every stat/open under it (Config::load, canonicalize, ...).
-    // The force-unmount acts on the mountpoint path itself without touching
-    // the dead server, so the real tree reappears before we read the config.
     let startup = std::time::Instant::now();
     let mut phase = std::time::Instant::now();
     let mut lap = |name: &str| {
@@ -187,9 +159,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     };
     rewind::recover_before_repo_open(repo_root).map_err(|error| error.to_string())?;
     lap("rewind recovery before repo open");
-    fork::sweep_stale_dry_session(repo_root);
-    lap("sweep stale dry-run session");
-
     let config = Config::load(repo_root).map_err(|error| error.to_string())?;
     lap("config load");
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
@@ -241,7 +210,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     }
     if !mounts.available {
         eprintln!(
-            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
+            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies",
             mounts.reason.as_deref().unwrap_or("unknown reason")
         );
     }
@@ -263,8 +232,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
             router: Arc::new(RoutedMountSource::new()),
             session: None,
         })),
-        dry_session: Arc::new(Mutex::new(None)),
-        pending: Arc::new(Mutex::new(HashMap::new())),
         spec,
         live_sessions: Arc::new(Mutex::new(HashSet::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
@@ -284,7 +251,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
 #[derive(Clone)]
 struct Server {
-    /// Probed once at start: decides fork mode and gates Safe Mode.
+    /// Probed once at start to decide whether forks mount or materialize.
     mounts: MountCapability,
     handle: PipelineHandle,
     index_db: PathBuf,
@@ -294,10 +261,6 @@ struct Server {
     shutdown: Arc<Notify>,
     forks: Arc<Mutex<HashMap<String, ForkState>>>,
     fork_mount: Arc<Mutex<ForkMount>>,
-    /// The one active Safe Mode session shadow-mounted at `repo_root`, if any.
-    dry_session: Arc<Mutex<Option<DrySession>>>,
-    /// Sessions that resolved (committed) but haven't been applied/discarded.
-    pending: Arc<Mutex<HashMap<String, PendingSession>>>,
     /// The speculation scheduler, when it is enabled. `None` makes every
     /// call site a no-op, so the default path costs nothing.
     spec: Option<Arc<crate::speculate::SpecHandle>>,
@@ -368,13 +331,11 @@ impl Server {
     }
 
     /// True when nothing has needed this daemon for `idle`: no request, no
-    /// open session, no live fork, no Safe Mode session, nothing pending.
+    /// open session, and no live fork.
     async fn idle_for(&self, idle: Duration) -> bool {
         self.last_activity.lock().await.elapsed() >= idle
             && self.live_sessions.lock().await.is_empty()
             && self.forks.lock().await.is_empty()
-            && self.dry_session.lock().await.is_none()
-            && self.pending.lock().await.is_empty()
     }
 
     /// The store's size on disk, from a cache that a background walk
@@ -717,9 +678,6 @@ impl Server {
                     .session_started(session_id.clone(), host)
                     .await
                     .map_err(stringify)?;
-                if self.config.dry_run {
-                    self.session_fork(session_id).await?;
-                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionEnd { session_id } => {
@@ -772,13 +730,6 @@ impl Server {
                 if let Some(spec) = self.spec.as_ref() {
                     spec.shutdown().await;
                 }
-                // Unmount an active Safe Mode shadow first: it sits directly
-                // on the real repo root, so this must never be left mounted
-                // once the daemon that owns it is gone.
-                if let Some(mut session) = self.dry_session.lock().await.take() {
-                    let _ = tokio::task::block_in_place(|| session.mount.stop());
-                }
-                self.pending.lock().await.clear();
                 // Detach the fork session before the pipeline goes away: its
                 // callback runtimes reach into the shared checkouts.
                 self.forks.lock().await.clear();
@@ -989,157 +940,7 @@ impl Server {
                     ),
                 ))
             }
-            proto::Op::SessionFork { session_id } => {
-                self.session_fork(session_id).await?;
-                Ok(proto::Reply::Unit)
-            }
-            proto::Op::SessionResolve { session_id } => {
-                self.invalidate(&crate::speculate::Cause::Session(session_id.clone()));
-                let mut slot = self.dry_session.lock().await;
-                let session = slot
-                    .take()
-                    .filter(|session| session.session_id == session_id)
-                    .ok_or_else(|| format!("no active Safe Mode session {session_id}"))?;
-                drop(slot);
-                // Unmount first: the real tree must reappear before we ask
-                // the engine to touch it, and no new writes can race the
-                // commit below.
-                let DrySession {
-                    fork_id,
-                    session_id,
-                    shared,
-                    base,
-                    mut mount,
-                } = session;
-                tokio::task::block_in_place(|| mount.stop())
-                    .map_err(|error| format!("unmount: {error:?}"))?;
-                let label = format!("safe mode session {fork_id}");
-                let outcome = self
-                    .handle
-                    .resolve_session(Arc::clone(&shared), base, label.clone())
-                    .await
-                    .map_err(stringify)?;
-                match outcome {
-                    SessionResolveOutcome::NoChanges => {
-                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
-                            session_id,
-                            diff: Vec::new(),
-                        }))
-                    }
-                    SessionResolveOutcome::Resolved { generation } => {
-                        let changes = self
-                            .handle
-                            .diff(base, generation)
-                            .await
-                            .map_err(stringify)?;
-                        self.pending.lock().await.insert(
-                            session_id.clone(),
-                            PendingSession {
-                                generation,
-                                base,
-                                label,
-                            },
-                        );
-                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
-                            session_id,
-                            diff: changes.into_iter().map(diff_entry).collect(),
-                        }))
-                    }
-                    SessionResolveOutcome::Conflict { message } => Err(message),
-                }
-            }
-            proto::Op::SessionApply { session_id } => {
-                let mut pending = self.pending.lock().await;
-                let session = pending
-                    .remove(&session_id)
-                    .ok_or_else(|| format!("no resolved Safe Mode session {session_id}"))?;
-                drop(pending);
-                let outcome = self
-                    .handle
-                    .apply_session(session.generation, session.base, session.label)
-                    .await
-                    .map_err(stringify)?;
-                match outcome {
-                    PromoteOutcome::Promoted {
-                        generation,
-                        old_tree,
-                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
-                        generation: acyclic::generation_hex(generation),
-                        old_tree: old_tree.map(|path| path.display().to_string()),
-                        warning: "reload your editor: open files still point at the replaced tree"
-                            .into(),
-                        replayed_paths: 0,
-                        merged_files: 0,
-                        conflicts: Vec::new(),
-                        fork_path: None,
-                        kept_mainline: Vec::new(),
-                        mainline_moved: false,
-                    })),
-                    PromoteOutcome::Conflict { message } => Err(message),
-                }
-            }
-            proto::Op::SessionDiscard { session_id } => {
-                self.pending.lock().await.remove(&session_id);
-                Ok(proto::Reply::Unit)
-            }
         }
-    }
-
-    /// Forks one checkout and shadow-mounts it directly at `repo_root` for
-    /// `session_id`'s duration (Safe Mode's session redirection). Only one
-    /// Safe Mode session can be active per repo at a time.
-    async fn session_fork(&self, session_id: String) -> Result<(), String> {
-        if !self.mounts.available {
-            return Err(format!(
-                "Safe Mode needs a mount provider and this host has none ({}).\n{}",
-                self.mounts.reason.as_deref().unwrap_or("unknown reason"),
-                fork::mount_setup_hint()
-            ));
-        }
-        if self.dry_session.lock().await.is_some() {
-            return Err("a Safe Mode session is already active for this repo".to_owned());
-        }
-        let seed = self.handle.fork().await.map_err(stringify)?;
-        let shared = Arc::clone(&seed.shared);
-        let config = seed.config;
-        let guarded_paths = self.config.guarded_paths.clone();
-        let volume_id = seed.volume_id;
-        let destination = self.repo_root.clone();
-        let mount = tokio::task::block_in_place(move || {
-            let source = CheckoutMountSource::new(shared, config)
-                .map_err(|error| format!("mount source: {error:?}"))?;
-            let source: Arc<dyn MountFilesystem> =
-                if GuardedMountFilesystem::is_active(&guarded_paths) {
-                    Arc::new(GuardedMountFilesystem::new(
-                        Arc::new(source),
-                        &guarded_paths,
-                    ))
-                } else {
-                    Arc::new(source)
-                };
-            mount_native_over_existing(
-                NativeMountRequest {
-                    mount_id: acyclic::MountId::new(),
-                    volume_id,
-                    destination,
-                    writable: true,
-                },
-                source,
-            )
-            .map_err(|error| format!("shadow mount: {error:?}"))
-        })?;
-        *self.dry_session.lock().await = Some(DrySession {
-            fork_id: short_id(),
-            session_id,
-            shared: seed.shared,
-            base: seed.base,
-            mount,
-        });
-        // The fork now shadows the real repo root: suspend mainline capture
-        // until resolve/apply, or the pipeline watcher captures the shadow's
-        // content and the mount lifecycle instead of real-tree mutations.
-        self.handle.set_shadowed(true).await.map_err(stringify)?;
-        Ok(())
     }
 
     /// Copy-mode forks: materialize the base generation into a real

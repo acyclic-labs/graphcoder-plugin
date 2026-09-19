@@ -4,7 +4,7 @@ Checkpoint every agent action, rewind exactly, see the blast radius. The store c
 
 **A local product with plugin distribution.** The product is an agent-native state engine that runs on your machine — snapshots, forks, and indexing over your working tree. The plugins are thin adapters that deliver it through Claude Code, Codex, OpenCode, any agent that can run a shell command, and Claude Desktop over MCP. The engine is the moat; the plugins are the channel.
 
-> Status: Launches 1–4 built (Rewind, Timeline, Forks, Safe Mode), acceptance suites green on macOS and Linux, published to npm as `@acyclic-labs/plugin`. Launch 1's release gate is met: snapshot exclusions, a store-growth proof, license scanning, an attested SBOM per binary, `scripts/install.sh`, and a clean-machine install test. What v1 deliberately does not do is prune or purge history; see [Retention and purge](#retention-and-purge). Launch 5 (Monorepo) is spec. The spec lives on the [Acyclic plugins docs page](https://acyclic.dev/docs/plugins).
+> Status: Launches 1–3 built (Rewind, Timeline, Forks), acceptance suites green on macOS, Linux, and Windows, published to npm as `@acyclic-labs/plugin`. Launch 1's release gate is met: snapshot exclusions, a store-growth proof, license scanning, an attested SBOM per binary, `scripts/install.sh`, and a clean-machine install test. What v1 deliberately does not do is prune or purge history; see [Retention and purge](#retention-and-purge). Launch 5 (Monorepo) is spec. The spec lives on the [Acyclic plugins docs page](https://acyclic.dev/docs/plugins).
 
 ## Install
 
@@ -67,7 +67,7 @@ Not yet covered: an `install` writer for Codex's MCP config (TOML), Kimi Code CL
 | `commit_every` / `commit_idle_ms` | `25` / `60000` | How often per-tool-call checkpoints are published to the durable store. |
 | `auto_checkpoint_idle_ms` | `5000` | Idle-timer safety net: checkpoints changes on its own once the watcher has been quiet this long, for hosts with no lifecycle-hook API (Claude Desktop). `0` disables it. Cheap no-op for hooked hosts, which already drain the watcher themselves. |
 | `quiesce_ms` / `quiesce_cap_ms` | `50` / `500` | Watcher quiet window before a capture. |
-| `dry_run` / `guarded_paths` | `false` / `[]` | Safe Mode (Launch 4). |
+| `guarded_paths` | `[]` | Repo-relative prefixes that mounted forks cannot write. Copy-mode forks do not enforce this mount-layer policy. |
 | `[decompose]` / `[merge]` | | Fork decomposition policy and merge limits (Launch 3). |
 | `store_dir` | `~/.local/share/acyclic/stores` | Where stores live. Never inside the repo. |
 
@@ -108,7 +108,7 @@ Median lead is the number to watch: it is how far ahead of the request a claimed
 
 `acyclic status` reports the store size; trash is pruned by TTL. The store itself is never garbage-collected in v1, on purpose. At the pinned `acyclic-fs` revision a generation stays reachable only while it is a workspace head or carries a retention fact (checkpoint label, pin, fork base), retention facts cannot be released, and closure proofs do not follow generation parents. So the fs collector would either destroy every checkpoint but the head or, if every checkpoint were pinned first, never free anything again. Purge-through-history has the same dependency: content cannot be physically removed from a retained generation. Both land when the fs grows a retention-release fact; until then, keep secrets out of the store with `exclude`, which is the compliance control that ships. Details and the upstream ask are in `docs/design/implementation-rewind.md`, Phase 4.
 
-Known caveats: mtimes are not restored on rewind, a rewind warrants an editor reload, forks and Safe Mode sessions do not see excluded paths, and baseline capture runs at roughly 230 s/GiB on first `init`.
+Known caveats: mtimes are not restored on rewind, a rewind warrants an editor reload, forks do not see excluded paths, and baseline capture runs at roughly 230 s/GiB on first `init`.
 
 ## Thesis
 
@@ -130,7 +130,6 @@ One engine, thin adapters:
 | 1 | Rewind | Merkle snapshot store + host hooks | Never fear letting the agent loose | built (`tests/acceptance/journey.sh`, `crash.sh`, `soak.sh`, `latency.sh`, `claude-e2e.sh`) |
 | 2 | Timeline | Turn-linked metadata index | The repo at any point in the conversation | built (`timeline.sh`) |
 | 3 | Forks | Copy-on-write materialization | N parallel attempts, pick the winner | built: mounted forks, promote with three-way merge (`forks.sh`, `merge.sh`, `claude-merge-e2e.sh`) |
-| 4 | Safe Mode | Session redirection + interposition | Agents on the codebase, not agents' mistakes in it | built, needs the native mount layer (`safe-mode.sh`) |
 | 5 | Monorepo | Merkle-aware content + symbol index | The repo that finally works with agents | not started |
 
 Run everything with `tests/acceptance/run-all.sh`; the live Claude Code scenarios are gated by `ACYCLIC_E2E=1`.

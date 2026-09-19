@@ -113,9 +113,8 @@ Two honest limits on that pitch:
 - Hosts without a prompt hook — Claude Desktop, VS Code, OpenCode — get
   checkpoints without turn linkage, so the headline evidence is thinner exactly
   where the adapter is thinnest.
-- The "a human approved it before it reached the real tree" half rests on Safe
-  Mode, which is off by default, refuses to start without a mount provider, and
-  whose approval verbs are hidden CLI-only and wired into no host.
+- V1 does not interpose a human approval gate on ordinary agent writes. Explicit
+  forks isolate work only when the user or host chooses that workflow.
 
 ## When the cloud arrives (v2)
 
@@ -149,4 +148,4 @@ as a silent default — and the engine remains fully usable with the cloud off.
    claiming it.*
 6. **Is `exclude` enough as the only shipped control?** It is prefix-based,
    start-time-bound, and non-retroactive, and excluded paths are invisible to
-   forks and Safe Mode sessions. *No lean.*
+   forks. *No lean.*

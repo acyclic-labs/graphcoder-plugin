@@ -92,27 +92,23 @@ pub fn mount_setup_hint() -> &'static str {
             "forks will use full copies until /dev/fuse is usable. To enable mounts:\n",
             "  sudo modprobe fuse                          # load the kernel module\n",
             "  sudo usermod -aG fuse \"$USER\"               # if /dev/fuse is group-restricted; log in again\n",
-            "  docker run --device /dev/fuse --cap-add SYS_ADMIN ...   # inside a container\n",
-            "Safe Mode (dry_run) needs mounts and refuses to start without them.",
+            "  docker run --device /dev/fuse --cap-add SYS_ADMIN ...   # inside a container",
         )
     } else if cfg!(target_os = "macos") {
         concat!(
             "forks will use full copies: the built-in NFS mount tools (/sbin/mount_nfs, /sbin/umount)\n",
             "are missing or blocked by policy. No extra software is needed on macOS;\n",
-            "ask your administrator to allow loopback NFS mounts.\n",
-            "Safe Mode (dry_run) needs mounts and refuses to start without them.",
+            "ask your administrator to allow loopback NFS mounts.",
         )
     } else if cfg!(windows) {
         concat!(
             "forks will use full copies until the optional Windows Projected File System\n",
             "feature is enabled and available to this process. Enable Client-ProjFS in\n",
             "Windows Features to use accelerated forks. ProjFS safely rejects cross-root\n",
-            "directory moves that it cannot capture atomically. Safe Mode (dry_run) cannot\n",
-            "shadow an existing Windows directory with ProjFS.",
+            "directory moves that it cannot capture atomically.",
         )
     } else {
-        "native mounts are not supported on this platform; forks use full copies \
-         and Safe Mode (dry_run) is unavailable."
+        "native mounts are not supported on this platform; forks use full copies."
     }
 }
 
@@ -122,7 +118,7 @@ pub fn forks_copy_root(repo_root: &Path) -> Option<PathBuf> {
 }
 
 /// Captures the current content of `root` into a fork's overlay, so that
-/// promote/resolve see it exactly as they would see writes through a mount.
+/// promote sees it exactly as it would see writes through a mount.
 /// The overlay must be pristine (a fresh fork seed): capture is a full-tree
 /// baseline against the checkout, so only paths that actually differ from
 /// the base become pending mutations.
@@ -165,21 +161,6 @@ pub enum PromoteOutcome {
     },
     /// The mainline moved past the fork's base — v1 surfaces the conflict
     /// legibly instead of merging.
-    Conflict { message: String },
-}
-
-/// Result of the commit half of a Safe Mode session resolve (see
-/// [`crate::pipeline::PipelineHandle::resolve_session`]) — the swap itself
-/// is deferred to a separate `apply_session` call so the caller can show an
-/// approval-gated diff in between.
-#[derive(Clone, Debug)]
-pub enum SessionResolveOutcome {
-    /// The overlay committed cleanly; `generation` is ready for
-    /// `apply_session`, or can simply be left unswapped (Safe Mode reject).
-    Resolved { generation: GenerationId },
-    /// Nothing was written; there is nothing to diff or apply.
-    NoChanges,
-    /// The mainline moved past the fork's base — same v1 stance as promote.
     Conflict { message: String },
 }
 
@@ -235,87 +216,41 @@ pub fn sweep_stale_forks(repo_root: &Path) {
     let _ = std::fs::remove_dir(&root);
 }
 
-/// Best-effort cleanup of a Safe Mode shadow mount a dead daemon left
-/// directly on `repo_root` itself. Unlike [`sweep_stale_forks`], the
-/// directory is never removed here -- it IS the real repo -- only
-/// force-unmounted so its real content reappears. A no-op if nothing is
-/// mounted there.
-pub fn sweep_stale_dry_session(repo_root: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("umount")
-            .arg("-f")
-            .arg(repo_root)
-            .status();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("fusermount")
-            .arg("-u")
-            .arg(repo_root)
-            .status();
-    }
-    // A ProjFS virtualization root stops with the process that owned it, so
-    // a dead daemon leaves nothing mounted over the repo to reap.
-    #[cfg(windows)]
-    {
-        let _ = repo_root;
-    }
-}
-
-/// Reaps a Safe Mode shadow left by a *crashed* daemon before the caller
-/// touches `repo`. A dead daemon's shadow is a loopback-NFS/FUSE mountpoint
-/// whose server is gone, so every `stat`/`open` under it (config load, path
-/// canonicalization) blocks indefinitely — the CLI would hang before it
-/// could even spawn a fresh daemon to clean up.
-///
-/// Distinguishing a dead shadow from a live session (whose shadow is fine)
-/// without a store/config lookup — which would itself stat `repo` — is done
-/// by probing: a live server answers a `stat` immediately, while a dead one
-/// either blocks or fails (the NFS layer surfaces `ETIMEDOUT`/`ENOTCONN`).
-/// So this force-unmounts whenever a bounded probe does not cleanly succeed;
-/// a healthy repo always stats OK and is never disturbed, and a `umount` of a
-/// path that is not actually a mount is a harmless no-op.
-pub fn reap_dead_shadow(repo: &Path) {
+/// Recovers a repository still covered by a shadow mount from a legacy
+/// `dry_run` daemon. New versions no longer create these mounts, but upgrade
+/// must remain able to expose the real repository before opening it.
+pub fn reap_legacy_shadow(repo: &Path) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::time::Duration;
-        // Resolve to an absolute mountpoint via the (always-live) parent, so
-        // the probe/unmount target is stable without stat-ing `repo` itself.
         let target = match (repo.parent(), repo.file_name()) {
-            (Some(parent), Some(name)) => match parent.canonicalize() {
-                Ok(parent) => parent.join(name),
-                Err(_) => repo.to_path_buf(),
-            },
+            (Some(parent), Some(name)) => parent
+                .canonicalize()
+                .map_or_else(|_| repo.to_path_buf(), |parent| parent.join(name)),
             _ => repo.to_path_buf(),
         };
         let probe = target.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        // Detached: if the stat is truly wedged it never returns, but the
-        // force-unmount below releases it and this short-lived CLI exits.
-        std::thread::spawn(move || {
-            let _ = tx.send(std::fs::metadata(&probe).is_ok());
-        });
-        let healthy = matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
-        if !healthy {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || drop(sender.send(std::fs::metadata(probe).is_ok())));
+        if !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true)) {
             #[cfg(target_os = "macos")]
-            let _ = std::process::Command::new("umount")
-                .arg("-f")
-                .arg(&target)
-                .status();
+            drop(
+                std::process::Command::new("umount")
+                    .arg("-f")
+                    .arg(target)
+                    .status(),
+            );
             #[cfg(target_os = "linux")]
-            let _ = std::process::Command::new("fusermount")
-                .arg("-u")
-                .arg(&target)
-                .status();
+            drop(
+                std::process::Command::new("fusermount")
+                    .arg("-u")
+                    .arg(target)
+                    .status(),
+            );
         }
     }
-    // A ProjFS shadow dies with the daemon that projected it, so there is no
-    // wedged mountpoint to probe for and nothing to force-unmount.
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = repo;
-    }
+    let _ = repo;
 }
 
 #[cfg(test)]

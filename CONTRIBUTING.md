@@ -13,7 +13,7 @@ Acceptance suites (end-to-end, run against a real repo) live in `tests/acceptanc
 tests/acceptance/run-all.sh
 ```
 
-Individual suites (`journey.sh`, `timeline.sh`, `forks.sh`, `merge.sh`, `safe-mode.sh`, etc.) can
+Individual suites (`journey.sh`, `timeline.sh`, `forks.sh`, `merge.sh`, etc.) can
 be run with `bash tests/acceptance/<suite>.sh` if you're iterating on one feature.
 
 The `*-e2e.sh` suites drive the real host CLIs (Claude Code, Codex, cursor-agent, OpenCode) and
@@ -106,7 +106,7 @@ exempt from this check.
 ## Design context
 
 `docs/design/` has the design docs and implementation notes behind the bigger features (Rewind,
-Timeline, Forks, Safe Mode). Worth a skim before working on any of them — they capture the
+Timeline, Forks). Worth a skim before working on any of them — they capture the
 tradeoffs and constraints that shaped the current architecture, including a few (like snapshot
 GC) that are intentionally deferred.
 

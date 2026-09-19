@@ -73,7 +73,7 @@ is what exists, including where it diverged from the plan.
 ## Notes
 
 - Fork orchestration of subagents is uniquely plugin-shaped — it must live inside the host.
-- Filesystem-layer enforcement for Launch 4's guarded paths arrives with the mount option. This turned out to be the decisive argument: the mount shipped and reflinks never did, and Safe Mode refuses to start without a mount provider.
+- Filesystem-layer enforcement for guarded paths arrives with the mount option. Copy-mode forks cannot enforce this policy at the filesystem boundary.
 
 ## Open questions (not yet settled)
 

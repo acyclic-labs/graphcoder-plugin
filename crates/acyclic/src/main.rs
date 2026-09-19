@@ -216,17 +216,6 @@ enum Command {
     /// Record a host session ending (hook use).
     #[command(hide = true)]
     SessionEnd { session_id: String },
-    /// Safe Mode: commit a session's shadow fork and show what it would
-    /// change, without touching the real tree yet.
-    #[command(hide = true)]
-    SessionResolve { session_id: String },
-    /// Safe Mode: apply a `session-resolve`d session's changes to the real
-    /// tree.
-    #[command(hide = true)]
-    SessionApply { session_id: String },
-    /// Safe Mode: discard a `session-resolve`d session without applying it.
-    #[command(hide = true)]
-    SessionDiscard { session_id: String },
     /// Internal: the per-repo daemon process.
     #[command(name = "__daemon", hide = true)]
     Daemon { repo_root: PathBuf },
@@ -251,12 +240,7 @@ fn main() {
         }
     }
     let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    // Before touching the repo path (canonicalize, config load, socket): a
-    // crashed Safe Mode daemon can leave a dead shadow mount over the repo
-    // root that wedges every stat under it. Force-unmount it first (a no-op
-    // unless a bounded probe shows the mount is genuinely wedged), so the
-    // real tree is back before we read anything.
-    acyclic::fork::reap_dead_shadow(&repo_arg);
+    acyclic::fork::reap_legacy_shadow(&repo_arg);
     let repo_arg = acyclic::rewind::recover_before_repo_open(&repo_arg).unwrap_or_else(|error| {
         eprintln!("{}: rewind recovery: {error}", product::NAME);
         std::process::exit(1);
@@ -396,15 +380,12 @@ fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
     Client::connect(&paths.socket(), repo, &log, spawn)
 }
 
-/// One line on what forks and Safe Mode can do here, plus setup steps when
-/// the host lacks a mount provider. Shown by `init` and `install`.
+/// One line on native fork support, plus setup steps when the host lacks a
+/// mount provider. Shown by `init` and `install`.
 fn print_mount_capability() {
     let capability = acyclic::fork::mount_capability();
     if capability.available {
-        println!(
-            "mounts:        {} (forks and Safe Mode available)",
-            capability.provider
-        );
+        println!("mounts:        {} (forks mount)", capability.provider);
     } else {
         println!(
             "mounts:        unavailable ({})",
@@ -992,13 +973,10 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
             println!("unpublished:   {}", info.unpublished);
             println!("store size:    {}", human_bytes(info.store_bytes));
             if info.mount_available {
-                println!(
-                    "mounts:        {} (forks mount, Safe Mode on)",
-                    info.mount_provider
-                );
+                println!("mounts:        {} (forks mount)", info.mount_provider);
             } else {
                 println!(
-                    "mounts:        unavailable ({}) — forks copy, Safe Mode off",
+                    "mounts:        unavailable ({}) — forks copy",
                     info.mount_reason.as_deref().unwrap_or("unknown reason")
                 );
             }
@@ -1050,50 +1028,6 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
         }
         Command::SessionEnd { session_id } => {
             client.call(proto::Op::SessionEnd { session_id })?;
-            Ok(())
-        }
-        Command::SessionResolve { session_id } => {
-            let reply = client.call(proto::Op::SessionResolve { session_id })?;
-            let proto::Reply::SessionPending(info) = reply else {
-                return Err("unexpected reply".into());
-            };
-            if info.diff.is_empty() {
-                println!("session {}: no changes", info.session_id);
-                return Ok(());
-            }
-            for entry in &info.diff {
-                println!("{} {}", entry.change.tag(), entry.path);
-            }
-            println!(
-                "{} paths changed; run `{NAME} session-apply {}` to land them or \
-                 `{NAME} session-discard {}` to throw them away",
-                info.diff.len(),
-                info.session_id,
-                info.session_id
-            );
-            Ok(())
-        }
-        Command::SessionApply { session_id } => {
-            step_aside();
-            let reply = client.call(proto::Op::SessionApply { session_id })?;
-            let proto::Reply::Promote(info) = reply else {
-                return Err("unexpected reply".into());
-            };
-            match info.old_tree {
-                Some(old_tree) => {
-                    println!(
-                        "applied: working tree now at {}",
-                        short_hex(&info.generation)
-                    );
-                    println!("old tree kept at {old_tree}");
-                    println!("note: {}", info.warning);
-                }
-                None => println!("session had no changes; nothing to land"),
-            }
-            Ok(())
-        }
-        Command::SessionDiscard { session_id } => {
-            client.call(proto::Op::SessionDiscard { session_id })?;
             Ok(())
         }
         Command::Init

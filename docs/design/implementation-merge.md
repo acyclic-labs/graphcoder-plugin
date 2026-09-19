@@ -32,8 +32,7 @@ plan.
 
 **Out (later launches, listed so nobody re-litigates them mid-build):**
 rename detection; semantic or AST merges; markers written into the
-*mainline*; Safe Mode `apply_session` onto a moved mainline (keeps the
-unmoved-mainline rule); merging directory-ancestry overlaps; live rebase
+*mainline*; merging directory-ancestry overlaps; live rebase
 of a fork while the mainline moves.
 
 ## Definitions
@@ -206,7 +205,7 @@ before anything is written.
 One pipeline request `BuildGeneration { from: GenerationId, entries }`:
 scratch checkout at `from` (`scratch_checkout` exists), write each entry
 through the SDK checkout API the fork tests already use, `checkpoint()`
-it unpublished (as `resolve_session` does), `record_generation` it.
+it unpublished, then `record_generation` it.
 M = `BuildGeneration(H, merged ∪ taken)`; R = `BuildGeneration(M,
 conflicted)`. No head movement, no tree writes.
 
@@ -263,7 +262,7 @@ conflict state, proto fields, CLI lines, marker-scan on re-promote.
 Skill text update.
 
 **C3 — acceptance.** `merge.sh` changes below, run in mount mode on macOS
-and copy mode on Linux, plus `forks.sh`, `safe-mode.sh`, and the journey
+and copy mode on Linux, plus `forks.sh` and the journey
 suites unchanged. Update `spec-forks.md`'s out-of-scope line, its stale
 M4/M5 rows, and the c905be4 "discard" wording in the same commit.
 
@@ -380,10 +379,10 @@ Deliberate divergences:
   fork: through the shared checkout for a mount fork (route detached
   during promote, re-attached after), via `restore_path_into` for a copy
   fork.
-- **Rebased forks land by checkpoint-and-swap.** A rebased mount fork's
-  checkout still sits on the head it was cut from, so an optimistic
+- **Rebased forks land through the copy-fork snapshot/apply path.** A rebased
+  mount fork's checkout still sits on the head it was cut from, so an optimistic
   commit against the new head would conflict. `ForkState.rebased` routes
-  such forks through the same resolve/apply pair copy forks use.
+  such forks through the same snapshot/apply path copy forks use.
 - **Subtree copy and removal are iterative.** The fs facade's futures
   are large enough that three nested levels overflowed the pipeline
   thread's 2 MiB stack in a debug build. Both walks use an explicit work
@@ -419,9 +418,8 @@ Deliberate divergences:
   unmoved mainline used to land by whole-tree swap, which replaced the
   repo directory and needed the skill's `cd "$PWD"` step. Promote now
   always goes through the merge path: with an unmoved head the plan is
-  "take every fork path" and they are written in place. Safe Mode's
-  `session-apply` is the only remaining swap. `merge.sh` G11 asserts
-  the repo inode survives a promote.
+  "take every fork path" and they are written in place. `merge.sh` G11
+  asserts the repo inode survives a promote.
 - **Diff output marks gitignored paths** with a `(gitignored)` suffix
   and a `(K gitignored)` count so the skill's smallest-diff rule can
   ignore cache and build noise; the paths stay listed because rewind
@@ -451,14 +449,11 @@ Deliberate divergences:
   prints the wait-path p95 as information.
 - **Path tracing.** `ACYCLIC_TRACE=1` makes the CLI, hook, daemon, and
   pipeline log every branch taken and its cost (client connect/spawn,
-  op dispatch and reply, WAIT vs ENQUEUE checkpoint, shadowed noop,
+  op dispatch and reply, WAIT vs ENQUEUE checkpoint,
   recovery baseline, watcher drain polls/batches/stop reason, snapshot,
   index, publish, promote mode and outcome, merge plan counts, root
   hints). Daemon lines land in the store's `daemon.log`.
-- **Safe Mode S9 race.** After an empty session resolve unmounted the
-  shadow and installed a fresh watcher, a late mount-teardown event for
-  the repo root itself reached the next drain, and the engine refused a
-  mutation targeting the volume root. Root-targeted hints are now
+- **Root-targeted watcher hints.** Root-targeted hints are now
   stripped before capture: metadata-only ones dropped, structural ones
   (root created/removed/renamed, i.e. a mount came or went) trigger a
   fresh watcher and a recovery baseline instead of a failed request.

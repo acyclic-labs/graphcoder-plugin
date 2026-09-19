@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::diff::{self, FileChange};
 use crate::exclude::Exclusions;
-use crate::fork::{ForkSeed, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
+use crate::fork::{ForkSeed, PromoteOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RestoreOutcome, RewindOutcome};
 use crate::store::Store;
@@ -219,24 +219,8 @@ enum Request {
         label: String,
         reply: oneshot::Sender<Result<PromoteOutcome>>,
     },
-    ResolveSession {
-        shared: Arc<SharedLocalCheckout>,
-        base: GenerationId,
-        label: String,
-        reply: oneshot::Sender<Result<SessionResolveOutcome>>,
-    },
-    ApplySession {
-        generation: GenerationId,
-        base: GenerationId,
-        label: String,
-        reply: oneshot::Sender<Result<PromoteOutcome>>,
-    },
     Status {
         reply: oneshot::Sender<Result<StatusReport>>,
-    },
-    SetShadowed {
-        active: bool,
-        reply: oneshot::Sender<Result<()>>,
     },
     SessionStarted {
         session_id: String,
@@ -587,54 +571,8 @@ impl PipelineHandle {
         )?
     }
 
-    /// Safe Mode's commit half of promote: commits the overlay (or reports
-    /// a conflict) without touching the real tree, so the caller can show
-    /// an approval-gated diff before deciding whether to `apply_session`.
-    pub async fn resolve_session(
-        &self,
-        shared: Arc<SharedLocalCheckout>,
-        base: GenerationId,
-        label: String,
-    ) -> Result<SessionResolveOutcome> {
-        request!(
-            self,
-            ResolveSession {
-                shared: shared,
-                base: base,
-                label: label
-            }
-        )?
-    }
-
-    /// Safe Mode's swap half of promote: lands an already-`resolve_session`d
-    /// generation onto the real tree.
-    pub async fn apply_session(
-        &self,
-        generation: GenerationId,
-        base: GenerationId,
-        label: String,
-    ) -> Result<PromoteOutcome> {
-        request!(
-            self,
-            ApplySession {
-                generation: generation,
-                base: base,
-                label: label
-            }
-        )?
-    }
-
     pub async fn status(&self) -> Result<StatusReport> {
         request!(self, Status {})?
-    }
-
-    /// Safe Mode: while a session's fork is shadow-mounted over the real repo
-    /// root, mainline capture must pause — the pipeline's watcher would
-    /// otherwise observe the fork's content and the mount/unmount lifecycle
-    /// (which can map to the volume root) instead of real-tree mutations.
-    /// `resolve_session`/`apply_session` clear it and rebuild the watcher.
-    pub async fn set_shadowed(&self, active: bool) -> Result<()> {
-        request!(self, SetShadowed { active: active })?
     }
 
     pub async fn session_started(&self, session_id: String, host: String) -> Result<()> {
@@ -679,7 +617,7 @@ enum RootHint {
 /// Removes hints that target the volume root from a batch. The engine
 /// refuses any mutation of the root ("mutation cannot target the volume
 /// root"), and such hints only ever come from mount lifecycle events on the
-/// repo directory (Safe Mode shadowing it, or a fork session tearing down),
+/// repo directory (for example, a fork session tearing down),
 /// never from the user's edits.
 fn strip_root_hints(batch: WatchBatch) -> (WatchBatch, RootHint) {
     let WatchBatch::Changes {
@@ -778,9 +716,6 @@ struct Pipeline {
     last_checkpoint_row: Option<i64>,
     checkpoints_since_commit: u32,
     last_activity: Instant,
-    /// A Safe Mode session's fork is shadow-mounted over the repo root:
-    /// mainline capture is suspended until `resolve_session`/`apply_session`.
-    shadowed: bool,
     /// Watcher invalidations and recovery rescans since start; see
     /// [`WatcherHealth`].
     watcher_health: WatcherHealth,
@@ -868,12 +803,9 @@ fn fail_request(request: Request, message: &str) {
         Request::MaterializePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
-        Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
-        Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePath { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::TurnStarted { reply, .. } => drop(reply.send(Err(error()))),
-        Request::SetShadowed { reply, .. } => drop(reply.send(Err(error()))),
         Request::Status { reply } => drop(reply.send(Err(error()))),
         Request::SessionStarted { reply, .. } | Request::SessionEnded { reply, .. } => {
             drop(reply.send(Err(error())));
@@ -922,7 +854,6 @@ impl Pipeline {
             last_checkpoint_row: None,
             checkpoints_since_commit: 0,
             last_activity: Instant::now(),
-            shadowed: false,
             watcher_health: WatcherHealth::default(),
             auto_pending: None,
         };
@@ -1286,24 +1217,6 @@ impl Pipeline {
                 let _ = reply.send(self.promote(shared, base, &label).await);
                 false
             }
-            Request::ResolveSession {
-                shared,
-                base,
-                label,
-                reply,
-            } => {
-                let _ = reply.send(self.resolve_session(shared, base, &label).await);
-                false
-            }
-            Request::ApplySession {
-                generation,
-                base,
-                label,
-                reply,
-            } => {
-                let _ = reply.send(self.apply_session(generation, base, &label).await);
-                false
-            }
             Request::Status { reply } => {
                 let _ = reply.send(Ok(StatusReport {
                     state: self.state,
@@ -1312,11 +1225,6 @@ impl Pipeline {
                     checkpoints_since_commit: self.checkpoints_since_commit,
                     watcher: self.watcher_health.clone(),
                 }));
-                false
-            }
-            Request::SetShadowed { active, reply } => {
-                self.shadowed = active;
-                let _ = reply.send(Ok(()));
                 false
             }
             Request::SessionStarted {
@@ -1357,26 +1265,6 @@ impl Pipeline {
         attribution: &Attribution,
     ) -> Result<CheckpointOutcome> {
         let started = Instant::now();
-        if self.shadowed {
-            // A Safe Mode session's fork is mounted over the repo root; the
-            // real tree is frozen and the watcher sees only fork/mount noise.
-            // Record a noop so the hook gets a clean reply, but never drain
-            // the watcher or snapshot the mainline mid-session.
-            crate::trace!(
-                "pipeline",
-                "checkpoint kind={:?}: shadowed -> noop row, watcher untouched",
-                kind
-            );
-            let row = self
-                .index
-                .record(self.last_generation, CheckpointKind::Noop, attribution)?;
-            self.last_checkpoint_row = Some(row);
-            return Ok(CheckpointOutcome {
-                row_id: row,
-                generation: self.last_generation,
-                kind: CheckpointKind::Noop,
-            });
-        }
         if self.state != State::Ready {
             // A failed recovery leaves state at Baselining; a request is the
             // natural moment to retry rather than staying down forever.
@@ -1639,7 +1527,7 @@ impl Pipeline {
     /// meantime. Never records a row when nothing changed, so it cannot spam
     /// the timeline.
     async fn auto_checkpoint(&mut self) {
-        if self.config.auto_checkpoint_idle_ms == 0 || self.shadowed || self.state != State::Ready {
+        if self.config.auto_checkpoint_idle_ms == 0 || self.state != State::Ready {
             return;
         }
         // Like `idle_commit`, failures here are advisory: the pending state
@@ -1837,11 +1725,6 @@ impl Pipeline {
         safety: bool,
         label: Option<String>,
     ) -> Result<RestoredPaths> {
-        if self.shadowed {
-            return Err(EngineError::Restore(
-                "a Safe Mode session is shadowing the repo root; resolve it first".into(),
-            ));
-        }
         for path in paths {
             if self.exclusions.covers_host(path) {
                 return Err(EngineError::Restore(format!(
@@ -2051,7 +1934,7 @@ impl Pipeline {
         Ok(ForkSeed {
             // Native close/flush must never publish: sibling forks share one
             // volume head, so a seal on close makes the next fork's mutations
-            // Stale. Promote/resolve are the only commits.
+            // stale. Promote is the only commit.
             shared: Arc::new(SharedLocalCheckout::with_publication(
                 checkout,
                 MountPublication::Manual,
@@ -2149,140 +2032,6 @@ impl Pipeline {
             .await
             .map_err(EngineError::fs("refresh checkout"))?
             .value;
-        let row = self.index.record(
-            generation,
-            CheckpointKind::Manual,
-            &Attribution {
-                label: Some(label.to_owned()),
-                ..Attribution::default()
-            },
-        )?;
-        self.last_generation = generation;
-        self.last_checkpoint_row = Some(row);
-
-        let swap = self.swap_root_and_rebaseline(generation).await?;
-        Ok(PromoteOutcome::Promoted {
-            generation,
-            old_tree: Some(swap.old_tree),
-        })
-    }
-
-    /// The commit half of promote, split out for Safe Mode: publishes the
-    /// mainline safety net and commits the fork's overlay, but never
-    /// touches the real tree — the caller diffs `base` against the
-    /// returned generation and decides whether to `apply_session` it.
-    async fn resolve_session(
-        &mut self,
-        shared: Arc<SharedLocalCheckout>,
-        base: GenerationId,
-        label: &str,
-    ) -> Result<SessionResolveOutcome> {
-        // The server unmounts the shadow before calling us, so the pipeline
-        // watcher's queue is full of mount-teardown hints — some of which map
-        // to the volume root and would fail capture outright. Leave shadow
-        // mode and swap in a fresh watcher on the now-real tree to DISCARD
-        // that queue. The pipeline's own checkout never moved during the
-        // session (mainline checkpoints no-op while shadowed), so it still
-        // sits at `base`; we must not re-baseline/publish it here or the
-        // mainline HEAD would advance past the fork and the overlay commit
-        // below would spuriously conflict.
-        if self.shadowed {
-            self.shadowed = false;
-            self.reset_watch().await?;
-            let _ = self
-                .watch
-                .as_mut()
-                .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
-                .finish_rescan()
-                .map_err(EngineError::fs("finish rescan"))?;
-            self.state = State::Ready;
-        } else {
-            // No shadow (direct callers, e.g. tests): the watcher is trusted,
-            // so fold any pending real-tree change into the safety net.
-            self.drain_watcher().await?;
-        }
-        let safety = self.checkpoint_engine().await?;
-        let safety_row = self.index.record(
-            safety,
-            CheckpointKind::PreRewind,
-            &Attribution {
-                label: Some(format!("before {label}")),
-                ..Attribution::default()
-            },
-        )?;
-        self.last_generation = safety;
-        self.last_checkpoint_row = Some(safety_row);
-        // The safety checkpoint stays UNPUBLISHED (checkpoint, not commit):
-        // publishing it would move the authority head off `base`, and Safe
-        // Mode must leave the head at base until `apply_session` so that
-        // `session-discard` truly changes nothing and the next session forks
-        // cleanly. Unpublished checkpoint generations are fully restorable.
-        let _ = base; // conflict against a moved mainline is detected at apply
-
-        // Snapshot the fork's overlay as an unpublished generation: diffable
-        // and rewind-applyable by id, without advancing the head.
-        let generation = {
-            let guard = shared.lock().await;
-            if !guard.has_pending_mutations() {
-                return Ok(SessionResolveOutcome::NoChanges);
-            }
-            guard
-                .checkpoint(WorkCounters::UNBOUNDED, &self.cancel)
-                .await
-                .map_err(EngineError::fs("session checkpoint"))?
-                .value
-        };
-        Ok(SessionResolveOutcome::Resolved { generation })
-    }
-
-    /// The swap half of promote, split out for Safe Mode: lands an
-    /// already-committed generation (from `resolve_session`) onto the real
-    /// tree, exactly like `promote`'s own tail.
-    async fn apply_session(
-        &mut self,
-        generation: GenerationId,
-        base: GenerationId,
-        label: &str,
-    ) -> Result<PromoteOutcome> {
-        self.state = State::Rewinding;
-        self.drain_watcher().await?;
-        if self.checkpoint_engine().await? != base {
-            self.state = State::Ready;
-            return Ok(PromoteOutcome::Conflict {
-                message: format!(
-                    "the working tree moved past the session's base ({}); Safe Mode in v1 requires an unmoved mainline",
-                    crate::generation_hex(base)
-                ),
-            });
-        }
-        self.commit_engine().await?;
-        self.store.checkout = self
-            .store
-            .volume
-            .checkout(
-                acyclic_fs::model::GenerationSelector::Head,
-                crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
-            )
-            .await
-            .map_err(EngineError::fs("refresh checkout"))?
-            .value;
-        // Same v1 stance as promote: if the mainline published anything since
-        // the fork's base, the head has moved off `base` and applying would
-        // clobber it. Detected here rather than at resolve, because resolve
-        // deliberately leaves the head at base (unpublished overlay).
-        if self.store.checkout.generation_id() != base {
-            self.state = State::Ready;
-            return Ok(PromoteOutcome::Conflict {
-                message: format!(
-                    "the working tree moved past the session's base ({}); \
-                     Safe Mode in v1 requires an unmoved mainline — rewind to \
-                     the base or start a new session",
-                    crate::generation_hex(base)
-                ),
-            });
-        }
         let row = self.index.record(
             generation,
             CheckpointKind::Manual,

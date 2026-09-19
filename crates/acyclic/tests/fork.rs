@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acyclic::config::Config;
-use acyclic::fork::{PromoteOutcome, SessionResolveOutcome};
+use acyclic::fork::PromoteOutcome;
 use acyclic::index::{Attribution, CheckpointKind, Index};
 use acyclic::pipeline::{self, PipelineHandle, State};
 use acyclic::store::{Store, StorePaths};
@@ -180,75 +180,6 @@ fn promote_lands_fork_changes() {
         row.kind == CheckpointKind::Manual && row.label.as_deref() == Some("promote test-fork")
     }));
     assert_watcher_recovers_after_swap(&rig);
-    rig.finish();
-}
-
-/// Safe Mode: `resolve_session` + `apply_session` together must land a fork's
-/// changes identically to promote's single-shot version.
-#[test]
-fn resolve_then_apply_session_lands_fork_changes() {
-    let rig = Rig::start();
-    let (diffable_base, outcome) = rig.runtime.block_on(async {
-        let seed = rig.handle.fork().await.expect("fork");
-        write_in_fork(&seed, "/fork-note.txt", b"written in fork\n").await;
-        let resolved = rig
-            .handle
-            .resolve_session(
-                Arc::clone(&seed.shared),
-                seed.base,
-                "safe-mode session".into(),
-            )
-            .await
-            .expect("resolve_session");
-        let SessionResolveOutcome::Resolved { generation } = resolved else {
-            panic!("expected Resolved, got {resolved:?}");
-        };
-        let diff = rig.handle.diff(seed.base, generation).await.expect("diff");
-        let outcome = rig
-            .handle
-            .apply_session(generation, seed.base, "safe-mode session".into())
-            .await
-            .expect("apply_session");
-        (diff, outcome)
-    });
-
-    // The pre-apply diff already shows the new file, before anything landed.
-    assert!(diffable_base
-        .iter()
-        .any(|change| change.path == Path::new("fork-note.txt")));
-
-    let PromoteOutcome::Promoted { old_tree, .. } = outcome else {
-        panic!("expected Promoted, got {outcome:?}");
-    };
-    assert!(old_tree.is_some(), "a real change must swap the tree");
-    assert_eq!(
-        std::fs::read(rig.repo_path().join("fork-note.txt")).expect("landed file"),
-        b"written in fork\n"
-    );
-    assert_watcher_recovers_after_swap(&rig);
-    rig.finish();
-}
-
-/// Safe Mode: discarding a resolved session (never calling `apply_session`)
-/// must leave the real tree completely untouched.
-#[test]
-fn resolved_session_left_unapplied_leaves_zero_trace() {
-    let rig = Rig::start();
-    rig.runtime.block_on(async {
-        let seed = rig.handle.fork().await.expect("fork");
-        write_in_fork(&seed, "/fork-note.txt", b"written in fork\n").await;
-        let resolved = rig
-            .handle
-            .resolve_session(
-                Arc::clone(&seed.shared),
-                seed.base,
-                "safe-mode session".into(),
-            )
-            .await
-            .expect("resolve_session");
-        assert!(matches!(resolved, SessionResolveOutcome::Resolved { .. }));
-    });
-    assert!(!rig.repo_path().join("fork-note.txt").exists());
     rig.finish();
 }
 
