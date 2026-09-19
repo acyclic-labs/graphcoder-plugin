@@ -209,7 +209,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         mounts,
         handle: handle.clone(),
         index_db: paths.index_db(),
-        store_root: paths.root.clone(),
         repo_root,
         config,
         shutdown: shutdown.clone(),
@@ -222,7 +221,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         spec,
         live_sessions: Arc::new(Mutex::new(HashSet::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
-        store_bytes: Arc::new(Mutex::new(None)),
     };
 
     runtime.block_on(serve_until_done(server, listener, shutdown, handle));
@@ -242,7 +240,6 @@ struct Server {
     mounts: MountCapability,
     handle: PipelineHandle,
     index_db: PathBuf,
-    store_root: PathBuf,
     repo_root: PathBuf,
     config: Config,
     shutdown: Arc<Notify>,
@@ -257,9 +254,6 @@ struct Server {
     live_sessions: Arc<Mutex<HashSet<String>>>,
     /// When the last request arrived; the idle-exit clock.
     last_activity: Arc<Mutex<Instant>>,
-    /// `store size` for `status`, refreshed in the background: walking the
-    /// object directory costs ~1s on an aged store.
-    store_bytes: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 impl Server {
@@ -337,32 +331,6 @@ impl Server {
             && self.forks.lock().await.is_empty()
     }
 
-    /// The store's size on disk, from a cache that a background walk
-    /// refreshes once it is a minute old. Only the very first call walks.
-    async fn store_size(&self) -> u64 {
-        const FRESH: Duration = Duration::from_secs(60);
-        let root = self.store_root.join("store");
-        let cached = *self.store_bytes.lock().await;
-        match cached {
-            Some((at, bytes)) if at.elapsed() < FRESH => bytes,
-            Some((_, bytes)) => {
-                let cache = Arc::clone(&self.store_bytes);
-                tokio::task::spawn_blocking(move || {
-                    let fresh = directory_bytes(&root);
-                    if let Ok(mut slot) = cache.try_lock() {
-                        *slot = Some((Instant::now(), fresh));
-                    }
-                });
-                bytes
-            }
-            None => {
-                let bytes = tokio::task::block_in_place(|| directory_bytes(&root));
-                *self.store_bytes.lock().await = Some((Instant::now(), bytes));
-                bytes
-            }
-        }
-    }
-
     #[allow(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
@@ -381,7 +349,7 @@ impl Server {
                     state: format!("{:?}", status.state).to_lowercase(),
                     last_checkpoint: status.last_checkpoint,
                     unpublished: status.unpublished,
-                    store_bytes: self.store_size().await,
+                    store_bytes: 0,
                     repo_root: self.repo_root.display().to_string(),
                     mount_provider: self.mounts.provider.to_owned(),
                     mount_available: self.mounts.available,
@@ -2018,25 +1986,4 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
 
 fn hex_generation(generation: acyclic::GenerationId) -> String {
     acyclic::generation_hex(generation)
-}
-
-fn directory_bytes(root: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += metadata.len();
-            }
-        }
-    }
-    total
 }
