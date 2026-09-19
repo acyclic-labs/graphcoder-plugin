@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::{
-    materialize_checkout, materialize_checkout_host_path, MaterializeError, MaterializeOptions,
+    materialize_checkout, materialize_checkout_host_path, publish_native_exchange,
+    MaterializeError, MaterializeOptions,
 };
 use acyclic_fs::{CancellationToken, GenerationId, WorkCounters};
 use serde::{Deserialize, Serialize};
@@ -342,28 +343,8 @@ pub struct Journal {
     pub carried: Vec<PathBuf>,
 }
 
-/// Moves each `relative` path from `from` to `into`, replacing whatever the
-/// materialized tree had there (the live copy wins). Stops at the first
-/// failure; the caller unwinds with [`move_back`].
-fn carry(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
-    for path in relative {
-        let source = from.join(path);
-        let destination = into.join(path);
-        if std::fs::symlink_metadata(&source).is_err() {
-            continue;
-        }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let _ = remove_any(&destination);
-        std::fs::rename(&source, &destination).map_err(|error| {
-            EngineError::Restore(format!("carry excluded path {}: {error}", path.display()))
-        })?;
-    }
-    Ok(())
-}
-
-/// Inverse of [`carry`]: every listed path present in `from` goes back.
+/// Returns every listed path present in `from` to `into` during legacy
+/// journal recovery.
 /// A conflict or I/O failure keeps the journal and both trees for retry.
 fn move_back(from: &Path, into: &Path, relative: &[PathBuf]) -> Result<()> {
     for path in relative {
@@ -552,55 +533,27 @@ pub async fn execute(
         EngineError::Restore(format!("materialize: {error:?}"))
     })?;
 
-    // 2. Carry the live excluded paths into the new tree. Journaled first,
-    // so a crash mid-carry can move them back.
+    // 2. Publish the complete sibling tree. The SDK owns durable exclusion
+    // carry and platform exchange recovery; this adapter owns materialization
+    // and the product's retained-tree naming policy.
     let carried: Vec<PathBuf> = exclusions
         .host_paths()
         .into_iter()
         .filter(|relative| std::fs::symlink_metadata(repo.join(relative)).is_ok())
         .collect();
-    if !carried.is_empty() {
-        write_journal(
-            &journal_path,
-            &Journal {
-                target_generation: hex::encode(target.digest().as_bytes()),
-                repo_root: repo.clone(),
-                tmp: tmp.clone(),
-                phase: Phase::Carrying,
-                carried: carried.clone(),
-            },
-        )?;
-        if let Err(error) = carry(repo, &tmp, &carried) {
-            // Undo what moved, then abandon the rewind with the repo whole.
-            move_back(&tmp, repo, &carried)?;
-            let _ = std::fs::remove_dir_all(&tmp);
-            let _ = std::fs::remove_file(&journal_path);
-            return Err(error);
-        }
-    }
-
-    // 3. Atomic exchange: repo <-> tmp. After this the old tree is at `tmp`.
-    write_journal(
-        &journal_path,
-        &Journal {
-            target_generation: hex::encode(target.digest().as_bytes()),
-            repo_root: repo.clone(),
-            tmp: tmp.clone(),
-            phase: Phase::Swapping,
-            carried,
-        },
-    )?;
     let locator = publish_locator(repo, &journal_path)?;
-    if let Err(error) = atomic_exchange(repo, &tmp) {
-        // The third Windows rename can fail after the new tree is already
-        // published. Reconcile immediately, before the daemon accepts another
-        // rewind that could reuse the scratch name.
-        return reconcile_exchange_failure(target, repo, &journal_path, error);
+    let exchange = publish_native_exchange(&journal_path, repo, &tmp, carried)
+        .map_err(|error| EngineError::Restore(format!("publish tree: {error}")))?;
+    if !exchange.published {
+        return Err(EngineError::Restore(
+            "native exchange recovered without publishing the target tree".into(),
+        ));
     }
 
-    // 4. Retain the old tree beside the repository.
-    let old_tree = park_replaced_tree(&tmp, parent, &name)?;
-    finish_published_rewind(&journal_path, &locator);
+    // 3. Retain the old tree beside the repository.
+    let displaced = exchange.displaced.unwrap_or(tmp);
+    let old_tree = park_replaced_tree(&displaced, parent, &name)?;
+    let _ = std::fs::remove_file(locator);
     prune_sibling_trash(repo, trash_ttl_days);
 
     Ok(RewindOutcome {
@@ -608,38 +561,6 @@ pub async fn execute(
         old_tree,
         warning: "reload your editor: open files still point at the replaced tree",
     })
-}
-
-fn finish_published_rewind(journal: &Path, locator: &Path) {
-    // The tree is already published. Cleanup failure leaves the journal and
-    // locator for startup retry, but must not report a failed rewind.
-    if std::fs::remove_file(journal).is_ok() {
-        let _ = std::fs::remove_file(locator);
-    }
-}
-
-fn reconcile_exchange_failure(
-    target: GenerationId,
-    repo: &Path,
-    journal_path: &Path,
-    error: EngineError,
-) -> Result<RewindOutcome> {
-    let recovered = recover(journal_path)?;
-    if let Ok(locator) = locator_path(repo) {
-        let _ = std::fs::remove_file(locator);
-    }
-    if let Some(RecoveredSwap {
-        published: true,
-        old_tree: Some(old_tree),
-    }) = recovered
-    {
-        return Ok(RewindOutcome {
-            restored: target,
-            old_tree,
-            warning: "reload your editor: open files still point at the replaced tree",
-        });
-    }
-    Err(error)
 }
 
 /// Moves the replaced tree out of the way and returns where it landed.
@@ -1435,44 +1356,5 @@ mod tests {
             b"carried live data"
         );
         assert!(parked_tree_contains(&repo, "file.txt", b"new tree"));
-    }
-
-    /// After rename #2 the new tree is published, and the old tree in
-    /// scratch must be parked rather than deleted.
-    #[cfg(windows)]
-    #[test]
-    fn recover_preserves_old_tree_after_second_windows_rename() {
-        let work = tempfile::tempdir().expect("tempdir");
-        let repo = work.path().join("repo");
-        std::fs::create_dir(&repo).expect("repo");
-        std::fs::write(repo.join("file.txt"), b"new tree").expect("seed new");
-        let tmp = work.path().join("repo.tmp");
-        let scratch = swap_scratch(&repo).expect("scratch path");
-        std::fs::create_dir(&scratch).expect("scratch");
-        std::fs::write(scratch.join("file.txt"), b"old tree").expect("seed old");
-        let journal_path = work.path().join("journal.json");
-        write(&journal_path, &journal(&repo, &tmp, Phase::Swapping));
-
-        let generation = GenerationId::new(acyclic_fs::Digest::ZERO);
-        let outcome = reconcile_exchange_failure(
-            generation,
-            &repo,
-            &journal_path,
-            EngineError::Restore("injected third rename failure".into()),
-        )
-        .expect("published rewind is a success");
-        assert_eq!(outcome.restored, generation);
-        assert_eq!(
-            std::fs::read(outcome.old_tree.join("file.txt")).expect("old tree"),
-            b"old tree"
-        );
-
-        assert_eq!(
-            std::fs::read(repo.join("file.txt")).expect("repo whole"),
-            b"new tree"
-        );
-        assert!(!scratch.exists(), "scratch must not outlive recovery");
-        assert!(!journal_path.exists());
-        assert!(parked_tree_contains(&repo, "file.txt", b"old tree"));
     }
 }
