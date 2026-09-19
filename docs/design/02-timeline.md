@@ -35,7 +35,7 @@ Same engine, adds the time dimension. Fast-follow; bundles into Launch 1 if it l
 
 ## Status (2026-09-06): shipped
 
-Implemented in `acyclic-engine` (index), the daemon, the CLI, and the Claude
+Implemented in `acyclic` (index), the daemon, the CLI, and the Claude
 Code adapter; `tests/acceptance/timeline.sh` covers all four acceptance
 criteria and runs in `run-all.sh`.
 

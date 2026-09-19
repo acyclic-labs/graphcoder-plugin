@@ -18,6 +18,9 @@ BUDGET_MS="${ACYCLIC_LAT_BUDGET_MS:-100}"
 setup_repo
 "$QUAL" corpus "$R" "$FILES" "$CORPUS_MB" >/dev/null || fail "corpus generation"
 acy init >/dev/null || fail "init (includes baseline of the corpus)"
+if [ "${ACYCLIC_TRACE:-}" = 1 ]; then
+  grep 'baseline phases:' "$STORES"/*/daemon.log | tail -1 || true
+fi
 
 # Warm-up round, then timed samples. Each round touches a file so the
 # checkpoint has real work queued behind the ack.

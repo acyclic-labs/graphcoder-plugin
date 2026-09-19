@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // Only the Unix sweep names the product; on Windows there is no sweep.
-#[cfg(unix)]
-use acyclic_engine::product::NAME;
-use acyclic_engine::spec::RunOutcome;
+#[cfg(all(unix, test))]
+use acyclic::product::NAME;
+use acyclic::spec::RunOutcome;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -67,7 +67,7 @@ impl RunSpace {
     }
 
     fn record(&self, pgid: i32, argv0: &str) {
-        let line = format!("{pgid} {} {argv0}\n", acyclic_engine::unix_now());
+        let line = format!("{pgid} {} {argv0}\n", acyclic::unix_now());
         let _ = std::fs::write(&self.pid_file, line);
     }
 
@@ -351,18 +351,18 @@ impl Drop for OwnedJob {
     }
 }
 
-/// Kills anything a dead daemon left running, before the store opens.
+/// Kills anything a dead daemon left running when speculation is enabled.
 ///
 /// Matched on the recorded command name as well as the pid, so a reused pid
 /// belonging to something else is never signalled — the check costs one
 /// `ps` and removes the whole class of mistake.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[allow(
     unsafe_code,
     reason = "kill(pid, 0) only tests for the process's existence; the \
               killpg that follows is guarded by a command-name match"
 )]
-pub fn sweep_stale_runs(spec_runs: &Path) {
+fn sweep_stale_runs(spec_runs: &Path) {
     let pids = spec_runs.join("pids");
     let Ok(entries) = std::fs::read_dir(&pids) else {
         return;
@@ -401,12 +401,9 @@ pub fn sweep_stale_runs(spec_runs: &Path) {
 /// Windows needs no sweep: each run's job object carries
 /// `KILL_ON_JOB_CLOSE` and the daemon holds its only handle, so a daemon
 /// that dies — however it dies — takes the run's whole tree with it.
-#[cfg(not(unix))]
-pub fn sweep_stale_runs(_spec_runs: &Path) {}
-
 /// Whether the live process really is the run we recorded, rather than
 /// whatever inherited its pid.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn command_name_matches(pid: i32, expected: &str) -> bool {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
@@ -593,6 +590,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn sweeping_an_absent_directory_is_a_no_op() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -2,8 +2,7 @@
 
 **Status: verified on real Windows hardware.** Checks 1–8 below were run on
 Windows 11 (26200) with the MSVC toolchain, against a release build of this
-branch. Two capabilities are deliberately *not* offered on Windows — mounted
-forks and Safe Mode — for a reason recorded under [Known
+branch. Mounted forks have platform-specific limits recorded under [Known
 limits](#known-limits); everything else behaves as it does on POSIX.
 
 `tests/acceptance/windows-smoke.sh` is the executable form of checks 3–7,
@@ -16,14 +15,14 @@ lint job cannot see.
 | Area | Change |
 | --- | --- |
 | `crates/acyclic/src/ipc.rs` | New. The transport split: Unix domain socket vs. Windows named pipe, with an owner-only pipe DACL. |
-| `crates/acyclic-engine/src/names.rs` | New. The one definition of how a host name becomes engine bytes. |
+| `crates/acyclic/src/names.rs` | New. The one definition of how a host name becomes engine bytes. |
 | `crates/acyclic/src/client.rs` | `ipc::ClientStream`; daemon spawn no longer leaks stdio handles or stands in the repo. |
 | `crates/acyclic/src/server.rs` | `ipc::Listener`/`ipc::ServerStream`; fork route names carry the host encoding. |
-| `crates/acyclic-engine/src/store.rs` | Volume profile and component byte budget come from `names`. |
-| `crates/acyclic-engine/src/rewind.rs` | Windows directory exchange; journal write fixed; staging is retry-safe. |
-| `crates/acyclic-engine/src/guard.rs` | Guarded prefixes and `AppleDouble` matching in the host encoding. |
-| `crates/acyclic-engine/src/{diff,exclude}.rs` | Name decoding via `names` instead of per-file UTF-8 fallbacks. |
-| `crates/acyclic-engine/src/fork.rs` | Windows is held to copy forks (see below). |
+| `crates/acyclic/src/store.rs` | Volume profile and component byte budget come from `names`. |
+| `crates/acyclic/src/rewind.rs` | Windows directory exchange; journal write fixed; staging is retry-safe. |
+| `crates/acyclic/src/guard.rs` | Guarded prefixes and `AppleDouble` matching in the host encoding. |
+| `crates/acyclic/src/{diff,exclude}.rs` | Name decoding via `names` instead of per-file UTF-8 fallbacks. |
+| `crates/acyclic/src/fork.rs` | Windows forks require Projected File System. |
 | `crates/acyclic/src/main.rs` | The client steps out of the tree before asking for a whole-tree swap. |
 | `.github/workflows/{ci,release}.yml` | A `windows` CI job; `win32/x64` release matrix entry. |
 | `packaging/npm/*.sh`, `deny.toml` | `win32` platform package; MSVC target in the license set. |
@@ -52,9 +51,9 @@ That is one decision, not two, and it reaches further than capture. The
 `ProjFS` provider decodes every entry name it is handed as UTF-16LE, so a
 name that arrives in any other encoding is *projected as mojibake rather
 than rejected* — fork route ids passed as raw ASCII came back as six garbage
-characters. The Safe Mode guard has the sharper version of the same problem:
-it compares configured prefixes byte-for-byte against mount path components,
-and a guard that never matches **fails open**. `crates/acyclic-engine/src/names.rs`
+characters. Guarded fork paths have the sharper version of the same problem:
+they compare configured prefixes byte-for-byte against mount path components,
+and a guard that never matches **fails open**. `crates/acyclic/src/names.rs`
 exists so there is exactly one place this can be got wrong.
 
 Because the profile is fixed for the life of a volume, a store created on
@@ -169,16 +168,14 @@ correct.
 
 ## Known limits
 
-- **Forks are always copies, and Safe Mode is off.** `ProjFS` mounts and
+- **Forks require a writable native mount.** `ProjFS` mounts and
   projects a fork correctly — the tree appears and reads back fine — but
   writes into the projection stop at the `ProjFS` local cache and never reach
   the overlay checkout. A mounted fork therefore looked like it worked while
   `fork-diff` reported no changes and `promote` landed nothing: it silently
-  ate the work. `mount_capability()` now reports mounts unavailable on
-  Windows, so forks take the copy path, which is verified end to end (write,
-  `fork-diff`, `promote` all behave). Safe Mode needs a real mount and is
-  unavailable for the same reason. Revisit if the sdk's `ProjFS` provider
-  gains write-back.
+  ate the work. `mount_capability()` reports mounts unavailable on Windows
+  until the SDK's `ProjFS` provider gains write-back, and fork creation fails
+  explicitly instead of materializing a full-tree compatibility copy.
 
 - **The tree exchange is not atomic.** `RENAME_EXCHANGE` has no Windows
   equivalent, so `atomic_exchange` does three renames through a scratch
@@ -189,11 +186,10 @@ correct.
   crash mid-swap is recovered rather than impossible, which is weaker than
   the APFS/`renameat2` guarantee.
 
-- **No read/write deadlines.** `ClientStream::set_read_timeout` and
-  `set_write_timeout` are no-ops on Windows: a pipe opened as a `File`
-  carries no per-handle timeout. The pre-tool hook's deadline therefore does
-  not bound anything there. Closing this needs overlapped I/O or a watchdog
-  thread. **The latency gate's guarantee does not hold on Windows.**
+- **Client call deadlines.** Windows named-pipe clients use Tokio's IOCP
+  transport. The call timeout covers the whole request and response, including
+  partial writes and replies. A timed-out client must reconnect before another
+  call so a late daemon response cannot be paired with the wrong request.
 
 - **A speculative run's timeout kills without a grace period, and a
   descendant can escape the job.** `spec_runner` puts each run in a job

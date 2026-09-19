@@ -6,7 +6,7 @@
 //! the endpoint naming, the "already running" check, and teardown differ.
 //!
 //! Callers name the endpoint with the socket path from
-//! [`acyclic_engine::store::Paths::socket`] on every platform. On Windows
+//! [`acyclic::store::Paths::socket`] on every platform. On Windows
 //! that path is never created on disk — it only supplies the stable,
 //! per-store name the pipe is built from.
 
@@ -58,7 +58,7 @@ fn pipe_name(socket: &Path) -> String {
             }
         })
         .collect();
-    format!(r"\\.\pipe\{}-{key}", acyclic_engine::product::NAME)
+    format!(r"\\.\pipe\{}-{key}", acyclic::product::NAME)
 }
 
 // ---------------------------------------------------------------- client
@@ -68,7 +68,13 @@ pub struct ClientStream {
     #[cfg(unix)]
     inner: std::os::unix::net::UnixStream,
     #[cfg(windows)]
-    inner: std::fs::File,
+    inner: tokio::net::windows::named_pipe::NamedPipeClient,
+    #[cfg(windows)]
+    runtime: tokio::runtime::Runtime,
+    #[cfg(windows)]
+    read_timeout: std::cell::Cell<Option<std::time::Duration>>,
+    #[cfg(windows)]
+    write_timeout: std::cell::Cell<Option<std::time::Duration>>,
 }
 
 impl ClientStream {
@@ -83,19 +89,31 @@ impl ClientStream {
         }
         #[cfg(windows)]
         {
+            use tokio::net::windows::named_pipe::ClientOptions;
             // A named pipe is opened like a file. Every server instance being
             // momentarily busy is normal under concurrent hooks, so a short
             // bounded retry stands in for WaitNamedPipe.
             const BUSY: i32 = 231; // ERROR_PIPE_BUSY
             let name = pipe_name(socket);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()?;
             let mut last = None;
             for _ in 0..20 {
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&name)
-                {
-                    Ok(file) => return Ok(Self { inner: file }),
+                let opened = {
+                    let _entered = runtime.enter();
+                    ClientOptions::new().open(&name)
+                };
+                match opened {
+                    Ok(inner) => {
+                        return Ok(Self {
+                            inner,
+                            runtime,
+                            read_timeout: std::cell::Cell::new(None),
+                            write_timeout: std::cell::Cell::new(None),
+                        });
+                    }
                     Err(error) => {
                         if error.raw_os_error() != Some(BUSY) {
                             return Err(error);
@@ -109,9 +127,7 @@ impl ClientStream {
         }
     }
 
-    /// Bounds a single read. Windows named pipes opened as files carry no
-    /// per-handle timeout, so this is a no-op there — see the deadline note
-    /// in `docs/windows-verification.md`.
+    /// Bounds a single read, including Windows overlapped named-pipe reads.
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -119,12 +135,12 @@ impl ClientStream {
         }
         #[cfg(windows)]
         {
-            let _ = timeout;
+            self.read_timeout.set(timeout);
             Ok(())
         }
     }
 
-    /// Bounds a single write. No-op on Windows, as for reads.
+    /// Bounds a single write, including Windows overlapped named-pipe writes.
     pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -132,7 +148,7 @@ impl ClientStream {
         }
         #[cfg(windows)]
         {
-            let _ = timeout;
+            self.write_timeout.set(timeout);
             Ok(())
         }
     }
@@ -140,16 +156,97 @@ impl ClientStream {
 
 impl io::Read for ClientStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+        #[cfg(unix)]
+        {
+            self.inner.read(buf)
+        }
+        #[cfg(windows)]
+        {
+            use tokio::io::AsyncReadExt as _;
+            match self.read_timeout.get() {
+                Some(timeout) => self
+                    .runtime
+                    .block_on(async { tokio::time::timeout(timeout, self.inner.read(buf)).await })
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "named-pipe read timed out")
+                    })?,
+                None => self.runtime.block_on(async { self.inner.read(buf).await }),
+            }
+        }
     }
 }
 
 impl io::Write for ClientStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        #[cfg(unix)]
+        {
+            self.inner.write(buf)
+        }
+        #[cfg(windows)]
+        {
+            use tokio::io::AsyncWriteExt as _;
+            match self.write_timeout.get() {
+                Some(timeout) => self
+                    .runtime
+                    .block_on(async { tokio::time::timeout(timeout, self.inner.write(buf)).await })
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "named-pipe write timed out")
+                    })?,
+                None => self.runtime.block_on(async { self.inner.write(buf).await }),
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        #[cfg(unix)]
+        {
+            self.inner.flush()
+        }
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod deadline_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn named_pipe_read_deadline_is_enforced() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let socket = std::path::PathBuf::from(format!("deadline-{}-{nonce}", std::process::id()));
+        let name = pipe_name(&socket);
+        let (ready, connected) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let pipe = create_pipe_instance(&name, true).expect("pipe");
+                ready.send(()).expect("ready");
+                pipe.connect().await.expect("connect");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+        });
+        connected.recv().expect("server ready");
+        let mut client = ClientStream::connect(&socket).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .expect("deadline");
+        let started = Instant::now();
+        let error = client
+            .read(&mut [0_u8; 1])
+            .expect_err("read should time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(180));
+        server.join().expect("server exit");
     }
 }
 

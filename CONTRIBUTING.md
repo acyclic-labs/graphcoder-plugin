@@ -13,7 +13,7 @@ Acceptance suites (end-to-end, run against a real repo) live in `tests/acceptanc
 tests/acceptance/run-all.sh
 ```
 
-Individual suites (`journey.sh`, `timeline.sh`, `forks.sh`, `merge.sh`, `safe-mode.sh`, etc.) can
+Individual suites (`journey.sh`, `timeline.sh`, `forks.sh`, `merge.sh`, etc.) can
 be run with `bash tests/acceptance/<suite>.sh` if you're iterating on one feature.
 
 The `*-e2e.sh` suites drive the real host CLIs (Claude Code, Codex, cursor-agent, OpenCode) and
@@ -76,7 +76,7 @@ guards what those can't express. The rules, and why each exists:
 - **No lossy `as` casts** between integer widths or signs (`cast_possible_truncation`,
   `cast_sign_loss`, `cast_possible_wrap`, `cast_precision_loss`, `cast_lossless`). Use
   `u64::from`, `i64::try_from(x).unwrap_or(i64::MAX)`, or an `allow` that says why the value
-  is in range. `acyclic_engine::unix_now()` and `short_hex()` exist so the two most common
+  is in range. `acyclic::unix_now()` and `short_hex()` exist so the two most common
   cases are written once.
 - **Closed sets are enums, not strings.** Anything the CLI parses or the wire carries with a
   fixed vocabulary — checkpoint kinds, hook events, host names, restore actions, diff change
@@ -100,13 +100,13 @@ guards what those can't express. The rules, and why each exists:
 The public product name is defined once, in `product.toml`, and threaded through everywhere else:
 `product::NAME` in Rust, `scripts/product.sh` in shell. Never hardcode the name as a literal
 string or path in source — `scripts/check-product-name.sh` fails CI if it drifts. Crate names
-(`acyclic`, `acyclic-engine`, `acyclic-proto`, `acyclic-qual`) are internal identifiers and are
+(`acyclic`, `acyclic-qual`) are internal identifiers and are
 exempt from this check.
 
 ## Design context
 
 `docs/design/` has the design docs and implementation notes behind the bigger features (Rewind,
-Timeline, Forks, Safe Mode). Worth a skim before working on any of them — they capture the
+Timeline, Forks). Worth a skim before working on any of them — they capture the
 tradeoffs and constraints that shaped the current architecture, including a few (like snapshot
 GC) that are intentionally deferred.
 

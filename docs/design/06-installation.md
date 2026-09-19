@@ -206,7 +206,7 @@ The two adapter shapes above — lifecycle hooks, and JSON-based MCP registratio
 
 ## Configuration
 
-- Per-repo: `.acyclic/config.toml` — checked in, so teams share policy: checkpoint granularity, guarded paths, dry-run default, store size caps, retention TTLs.
+- Per-repo: `.acyclic/config.toml` — checked in, so teams share policy: checkpoint granularity, guarded paths, store size caps, retention TTLs.
 - Per-machine: `~/.config/acyclic/` — defaults.
 - Zero config is a supported state — defaults are safe everywhere.
 
@@ -348,4 +348,4 @@ of them, so they come first.
 
 ## Design commitment
 
-This resolves the mechanism question in favor of **CLI-as-core with host adapters** (not MCP-as-core, not per-host deep builds). That choice is what makes OpenCode and future hosts nearly free. MCP wraps the CLI where a host has no other extension point — Claude Desktop's `acyclic mcp` adapter is exactly that: every MCP tool is a thin translation into the same `acyclic-proto::Op` the CLI and hooks already send the daemon, no engine logic lives in the MCP layer itself. See the Claude Desktop row above for why it's marked experimental rather than promoted to a supported host yet.
+This resolves the mechanism question in favor of **CLI-as-core with host adapters** (not MCP-as-core, not per-host deep builds). That choice is what makes OpenCode and future hosts nearly free. MCP wraps the CLI where a host has no other extension point — Claude Desktop's `acyclic mcp` adapter is exactly that: every MCP tool is a thin translation into the same private `proto::Op` the CLI and hooks already send the daemon, no engine logic lives in the MCP layer itself. See the Claude Desktop row above for why it's marked experimental rather than promoted to a supported host yet.

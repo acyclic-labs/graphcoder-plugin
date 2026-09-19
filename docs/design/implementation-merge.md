@@ -32,8 +32,7 @@ plan.
 
 **Out (later launches, listed so nobody re-litigates them mid-build):**
 rename detection; semantic or AST merges; markers written into the
-*mainline*; Safe Mode `apply_session` onto a moved mainline (keeps the
-unmoved-mainline rule); merging directory-ancestry overlaps; live rebase
+*mainline*; merging directory-ancestry overlaps; live rebase
 of a fork while the mainline moves.
 
 ## Definitions
@@ -132,10 +131,8 @@ When at least one file is `Conflicted` and nothing is refused:
 
 1. Build **R** = M with the conflicted files replaced by their
    marker-bearing content. R is F rebased onto H.
-2. Write R's differences from F into the fork: for a mount fork, through
-   the fork's `SharedLocalCheckout` (the mount serves it live); for a
-   copy fork, into the copy directory as well. `capture_copy` already
-   handles copy → overlay at promote.
+2. Write R's differences from F through the mounted workspace so the mount
+   and kernel caches observe every change.
 3. Set `fork.base = H`. Record R as `fork <id> rebased onto <H-hex>
    (N conflict(s))`.
 4. Record the open conflict on the fork: `{ base: B, ours: F, theirs: H,
@@ -168,12 +165,12 @@ consistency: the fork survives every non-landing outcome.
 ## Where the code goes
 
 ```
-crates/acyclic-engine/src/merge.rs        NEW — entry table, merge3 port, marker scan
-crates/acyclic-engine/src/pipeline.rs     BuildGeneration { from, entries } request
-crates/acyclic-engine/src/fork.rs         ForkSeed.base becomes mutable; OpenConflict
-crates/acyclic-engine/src/config.rs       [merge] max_file_bytes
+crates/acyclic/src/merge.rs        NEW — entry table, merge3 port, marker scan
+crates/acyclic/src/pipeline.rs     BuildGeneration { from, entries } request
+crates/acyclic/src/fork.rs         ForkSeed.base becomes mutable; OpenConflict
+crates/acyclic/src/config.rs       [merge] max_file_bytes
 crates/acyclic/src/server.rs              replay_onto_head → merge_onto_head; rebase path
-crates/acyclic-proto/src/lib.rs           PromoteInfo.merged_files; ForkInfo.conflict
+crates/acyclic/src/lib.rs           PromoteInfo.merged_files; ForkInfo.conflict
 crates/acyclic/src/main.rs                promote / forks output
 crates/acyclic/src/install.rs             skill: PARTITION + conflict resolution
 tests/acceptance/merge.sh                 G4/G5-adjacent flips; G13–G26 added
@@ -206,7 +203,7 @@ before anything is written.
 One pipeline request `BuildGeneration { from: GenerationId, entries }`:
 scratch checkout at `from` (`scratch_checkout` exists), write each entry
 through the SDK checkout API the fork tests already use, `checkpoint()`
-it unpublished (as `resolve_session` does), `record_generation` it.
+it unpublished, then `record_generation` it.
 M = `BuildGeneration(H, merged ∪ taken)`; R = `BuildGeneration(M,
 conflicted)`. No head movement, no tree writes.
 
@@ -263,7 +260,7 @@ conflict state, proto fields, CLI lines, marker-scan on re-promote.
 Skill text update.
 
 **C3 — acceptance.** `merge.sh` changes below, run in mount mode on macOS
-and copy mode on Linux, plus `forks.sh`, `safe-mode.sh`, and the journey
+and copy mode on Linux, plus `forks.sh` and the journey
 suites unchanged. Update `spec-forks.md`'s out-of-scope line, its stale
 M4/M5 rows, and the c905be4 "discard" wording in the same commit.
 
@@ -310,10 +307,9 @@ Acceptance (`merge.sh`, each from a fresh fork set):
 
 ## Risks and open questions
 
-- **Writing into a live mount fork.** R−F goes through the fork's shared
-  checkout while the agent may hold the mount open. Serialize under the
-  checkout lock like `capture_copy` does; document that an editor with
-  the file open sees the markers on next read.
+- **Writing into a live mount fork.** R−F goes through the mounted path while
+  the agent may hold it open. The driver serializes the resulting overlay
+  mutations; an editor with the file open sees markers on its next read.
 - **Fork base mutation.** `ForkSeed.base` is immutable today and the
   daemon's fork table copies it. Both must update atomically with the
   rebase record; a daemon restart already loses forks, so no persistence
@@ -377,13 +373,10 @@ Deliberate divergences:
   drain), recorded as the single landed row. The `before promote …`
   row records the published head without another drain. R is built
   from M with the marker files on top. A rebase writes R − F into the
-  fork: through the shared checkout for a mount fork (route detached
-  during promote, re-attached after), via `restore_path_into` for a copy
-  fork.
-- **Rebased forks land by checkpoint-and-swap.** A rebased mount fork's
-  checkout still sits on the head it was cut from, so an optimistic
-  commit against the new head would conflict. `ForkState.rebased` routes
-  such forks through the same resolve/apply pair copy forks use.
+  fork through its mounted path so driver and kernel caches remain coherent.
+- **Rebased forks land through snapshot/apply.** A rebased fork's checkout
+  still sits on the head it was cut from, so an optimistic commit against the
+  new head would conflict.
 - **Subtree copy and removal are iterative.** The fs facade's futures
   are large enough that three nested levels overflowed the pipeline
   thread's 2 MiB stack in a debug build. Both walks use an explicit work
@@ -391,8 +384,6 @@ Deliberate divergences:
 - **`rewind --last` is not the undo.** It targets the latest real
   checkpoint, which after a merge is the landed row. The undo is the
   `before promote <id> (merge)` safety row, exactly as for a replay.
-- **`ACYCLIC_FORCE_COPY_FORKS`** makes a mount-capable host use copy
-  forks so `merge.sh` runs both modes on one machine.
 - **Wire.** `PromoteInfo` gained `merged_files`, `conflicts`, and
   `fork_path`; `ForkEntry` gained `conflict_paths` and `conflict`
   (base/ours/theirs). A conflicting promote returns a non-zero exit
@@ -419,9 +410,8 @@ Deliberate divergences:
   unmoved mainline used to land by whole-tree swap, which replaced the
   repo directory and needed the skill's `cd "$PWD"` step. Promote now
   always goes through the merge path: with an unmoved head the plan is
-  "take every fork path" and they are written in place. Safe Mode's
-  `session-apply` is the only remaining swap. `merge.sh` G11 asserts
-  the repo inode survives a promote.
+  "take every fork path" and they are written in place. `merge.sh` G11
+  asserts the repo inode survives a promote.
 - **Diff output marks gitignored paths** with a `(gitignored)` suffix
   and a `(K gitignored)` count so the skill's smallest-diff rule can
   ignore cache and build noise; the paths stay listed because rewind
@@ -435,8 +425,8 @@ Deliberate divergences:
   `invalidate` returned Ok, and the FUSE transport (Linux, FUSE-T on the
   macOS runner) has no invalidation at all. The daemon now writes the
   rebase into `<mount root>/<id>/…` with plain filesystem operations
-  (`merge::materialize_paths`), the same way copy forks get theirs, so
-  every cache saw the operation. Promote also no longer detaches the
+  (`merge::materialize_paths`), so every cache saw the operation. Promote
+  also no longer detaches the
   route before working; it snapshots under the checkout lock and drops
   the route only after the fork lands, which removed the negative-entry
   window that hid re-attached forks on Linux.
@@ -451,14 +441,11 @@ Deliberate divergences:
   prints the wait-path p95 as information.
 - **Path tracing.** `ACYCLIC_TRACE=1` makes the CLI, hook, daemon, and
   pipeline log every branch taken and its cost (client connect/spawn,
-  op dispatch and reply, WAIT vs ENQUEUE checkpoint, shadowed noop,
+  op dispatch and reply, WAIT vs ENQUEUE checkpoint,
   recovery baseline, watcher drain polls/batches/stop reason, snapshot,
   index, publish, promote mode and outcome, merge plan counts, root
   hints). Daemon lines land in the store's `daemon.log`.
-- **Safe Mode S9 race.** After an empty session resolve unmounted the
-  shadow and installed a fresh watcher, a late mount-teardown event for
-  the repo root itself reached the next drain, and the engine refused a
-  mutation targeting the volume root. Root-targeted hints are now
+- **Root-targeted watcher hints.** Root-targeted hints are now
   stripped before capture: metadata-only ones dropped, structural ones
   (root created/removed/renamed, i.e. a mount came or went) trigger a
   fresh watcher and a recovery baseline instead of a failed request.

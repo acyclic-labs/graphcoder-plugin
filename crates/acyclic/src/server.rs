@@ -6,24 +6,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ipc;
-use acyclic_engine::config::Config;
-use acyclic_engine::fork::{
-    self, ForkMode, MountCapability, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout,
-};
-use acyclic_engine::guard::GuardedMountFilesystem;
-use acyclic_engine::index::{Attribution, CheckpointKind, CheckpointRow, Index};
-use acyclic_engine::merge::{self, Entry};
-use acyclic_engine::pipeline::{self, PipelineHandle};
-use acyclic_engine::product::NAME;
-use acyclic_engine::spec::SpeculateConfig;
-use acyclic_engine::store::{Store, StorePaths};
-use acyclic_engine::{rewind, EngineError};
+use crate::proto;
+use acyclic::config::Config;
+use acyclic::fork::{self, MountCapability, SharedLocalCheckout};
+use acyclic::guard::GuardedMountFilesystem;
+use acyclic::index::{Attribution, CheckpointKind, CheckpointRow, Index};
+use acyclic::merge::{self, Entry};
+use acyclic::pipeline::{self, PipelineHandle};
+use acyclic::product::NAME;
+use acyclic::spec::SpeculateConfig;
+use acyclic::store::{Store, StorePaths};
+use acyclic::{rewind, EngineError};
 use acyclic_fs::model::VolumeConfig;
 use acyclic_fs::{
-    mount_native, mount_native_over_existing, CheckoutMountSource, MountFilesystem,
-    NativeMountRequest, NativeMountSession, RoutedMountSource,
+    mount_native, CheckoutMountSource, MountFilesystem, NativeMountRequest, NativeMountSession,
+    RoutedMountSource,
 };
-use acyclic_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify};
 
@@ -36,11 +34,8 @@ struct ForkState {
     /// The generation promote is judged against. Starts at the fork's cut
     /// point; a conflicting promote rebases the fork and moves it to the
     /// head it was rebased onto.
-    base: acyclic_engine::GenerationId,
+    base: acyclic::GenerationId,
     entry: proto::ForkEntry,
-    /// Copy-mode forks only: the materialized directory the user works in.
-    /// Captured back into `shared` at promote, removed at drop/promote.
-    copy_dir: Option<PathBuf>,
     /// Set by a conflicting promote until the markers are gone.
     conflict: Option<OpenConflict>,
 }
@@ -50,27 +45,6 @@ struct ForkState {
 #[derive(Clone, Debug)]
 struct OpenConflict {
     paths: Vec<PathBuf>,
-}
-
-/// One Safe Mode session: its fork and the shadow mount that projects it
-/// directly at the real repo root for the session's duration. Only one can
-/// be active at a time -- shadowing is a whole-path substitution, so two
-/// sessions can't both shadow the same repo root concurrently.
-struct DrySession {
-    fork_id: String,
-    session_id: String,
-    shared: Arc<SharedLocalCheckout>,
-    base: acyclic_engine::GenerationId,
-    mount: NativeMountSession,
-}
-
-/// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`. Its
-/// overlay is already committed to the store under `generation`; nothing
-/// has touched the real tree yet.
-struct PendingSession {
-    generation: acyclic_engine::GenerationId,
-    base: acyclic_engine::GenerationId,
-    label: String,
 }
 
 /// The one native session projecting every fork through the router.
@@ -169,42 +143,33 @@ fn spawn_speculation(
 }
 
 pub fn run(repo_root: &Path) -> Result<(), String> {
-    // FIRST, before anything reads through `repo_root`: a Safe Mode shadow
-    // mount from a crashed daemon leaves the repo root a dead NFS mountpoint
-    // that wedges every stat/open under it (Config::load, canonicalize, ...).
-    // The force-unmount acts on the mountpoint path itself without touching
-    // the dead server, so the real tree reappears before we read the config.
     let startup = std::time::Instant::now();
     let mut phase = std::time::Instant::now();
     let mut lap = |name: &str| {
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "startup: {name} {:.1}ms (t+{:.1}ms)",
-            acyclic_engine::trace::ms(phase),
-            acyclic_engine::trace::ms(startup)
+            acyclic::trace::ms(phase),
+            acyclic::trace::ms(startup)
         );
         phase = std::time::Instant::now();
     };
-    fork::sweep_stale_dry_session(repo_root);
-    lap("sweep stale dry-run session");
-
-    let config = Config::load(repo_root).map_err(|error| error.to_string())?;
+    let (repo_root, early_recovered) =
+        rewind::recover_before_repo_open(repo_root).map_err(|error| error.to_string())?;
+    lap("rewind recovery before repo open");
+    let config = Config::load(&repo_root).map_err(|error| error.to_string())?;
     lap("config load");
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-    let paths = StorePaths::for_repo(repo_root, stores_root.as_deref())
+    let paths = StorePaths::for_repo(&repo_root, stores_root.as_deref())
         .map_err(|error| error.to_string())?;
 
-    // Finish or unwind any rewind that a crash interrupted BEFORE the store
-    // opens and the pipeline baselines; sweep fork dirs a dead daemon left
-    // mounted (fork sessions do not survive the daemon).
-    rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?;
+    // Finish or unwind any rewind that a crash interrupted before serving
+    // stateful operations. Fork cleanup is delayed until forks are requested.
+    let recovered = match early_recovered {
+        Some(recovered) => Some(recovered),
+        None => rewind::recover(&paths.rewind_journal()).map_err(|error| error.to_string())?,
+    };
     lap("rewind journal recovery");
-    fork::sweep_stale_forks(repo_root);
-    lap("sweep stale forks");
-    // Same reason as the fork sweep, and the same moment: a model run a
-    // crashed daemon left behind is still running, and still billing.
-    crate::spec_runner::sweep_stale_runs(&paths.spec_runs());
-    lap("sweep stale spec runs");
 
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     // Socket + pidfile FIRST, before the store opens: a client can then
@@ -214,27 +179,28 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
     // is removed; a live one refuses the second daemon via bind failure.
     let listener = bind_socket(&runtime, &paths)?;
     lap("socket bind + pidfile");
-    let store = runtime
-        .block_on(Store::open(paths.clone()))
+    let mut store = runtime
+        .block_on(Store::open(&repo_root, paths.clone()))
         .map_err(|error| error.to_string())?;
+    if let Some(recovered) = recovered {
+        runtime
+            .block_on(rewind::recover_workspace(&mut store, recovered))
+            .map_err(|error| error.to_string())?;
+        rewind::finish_recovery(&repo_root).map_err(|error| error.to_string())?;
+    }
     let repo_root = store.repo_root.clone();
     lap("store open");
     let index = Index::open(&paths.index_db()).map_err(|error| error.to_string())?;
     lap("index open");
     let (handle, pipeline_thread) = pipeline::spawn(store, index, config.clone());
-    lap("pipeline thread spawn (baseline runs on it)");
+    lap("pipeline metadata thread spawn");
 
     let shutdown = Arc::new(Notify::new());
-    let mut mounts = fork::mount_capability();
+    let mounts = fork::mount_capability();
     lap("native mount probe");
-    // Test hook: exercise the copy-fork paths on a host that has mounts.
-    if std::env::var_os("ACYCLIC_FORCE_COPY_FORKS").is_some() {
-        mounts.available = false;
-        mounts.reason = Some("ACYCLIC_FORCE_COPY_FORKS is set".into());
-    }
     if !mounts.available {
         eprintln!(
-            "{NAME} daemon: mounts unavailable ({}): forks fall back to copies, Safe Mode is off",
+            "{NAME} daemon: mounts unavailable ({}): forks are disabled",
             mounts.reason.as_deref().unwrap_or("unknown reason")
         );
     }
@@ -247,7 +213,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         mounts,
         handle: handle.clone(),
         index_db: paths.index_db(),
-        store_root: paths.root.clone(),
         repo_root,
         config,
         shutdown: shutdown.clone(),
@@ -256,12 +221,10 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
             router: Arc::new(RoutedMountSource::new()),
             session: None,
         })),
-        dry_session: Arc::new(Mutex::new(None)),
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        fork_cleanup_pending: Arc::new(Mutex::new(true)),
         spec,
         live_sessions: Arc::new(Mutex::new(HashSet::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
-        store_bytes: Arc::new(Mutex::new(None)),
     };
 
     runtime.block_on(serve_until_done(server, listener, shutdown, handle));
@@ -277,20 +240,16 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 
 #[derive(Clone)]
 struct Server {
-    /// Probed once at start: decides fork mode and gates Safe Mode.
+    /// Probed once at start to decide whether forks mount or materialize.
     mounts: MountCapability,
     handle: PipelineHandle,
     index_db: PathBuf,
-    store_root: PathBuf,
     repo_root: PathBuf,
     config: Config,
     shutdown: Arc<Notify>,
     forks: Arc<Mutex<HashMap<String, ForkState>>>,
     fork_mount: Arc<Mutex<ForkMount>>,
-    /// The one active Safe Mode session shadow-mounted at `repo_root`, if any.
-    dry_session: Arc<Mutex<Option<DrySession>>>,
-    /// Sessions that resolved (committed) but haven't been applied/discarded.
-    pending: Arc<Mutex<HashMap<String, PendingSession>>>,
+    fork_cleanup_pending: Arc<Mutex<bool>>,
     /// The speculation scheduler, when it is enabled. `None` makes every
     /// call site a no-op, so the default path costs nothing.
     spec: Option<Arc<crate::speculate::SpecHandle>>,
@@ -299,12 +258,20 @@ struct Server {
     live_sessions: Arc<Mutex<HashSet<String>>>,
     /// When the last request arrived; the idle-exit clock.
     last_activity: Arc<Mutex<Instant>>,
-    /// `store size` for `status`, refreshed in the background: walking the
-    /// object directory costs ~1s on an aged store.
-    store_bytes: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 impl Server {
+    async fn ensure_fork_workspace_clean(&self) -> Result<(), String> {
+        let mut pending = self.fork_cleanup_pending.lock().await;
+        if !*pending {
+            return Ok(());
+        }
+        let repo_root = self.repo_root.clone();
+        tokio::task::block_in_place(|| fork::sweep_stale_forks(&repo_root))?;
+        *pending = false;
+        Ok(())
+    }
+
     async fn serve(&self, stream: ipc::ServerStream) {
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
@@ -336,22 +303,22 @@ impl Server {
     async fn dispatch(&self, op: proto::Op) -> proto::Payload {
         let name = op_name(&op);
         let started = std::time::Instant::now();
-        acyclic_engine::trace!("daemon", "op {name} received");
+        acyclic::trace!("daemon", "op {name} received");
         let payload = match self.dispatch_inner(op).await {
             Ok(reply) => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "daemon",
                     "op {name} -> {} in {:.1}ms",
                     reply_name(&reply),
-                    acyclic_engine::trace::ms(started)
+                    acyclic::trace::ms(started)
                 );
                 proto::Payload::Ok(Box::new(reply))
             }
             Err(message) => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "daemon",
                     "op {name} -> error in {:.1}ms: {}",
-                    acyclic_engine::trace::ms(started),
+                    acyclic::trace::ms(started),
                     message.lines().next().unwrap_or("")
                 );
                 err(message)
@@ -361,39 +328,11 @@ impl Server {
     }
 
     /// True when nothing has needed this daemon for `idle`: no request, no
-    /// open session, no live fork, no Safe Mode session, nothing pending.
+    /// open session, and no live fork.
     async fn idle_for(&self, idle: Duration) -> bool {
         self.last_activity.lock().await.elapsed() >= idle
             && self.live_sessions.lock().await.is_empty()
             && self.forks.lock().await.is_empty()
-            && self.dry_session.lock().await.is_none()
-            && self.pending.lock().await.is_empty()
-    }
-
-    /// The store's size on disk, from a cache that a background walk
-    /// refreshes once it is a minute old. Only the very first call walks.
-    async fn store_size(&self) -> u64 {
-        const FRESH: Duration = Duration::from_secs(60);
-        let root = self.store_root.join("store");
-        let cached = *self.store_bytes.lock().await;
-        match cached {
-            Some((at, bytes)) if at.elapsed() < FRESH => bytes,
-            Some((_, bytes)) => {
-                let cache = Arc::clone(&self.store_bytes);
-                tokio::task::spawn_blocking(move || {
-                    let fresh = directory_bytes(&root);
-                    if let Ok(mut slot) = cache.try_lock() {
-                        *slot = Some((Instant::now(), fresh));
-                    }
-                });
-                bytes
-            }
-            None => {
-                let bytes = tokio::task::block_in_place(|| directory_bytes(&root));
-                *self.store_bytes.lock().await = Some((Instant::now(), bytes));
-                bytes
-            }
-        }
     }
 
     #[allow(
@@ -404,14 +343,16 @@ impl Server {
     async fn dispatch_inner(&self, op: proto::Op) -> Result<proto::Reply, String> {
         *self.last_activity.lock().await = Instant::now();
         match op {
-            proto::Op::Ping => Ok(proto::Reply::Pong),
+            proto::Op::Ping => {
+                self.handle.status().await.map_err(stringify)?;
+                Ok(proto::Reply::Pong)
+            }
             proto::Op::Status => {
                 let status = self.handle.status().await.map_err(stringify)?;
                 Ok(proto::Reply::Status(proto::StatusInfo {
                     state: format!("{:?}", status.state).to_lowercase(),
                     last_checkpoint: status.last_checkpoint,
                     unpublished: status.unpublished,
-                    store_bytes: self.store_size().await,
                     repo_root: self.repo_root.display().to_string(),
                     mount_provider: self.mounts.provider.to_owned(),
                     mount_available: self.mounts.available,
@@ -445,7 +386,7 @@ impl Server {
                     rewind_target: None,
                 };
                 if wait {
-                    acyclic_engine::trace!(
+                    acyclic::trace!(
                         "daemon",
                         "checkpoint: WAIT path (reply after the capture lands; durable={durable})"
                     );
@@ -460,14 +401,14 @@ impl Server {
                     Ok(proto::Reply::Checkpoint(proto::CheckpointInfo {
                         row_id: outcome.row_id,
                         generation: hex_generation(outcome.generation),
-                        kind: wire_kind(outcome.kind),
+                        kind: outcome.kind,
                     }))
                 } else {
                     // Enqueue-ack: the hook path. Admission into the FIFO
                     // happens BEFORE the ack, so a stop arriving after the
                     // ack queues behind the capture instead of dropping it.
                     // Failures land in the index as `failed`.
-                    acyclic_engine::trace!(
+                    acyclic::trace!(
                         "daemon",
                         "checkpoint: ENQUEUE path (ack on admission, capture runs behind)"
                     );
@@ -566,7 +507,7 @@ impl Server {
                     id: row.id,
                     generation: hex_generation(row.generation),
                     created_at: row.created_at,
-                    kind: wire_kind(row.kind),
+                    kind: row.kind,
                     published: row.published,
                     session_id: row.session_id,
                     host,
@@ -633,10 +574,7 @@ impl Server {
                 Ok(proto::Reply::Restore(proto::RestoreInfo {
                     checkpoint: row_id,
                     path: outcome.path.display().to_string(),
-                    action: match outcome.action {
-                        rewind::RestoreAction::Restored => proto::RestoreAction::Restored,
-                        rewind::RestoreAction::Removed => proto::RestoreAction::Removed,
-                    },
+                    action: outcome.action,
                     recorded_checkpoint,
                 }))
             }
@@ -710,9 +648,6 @@ impl Server {
                     .session_started(session_id.clone(), host)
                     .await
                     .map_err(stringify)?;
-                if self.config.dry_run {
-                    self.session_fork(session_id).await?;
-                }
                 Ok(proto::Reply::Unit)
             }
             proto::Op::SessionEnd { session_id } => {
@@ -735,12 +670,7 @@ impl Server {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in scratch_ids {
-                    let fork = self.forks.lock().await.remove(&id);
-                    let copy_dir = fork.and_then(|fork| fork.copy_dir);
-                    if let Err(error) = self.discard_fork_workspace(&id, copy_dir.as_deref()).await
-                    {
-                        eprintln!("{NAME} daemon: drop scratch fork {id}: {error}");
-                    }
+                    self.remove_fork(&id).await?;
                 }
                 // The session that just ended is the one the NEXT session's
                 // brief will describe, and nothing is asking for it yet:
@@ -765,13 +695,6 @@ impl Server {
                 if let Some(spec) = self.spec.as_ref() {
                     spec.shutdown().await;
                 }
-                // Unmount an active Safe Mode shadow first: it sits directly
-                // on the real repo root, so this must never be left mounted
-                // once the daemon that owns it is gone.
-                if let Some(mut session) = self.dry_session.lock().await.take() {
-                    let _ = tokio::task::block_in_place(|| session.mount.stop());
-                }
-                self.pending.lock().await.clear();
                 // Detach the fork session before the pipeline goes away: its
                 // callback runtimes reach into the shared checkouts.
                 self.forks.lock().await.clear();
@@ -790,9 +713,15 @@ impl Server {
                 if count == 0 || count > 16 {
                     return Err("fork count must be 1..=16".into());
                 }
-                if self.mounts.fork_mode() == ForkMode::Copy {
-                    return self.fork_copies(count, session_id).await;
+                if !self.mounts.available {
+                    return Err(format!(
+                        "native {} mounts are unavailable: {}\n{}",
+                        self.mounts.provider,
+                        self.mounts.reason.as_deref().unwrap_or("unknown reason"),
+                        fork::mount_setup_hint()
+                    ));
                 }
+                self.ensure_fork_workspace_clean().await?;
                 let root = fork::forks_mount_root(&self.repo_root)
                     .ok_or("repo root has no parent for fork workspaces")?;
                 let mut created = Vec::new();
@@ -804,8 +733,7 @@ impl Server {
                     let entry = proto::ForkEntry {
                         id: id.clone(),
                         path: root.join(&id).display().to_string(),
-                        mode: ForkMode::Mount.as_str().to_owned(),
-                        base: acyclic_engine::generation_hex(seed.base),
+                        base: acyclic::generation_hex(seed.base),
                         created_at: unix_now(),
                         session_id: session_id.clone(),
                         conflict_paths: Vec::new(),
@@ -817,7 +745,6 @@ impl Server {
                             shared: seed.shared,
                             base: seed.base,
                             entry: clone_entry(&entry),
-                            copy_dir: None,
                             conflict: None,
                         },
                     );
@@ -835,11 +762,7 @@ impl Server {
                 Ok(proto::Reply::Forks(entries))
             }
             proto::Op::ForkDrop { id } => {
-                let mut forks = self.forks.lock().await;
-                let fork = forks.remove(&id).ok_or(format!("no fork {id}"))?;
-                drop(forks);
-                self.discard_fork_workspace(&id, fork.copy_dir.as_deref())
-                    .await?;
+                self.remove_fork(&id).await?;
                 Ok(proto::Reply::Unit)
             }
             proto::Op::Promote { id } => {
@@ -863,18 +786,18 @@ impl Server {
                             paths: files.iter().map(|file| PathBuf::from(&file.path)).collect(),
                         });
                         fork.base = theirs;
-                        fork.entry.base = acyclic_engine::generation_hex(theirs);
+                        fork.entry.base = acyclic::generation_hex(theirs);
                         fork.entry.conflict_paths =
                             files.iter().map(|file| file.path.clone()).collect();
                         fork.entry.conflict = Some(proto::ConflictInfo {
-                            base: acyclic_engine::generation_hex(conflict_base),
-                            ours: acyclic_engine::generation_hex(ours),
-                            theirs: acyclic_engine::generation_hex(theirs),
+                            base: acyclic::generation_hex(conflict_base),
+                            ours: acyclic::generation_hex(ours),
+                            theirs: acyclic::generation_hex(theirs),
                         });
                         let fork_path = fork.entry.path.clone();
                         self.keep_fork(id, fork).await?;
                         return Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(theirs),
+                            generation: acyclic::generation_hex(theirs),
                             old_tree: None,
                             warning: String::new(),
                             replayed_paths: 0,
@@ -901,14 +824,11 @@ impl Server {
                     }
                     Ok(landed) => landed,
                 };
-                // Landed: the fork is consumed. Drop its route (mount fork)
-                // or its directory (copy fork).
-                if let Err(error) = self
-                    .discard_fork_workspace(&id, fork.copy_dir.as_deref())
-                    .await
-                {
-                    eprintln!("{NAME} daemon: discard fork {id} after promote: {error}");
-                }
+                // Landed: the fork is consumed. A teardown failure must be
+                // visible because the route is still live and the fork must
+                // remain tracked until a later drop can finish it.
+                self.forks.lock().await.insert(id.clone(), fork);
+                self.remove_fork(&id).await?;
                 match landed {
                     Landed::Replayed {
                         generation,
@@ -917,7 +837,7 @@ impl Server {
                         kept,
                         moved,
                     } => Ok(proto::Reply::Promote(proto::PromoteInfo {
-                        generation: acyclic_engine::generation_hex(generation),
+                        generation: acyclic::generation_hex(generation),
                         old_tree: None,
                         warning: if moved {
                             "the mainline had moved; the fork's paths were merged onto it in place"
@@ -934,7 +854,7 @@ impl Server {
                     })),
                     Landed::Nothing { generation, kept } => {
                         Ok(proto::Reply::Promote(proto::PromoteInfo {
-                            generation: acyclic_engine::generation_hex(generation),
+                            generation: acyclic::generation_hex(generation),
                             old_tree: None,
                             warning: String::new(),
                             replayed_paths: 0,
@@ -949,29 +869,10 @@ impl Server {
                 }
             }
             proto::Op::ForkDiff { id } => {
-                let (base, shared, copy_dir) = {
+                let (base, overlay) = {
                     let forks = self.forks.lock().await;
                     let fork = forks.get(&id).ok_or(format!("no fork {id}"))?;
-                    (fork.base, Arc::clone(&fork.shared), fork.copy_dir.clone())
-                };
-                // Mounted fork: its writes already sit in its own overlay, so
-                // snapshot that. Copy fork: read the directory into a
-                // scratch overlay pinned at the base (native capture cannot
-                // read through the mount itself: NFS lacks the extent ioctl).
-                // Either way the fork stays promotable afterwards.
-                let overlay = match copy_dir {
-                    None => shared,
-                    Some(dir) => {
-                        let scratch = self
-                            .handle
-                            .scratch_checkout(base)
-                            .await
-                            .map_err(stringify)?;
-                        fork::capture_copy(&scratch, &dir)
-                            .await
-                            .map_err(stringify)?;
-                        scratch
-                    }
+                    (fork.base, Arc::clone(&fork.shared))
                 };
                 let changes = if overlay.lock().await.has_pending_mutations() {
                     let generation = self
@@ -986,216 +887,19 @@ impl Server {
                 } else {
                     Vec::new()
                 };
-                // Timestamps differ on a copy fork by construction; only
-                // content is a blast radius.
                 Ok(proto::Reply::Diff(
                     self.annotate_ignored(
                         changes
                             .into_iter()
                             .filter(|change| {
-                                change.change != acyclic_engine::diff::ChangeKind::MetadataOnly
+                                change.change != acyclic::diff::ChangeKind::MetadataOnly
                             })
                             .map(diff_entry)
                             .collect(),
                     ),
                 ))
             }
-            proto::Op::SessionFork { session_id } => {
-                self.session_fork(session_id).await?;
-                Ok(proto::Reply::Unit)
-            }
-            proto::Op::SessionResolve { session_id } => {
-                self.invalidate(&crate::speculate::Cause::Session(session_id.clone()));
-                let mut slot = self.dry_session.lock().await;
-                let session = slot
-                    .take()
-                    .filter(|session| session.session_id == session_id)
-                    .ok_or_else(|| format!("no active Safe Mode session {session_id}"))?;
-                drop(slot);
-                // Unmount first: the real tree must reappear before we ask
-                // the engine to touch it, and no new writes can race the
-                // commit below.
-                let DrySession {
-                    fork_id,
-                    session_id,
-                    shared,
-                    base,
-                    mut mount,
-                } = session;
-                tokio::task::block_in_place(|| mount.stop())
-                    .map_err(|error| format!("unmount: {error:?}"))?;
-                let label = format!("safe mode session {fork_id}");
-                let outcome = self
-                    .handle
-                    .resolve_session(Arc::clone(&shared), base, label.clone())
-                    .await
-                    .map_err(stringify)?;
-                match outcome {
-                    SessionResolveOutcome::NoChanges => {
-                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
-                            session_id,
-                            diff: Vec::new(),
-                        }))
-                    }
-                    SessionResolveOutcome::Resolved { generation } => {
-                        let changes = self
-                            .handle
-                            .diff(base, generation)
-                            .await
-                            .map_err(stringify)?;
-                        self.pending.lock().await.insert(
-                            session_id.clone(),
-                            PendingSession {
-                                generation,
-                                base,
-                                label,
-                            },
-                        );
-                        Ok(proto::Reply::SessionPending(proto::SessionPendingInfo {
-                            session_id,
-                            diff: changes.into_iter().map(diff_entry).collect(),
-                        }))
-                    }
-                    SessionResolveOutcome::Conflict { message } => Err(message),
-                }
-            }
-            proto::Op::SessionApply { session_id } => {
-                let mut pending = self.pending.lock().await;
-                let session = pending
-                    .remove(&session_id)
-                    .ok_or_else(|| format!("no resolved Safe Mode session {session_id}"))?;
-                drop(pending);
-                let outcome = self
-                    .handle
-                    .apply_session(session.generation, session.base, session.label)
-                    .await
-                    .map_err(stringify)?;
-                match outcome {
-                    PromoteOutcome::Promoted {
-                        generation,
-                        old_tree,
-                    } => Ok(proto::Reply::Promote(proto::PromoteInfo {
-                        generation: acyclic_engine::generation_hex(generation),
-                        old_tree: old_tree.map(|path| path.display().to_string()),
-                        warning: "reload your editor: open files still point at the replaced tree"
-                            .into(),
-                        replayed_paths: 0,
-                        merged_files: 0,
-                        conflicts: Vec::new(),
-                        fork_path: None,
-                        kept_mainline: Vec::new(),
-                        mainline_moved: false,
-                    })),
-                    PromoteOutcome::Conflict { message } => Err(message),
-                }
-            }
-            proto::Op::SessionDiscard { session_id } => {
-                self.pending.lock().await.remove(&session_id);
-                Ok(proto::Reply::Unit)
-            }
         }
-    }
-
-    /// Forks one checkout and shadow-mounts it directly at `repo_root` for
-    /// `session_id`'s duration (Safe Mode's session redirection). Only one
-    /// Safe Mode session can be active per repo at a time.
-    async fn session_fork(&self, session_id: String) -> Result<(), String> {
-        if !self.mounts.available {
-            return Err(format!(
-                "Safe Mode needs a mount provider and this host has none ({}).\n{}",
-                self.mounts.reason.as_deref().unwrap_or("unknown reason"),
-                fork::mount_setup_hint()
-            ));
-        }
-        if self.dry_session.lock().await.is_some() {
-            return Err("a Safe Mode session is already active for this repo".to_owned());
-        }
-        let seed = self.handle.fork().await.map_err(stringify)?;
-        let shared = Arc::clone(&seed.shared);
-        let config = seed.config;
-        let guarded_paths = self.config.guarded_paths.clone();
-        let volume_id = seed.volume_id;
-        let destination = self.repo_root.clone();
-        let mount = tokio::task::block_in_place(move || {
-            let source = CheckoutMountSource::new(shared, config)
-                .map_err(|error| format!("mount source: {error:?}"))?;
-            let source: Arc<dyn MountFilesystem> =
-                if GuardedMountFilesystem::is_active(&guarded_paths) {
-                    Arc::new(GuardedMountFilesystem::new(
-                        Arc::new(source),
-                        &guarded_paths,
-                    ))
-                } else {
-                    Arc::new(source)
-                };
-            mount_native_over_existing(
-                NativeMountRequest {
-                    mount_id: acyclic_engine::MountId::new(),
-                    volume_id,
-                    destination,
-                    writable: true,
-                },
-                source,
-            )
-            .map_err(|error| format!("shadow mount: {error:?}"))
-        })?;
-        *self.dry_session.lock().await = Some(DrySession {
-            fork_id: short_id(),
-            session_id,
-            shared: seed.shared,
-            base: seed.base,
-            mount,
-        });
-        // The fork now shadows the real repo root: suspend mainline capture
-        // until resolve/apply, or the pipeline watcher captures the shadow's
-        // content and the mount lifecycle instead of real-tree mutations.
-        self.handle.set_shadowed(true).await.map_err(stringify)?;
-        Ok(())
-    }
-
-    /// Copy-mode forks: materialize the base generation into a real
-    /// directory per fork. Same ids, lifecycle, and promote semantics as
-    /// mounted forks; creation is O(tree) instead of O(1).
-    async fn fork_copies(
-        &self,
-        count: u32,
-        session_id: Option<String>,
-    ) -> Result<proto::Reply, String> {
-        let root = fork::forks_copy_root(&self.repo_root)
-            .ok_or("repo root has no parent for fork workspaces")?;
-        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-        let mut created = Vec::new();
-        for _ in 0..count {
-            let seed = self.handle.fork().await.map_err(stringify)?;
-            let id = short_id();
-            let dir = root.join(&id);
-            self.handle
-                .materialize(seed.base, dir.clone())
-                .await
-                .map_err(stringify)?;
-            let entry = proto::ForkEntry {
-                id: id.clone(),
-                path: dir.display().to_string(),
-                mode: ForkMode::Copy.as_str().to_owned(),
-                base: acyclic_engine::generation_hex(seed.base),
-                created_at: unix_now(),
-                session_id: session_id.clone(),
-                conflict_paths: Vec::new(),
-                conflict: None,
-            };
-            self.forks.lock().await.insert(
-                id,
-                ForkState {
-                    shared: seed.shared,
-                    base: seed.base,
-                    entry: clone_entry(&entry),
-                    copy_dir: Some(dir),
-                    conflict: None,
-                },
-            );
-            created.push(entry);
-        }
-        Ok(proto::Reply::Forks(created))
     }
 
     /// Lands a fork in place. The fork's paths are merged onto the current
@@ -1210,39 +914,17 @@ impl Server {
         fork: &ForkState,
         label: &str,
     ) -> Result<Landed, String> {
-        // Get at the fork's overlay. A mounted fork keeps serving while we
-        // work: its snapshot is taken under the checkout lock, and the
-        // route is detached only once the fork has landed. (Detaching
-        // first and re-attaching on a conflict left the kernel's negative
-        // name cache hiding the fork on Linux FUSE, which cannot
-        // invalidate a route name.)
-        let overlay = match fork.copy_dir.as_deref() {
-            Some(dir) => {
-                let scratch = self
-                    .handle
-                    .scratch_checkout(fork.base)
-                    .await
-                    .map_err(stringify)?;
-                fork::capture_copy(&scratch, dir).await.map_err(stringify)?;
-                scratch
-            }
-            None => Arc::clone(&fork.shared),
-        };
+        let overlay = Arc::clone(&fork.shared);
         // A rebased fork must have resolved its markers before it can land.
         if let Some(conflict) = fork.conflict.as_ref() {
             self.refuse_unresolved_markers(&overlay, conflict).await?;
         }
         let publish_started = std::time::Instant::now();
         let head = self.handle.publish_head().await.map_err(stringify)?;
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
-            "promote {id}: publish_head {:.1}ms; {} fork, mainline {} since the fork's base",
-            acyclic_engine::trace::ms(publish_started),
-            if fork.copy_dir.is_some() {
-                "copy"
-            } else {
-                "mount"
-            },
+            "promote {id}: publish_head {:.1}ms; mainline {} since the fork's base",
+            acyclic::trace::ms(publish_started),
             if head == fork.base {
                 "UNMOVED (plain in-place write)"
             } else {
@@ -1250,16 +932,9 @@ impl Server {
             }
         );
         let landed = self
-            .merge_onto_head(
-                id,
-                overlay,
-                fork.base,
-                head,
-                fork.copy_dir.as_deref(),
-                label,
-            )
+            .merge_onto_head(id, overlay, fork.base, head, label)
             .await;
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: outcome {}",
             match &landed {
@@ -1302,6 +977,17 @@ impl Server {
         Ok(())
     }
 
+    /// Detaches a fork's live route before forgetting its state. If teardown
+    /// fails, the entry remains visible and a caller can retry the drop.
+    async fn remove_fork(&self, id: &str) -> Result<(), String> {
+        if !self.forks.lock().await.contains_key(id) {
+            return Err(format!("no fork {id}"));
+        }
+        self.detach_route(id).await?;
+        self.forks.lock().await.remove(id);
+        Ok(())
+    }
+
     /// Builds the mount source for a fork's shared checkout and routes it
     /// under the one native session (mounting it on the first route).
     async fn attach_route(
@@ -1331,9 +1017,10 @@ impl Server {
             )
         })?;
         let mut mount = self.fork_mount.lock().await;
+        let route = route_name(id)?;
         mount
             .router
-            .add_route(route_name(id), source)
+            .add_route(route.clone(), source)
             .map_err(|error| format!("route: {error:?}"))?;
         // The ONE session, mounted lazily on the first fork. A route
         // insert is all later forks pay.
@@ -1345,7 +1032,7 @@ impl Server {
             let session = tokio::task::block_in_place(move || {
                 mount_native(
                     NativeMountRequest {
-                        mount_id: acyclic_engine::MountId::new(),
+                        mount_id: acyclic::MountId::new(),
                         volume_id,
                         destination: dest,
                         writable: true,
@@ -1357,7 +1044,7 @@ impl Server {
             match session {
                 Ok(session) => mount.session = Some(session),
                 Err(error) => {
-                    tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
+                    tokio::task::block_in_place(|| mount.router.remove_route(&route));
                     return Err(error);
                 }
             }
@@ -1419,9 +1106,8 @@ impl Server {
         &self,
         id: &str,
         overlay: Arc<SharedLocalCheckout>,
-        base: acyclic_engine::GenerationId,
-        head: acyclic_engine::GenerationId,
-        copy_dir: Option<&Path>,
+        base: acyclic::GenerationId,
+        head: acyclic::GenerationId,
         label: &str,
     ) -> Result<Landed, String> {
         let moved = head != base;
@@ -1437,17 +1123,17 @@ impl Server {
             .snapshot_overlay(Arc::clone(&overlay))
             .await
             .map_err(stringify)?;
-        let snapshot_ms = acyclic_engine::trace::ms(snapshot_started);
+        let snapshot_ms = acyclic::trace::ms(snapshot_started);
         let plan_started = std::time::Instant::now();
         let mut plan = self
             .handle
             .merge_plan(base, head, snapshot, format!("fork {id}"))
             .await
             .map_err(stringify)?;
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: snapshot_overlay {snapshot_ms:.1}ms, merge_plan {:.1}ms",
-            acyclic_engine::trace::ms(plan_started)
+            acyclic::trace::ms(plan_started)
         );
         // Gitignored paths (bytecode caches, build output, .env) are not
         // merge payload: a fork's copy never blocks a promote, the
@@ -1461,13 +1147,13 @@ impl Server {
         let ignore_started = std::time::Instant::now();
         let ignored =
             tokio::task::block_in_place(|| merge::ignored_paths(&self.repo_root, &contested));
-        let ignore_ms = acyclic_engine::trace::ms(ignore_started);
+        let ignore_ms = acyclic::trace::ms(ignore_started);
         let kept: Vec<String> = plan
             .keep_mainline_for(&ignored)
             .iter()
             .map(|path| path.display().to_string())
             .collect();
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "merge plan: take_ours={} take_theirs={} merged={} conflicted={} refused={} kept_mainline={}",
             plan.take_ours.len(),
@@ -1488,7 +1174,7 @@ impl Server {
                 "the working tree moved past the fork's base ({}) and {} path(s) cannot be merged:\n{}\n\
                  One fork must own those paths: re-fork from the current tree and redo that part, \
                  or rewind to the base. The fork is untouched",
-                acyclic_engine::generation_hex(base),
+                acyclic::generation_hex(base),
                 plan.refusals.len(),
                 lines.join("\n")
             ));
@@ -1546,7 +1232,7 @@ impl Server {
                 .await
                 .map_err(stringify)?
         };
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: gitignore check {ignore_ms:.1}ms ({} contested), landing source {} in \
              {:.1}ms ({} replayed subtree(s), {} merged file(s))",
@@ -1556,7 +1242,7 @@ impl Server {
             } else {
                 "= built merged generation"
             },
-            acyclic_engine::trace::ms(build_started),
+            acyclic::trace::ms(build_started),
             plan.take_ours.len(),
             plan.merged.len()
         );
@@ -1586,13 +1272,13 @@ impl Server {
                     rebased,
                     format!(
                         "fork {id} rebased onto {} ({} conflict(s))",
-                        acyclic_engine::short_hex(&acyclic_engine::generation_hex(head)),
+                        acyclic::short_hex(&acyclic::generation_hex(head)),
                         plan.conflicted.len()
                     ),
                 )
                 .await
                 .map_err(stringify)?;
-            self.rebase_fork(id, snapshot, rebased, copy_dir).await?;
+            self.rebase_fork(id, snapshot, rebased).await?;
             let mut files: Vec<proto::ConflictEntry> = plan
                 .conflicted
                 .iter()
@@ -1642,7 +1328,7 @@ impl Server {
             )
             .await
             .map_err(stringify)?;
-        let pre_ms = acyclic_engine::trace::ms(land_started);
+        let pre_ms = acyclic::trace::ms(land_started);
         // One restore for every landing path: one drain, one timeline row
         // carrying the promote label, however many paths the fork touched.
         // publish_head captured the tree just now, so no safety row either.
@@ -1669,16 +1355,16 @@ impl Server {
                     landing.len()
                 )
             })?;
-        let restore_ms = acyclic_engine::trace::ms(restore_started);
+        let restore_ms = acyclic::trace::ms(restore_started);
         let written = u32::try_from(restored.outcomes.len()).unwrap_or(u32::MAX);
         let landed_generation = restored.generation;
         // No inline publish: the landed row is a checkpoint like any other
         // and the idle timer publishes it. Authority publish is O(tree).
-        acyclic_engine::trace!(
+        acyclic::trace!(
             "daemon",
             "promote {id}: landing {written} path(s): record rows {pre_ms:.1}ms, \
              restore {restore_ms:.1}ms, land total {:.1}ms",
-            acyclic_engine::trace::ms(land_started)
+            acyclic::trace::ms(land_started)
         );
         Ok(Landed::Replayed {
             generation: landed_generation,
@@ -1689,15 +1375,13 @@ impl Server {
         })
     }
 
-    /// Makes the fork workspace equal to `rebased`: writes R − F into the
-    /// fork's directory, through the mount for a mounted fork. The real
-    /// tree is never touched.
+    /// Makes the mounted fork equal to `rebased` by writing R − F through
+    /// the mount. The real tree is never touched.
     async fn rebase_fork(
         &self,
         id: &str,
-        snapshot: acyclic_engine::GenerationId,
-        rebased: acyclic_engine::GenerationId,
-        copy_dir: Option<&Path>,
+        snapshot: acyclic::GenerationId,
+        rebased: acyclic::GenerationId,
     ) -> Result<(), String> {
         let changed: Vec<PathBuf> = content_changes(
             self.handle
@@ -1709,77 +1393,47 @@ impl Server {
         .map(|change| change.path)
         .collect();
         let roots = merge::subtree_roots(&changed);
-        if let Some(dir) = copy_dir {
-            for root in &roots {
-                self.handle
-                    .restore_path_into(rebased, dir.to_path_buf(), root.clone())
-                    .await
-                    .map_err(stringify)?;
-            }
-        } else {
-            // A mounted fork: write THROUGH the mount, never behind it.
-            // The driver and the kernel keep name and attribute caches
-            // that only their own operations update; a write via the
-            // checkout leaves a file the fork had deleted invisible for
-            // good, and the FUSE transport has no invalidation at all.
-            let dir = fork::forks_mount_root(&self.repo_root)
-                .ok_or("repo root has no parent for fork workspaces")?
-                .join(id);
-            self.handle
-                .materialize_paths(rebased, dir, roots)
-                .await
-                .map_err(stringify)?;
-        }
-        Ok(())
-    }
-
-    /// Drops whatever backs a fork: its route for mounted forks, its
-    /// directory for copy forks.
-    async fn discard_fork_workspace(
-        &self,
-        id: &str,
-        copy_dir: Option<&Path>,
-    ) -> Result<(), String> {
-        match copy_dir {
-            Some(dir) => {
-                std::fs::remove_dir_all(dir)
-                    .map_err(|error| format!("remove fork copy: {error}"))?;
-                Self::remove_if_empty(dir.parent());
-                Ok(())
-            }
-            None => self.detach_route(id).await,
-        }
-    }
-
-    fn remove_if_empty(dir: Option<&Path>) {
-        if let Some(dir) = dir {
-            let _ = std::fs::remove_dir(dir);
-            let _ = dir.parent().map(std::fs::remove_dir);
-        }
+        // Write THROUGH the mount, never behind it. The driver and kernel
+        // keep name and attribute caches that only their own operations
+        // update.
+        let dir = fork::forks_mount_root(&self.repo_root)
+            .ok_or("repo root has no parent for fork workspaces")?
+            .join(id);
+        self.handle
+            .materialize_paths(rebased, dir, roots)
+            .await
+            .map_err(stringify)
     }
 
     /// Removes one fork's route; the session unmounts (and the mount root
     /// disappears) when the last route goes, freeing the FUSE-T pool slot.
     async fn detach_route(&self, id: &str) -> Result<(), String> {
         let mut mount = self.fork_mount.lock().await;
-        // Dropping a route drops its CheckoutMountSource, which owns a tokio
-        // runtime — runtimes must never be dropped on an async worker.
-        tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
-        // The kernel may hold a positive entry cache for the removed name
-        // (FSKit caches until told otherwise): invalidate it eagerly.
-        if let Some(session) = mount.session.as_ref() {
-            if let Err(error) = tokio::task::block_in_place(|| session.invalidate(&route_name(id)))
-            {
-                eprintln!("{NAME} daemon: invalidate {id}: {error:?}");
+        let route = route_name(id)?;
+        let last_route = mount.router.route_count() == 1;
+        if !last_route {
+            if let Some(session) = mount.session.as_ref() {
+                tokio::task::block_in_place(|| session.invalidate(&route))
+                    .map_err(|error| format!("invalidate {id}: {error:?}"))?;
             }
         }
-        if mount.router.is_empty() {
-            if let Some(mut session) = mount.session.take() {
+        if last_route {
+            if let Some(session) = mount.session.as_mut() {
                 tokio::task::block_in_place(|| session.stop())
                     .map_err(|error| format!("unmount: {error:?}"))?;
             }
+            mount.session.take();
+        }
+        // Dropping a route drops its CheckoutMountSource, which owns a tokio
+        // runtime — runtimes must never be dropped on an async worker. For
+        // the last route, stop the fallible kernel session first so failure
+        // leaves both the route and fork state intact for an exact retry.
+        if !tokio::task::block_in_place(|| mount.router.remove_route(&route)) {
+            return Err(format!("fork {id} has no mount route"));
+        }
+        if last_route {
             if let Some(root) = fork::forks_mount_root(&self.repo_root) {
-                let _ = std::fs::remove_dir_all(root);
+                let _ = std::fs::remove_dir(root);
             }
         }
         Ok(())
@@ -2121,7 +1775,7 @@ struct PendingBranch {
     prompt: Option<String>,
     checkpoints: i64,
     /// Generations to diff for the branch's size, when the two differ.
-    diff: Option<(acyclic_engine::GenerationId, acyclic_engine::GenerationId)>,
+    diff: Option<(acyclic::GenerationId, acyclic::GenerationId)>,
 }
 
 /// Every branch the session rewound away from, with the work it would take
@@ -2174,12 +1828,10 @@ fn abandoned_branches(
 
 /// Content changes only. A rewind or restore rewrites mtimes on every path
 /// it materializes, so metadata-only rows are noise for "what changed".
-fn content_changes(
-    changes: Vec<acyclic_engine::diff::FileChange>,
-) -> Vec<acyclic_engine::diff::FileChange> {
+fn content_changes(changes: Vec<acyclic::diff::FileChange>) -> Vec<acyclic::diff::FileChange> {
     changes
         .into_iter()
-        .filter(|change| change.change != acyclic_engine::diff::ChangeKind::MetadataOnly)
+        .filter(|change| change.change != acyclic::diff::ChangeKind::MetadataOnly)
         .collect()
 }
 
@@ -2194,21 +1846,27 @@ fn err(message: String) -> proto::Payload {
 /// the `ProjFS` provider decodes every entry name it is handed as UTF-16LE,
 /// and hands an id passed as raw ASCII back to the user as mojibake. Ids are
 /// hex, so this is a widening on Windows and a copy everywhere else.
-fn route_name(id: &str) -> Vec<u8> {
-    acyclic_engine::names::str_to_bytes(id)
+fn route_name(id: &str) -> Result<Vec<u8>, String> {
+    let config = acyclic::store::volume_config();
+    acyclic_fs::host_path_to_namespace(Path::new(id), config.profile, config.limits)
+        .map_err(|error| format!("route name: {error}"))?
+        .components()
+        .first()
+        .map(|name| name.as_bytes().to_vec())
+        .ok_or_else(|| "route name is empty".to_owned())
 }
 
 fn short_id() -> String {
     // UUIDv7 leads with timestamp bits (identical across nearby calls);
     // the tail is the random section.
-    acyclic_engine::MountId::new().into_bytes()[10..]
+    acyclic::MountId::new().into_bytes()[10..]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
 fn unix_now() -> i64 {
-    acyclic_engine::unix_now()
+    acyclic::unix_now()
 }
 
 /// How a fork ended up in the real tree.
@@ -2217,7 +1875,7 @@ enum Landed {
     /// `merged` of the paths were produced by a three-way content merge;
     /// `moved` says whether the mainline had moved past the fork's base.
     Replayed {
-        generation: acyclic_engine::GenerationId,
+        generation: acyclic::GenerationId,
         paths: u32,
         merged: u32,
         kept: Vec<String>,
@@ -2225,14 +1883,14 @@ enum Landed {
     },
     /// No content changes to land.
     Nothing {
-        generation: acyclic_engine::GenerationId,
+        generation: acyclic::GenerationId,
         kept: Vec<String>,
     },
     /// Nothing landed: the fork was rebased onto `theirs` and `files`
     /// carry conflict markers in the fork workspace.
     Conflicted {
-        theirs: acyclic_engine::GenerationId,
-        ours: acyclic_engine::GenerationId,
+        theirs: acyclic::GenerationId,
+        ours: acyclic::GenerationId,
         files: Vec<proto::ConflictEntry>,
         kept: Vec<String>,
     },
@@ -2273,7 +1931,6 @@ fn clone_entry(entry: &proto::ForkEntry) -> proto::ForkEntry {
     proto::ForkEntry {
         id: entry.id.clone(),
         path: entry.path.clone(),
-        mode: entry.mode.clone(),
         base: entry.base.clone(),
         created_at: entry.created_at,
         session_id: entry.session_id.clone(),
@@ -2300,33 +1957,14 @@ fn engine_kind(kind: proto::CheckpointRequestKind) -> CheckpointKind {
     }
 }
 
-fn wire_kind(kind: CheckpointKind) -> proto::CheckpointKind {
-    match kind {
-        CheckpointKind::Baseline => proto::CheckpointKind::Baseline,
-        CheckpointKind::Pre => proto::CheckpointKind::Pre,
-        CheckpointKind::Post => proto::CheckpointKind::Post,
-        CheckpointKind::Manual => proto::CheckpointKind::Manual,
-        CheckpointKind::PreRewind => proto::CheckpointKind::PreRewind,
-        CheckpointKind::Recovered => proto::CheckpointKind::Recovered,
-        CheckpointKind::Failed => proto::CheckpointKind::Failed,
-        CheckpointKind::Noop => proto::CheckpointKind::Noop,
-        CheckpointKind::Auto => proto::CheckpointKind::Auto,
-    }
-}
-
 #[allow(
     clippy::needless_pass_by_value,
     reason = "used as `.map(diff_entry)` over an owning iterator"
 )]
-fn diff_entry(change: acyclic_engine::diff::FileChange) -> proto::DiffEntry {
+fn diff_entry(change: acyclic::diff::FileChange) -> proto::DiffEntry {
     proto::DiffEntry {
         path: change.path.display().to_string(),
-        change: match change.change {
-            acyclic_engine::diff::ChangeKind::Added => proto::ChangeKind::Added,
-            acyclic_engine::diff::ChangeKind::Removed => proto::ChangeKind::Removed,
-            acyclic_engine::diff::ChangeKind::Modified => proto::ChangeKind::Modified,
-            acyclic_engine::diff::ChangeKind::MetadataOnly => proto::ChangeKind::Metadata,
-        },
+        change: change.change,
         file_kind: format!("{:?}", change.file_kind).to_lowercase(),
         ignored: false,
     }
@@ -2336,7 +1974,7 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     proto::TimelineEntry {
         id: row.id,
         created_at: row.created_at,
-        kind: wire_kind(row.kind),
+        kind: row.kind,
         published: row.published,
         session_id: row.session_id,
         tool_name: row.tool_name,
@@ -2346,27 +1984,6 @@ fn timeline_entry(row: CheckpointRow) -> proto::TimelineEntry {
     }
 }
 
-fn hex_generation(generation: acyclic_engine::GenerationId) -> String {
-    acyclic_engine::generation_hex(generation)
-}
-
-fn directory_bytes(root: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += metadata.len();
-            }
-        }
-    }
-    total
+fn hex_generation(generation: acyclic::GenerationId) -> String {
+    acyclic::generation_hex(generation)
 }

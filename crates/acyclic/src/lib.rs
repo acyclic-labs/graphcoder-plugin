@@ -40,6 +40,7 @@ pub fn short_hex(hex: &str) -> &str {
     hex.get(..12).unwrap_or(hex)
 }
 
+pub mod checkpoint_kind;
 pub mod config;
 pub mod diff;
 pub mod exclude;
@@ -47,7 +48,6 @@ pub mod fork;
 pub mod guard;
 pub mod index;
 pub mod merge;
-pub mod names;
 pub mod pipeline;
 pub mod product;
 pub mod rewind;

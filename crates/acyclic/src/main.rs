@@ -19,15 +19,15 @@ mod hook;
 mod install;
 mod ipc;
 mod mcp;
+mod proto;
 mod server;
 mod spec_runner;
 mod speculate;
 
 use std::path::{Path, PathBuf};
 
-use acyclic_engine::product::{self, NAME};
-use acyclic_engine::short_hex;
-use acyclic_proto as proto;
+use acyclic::product::{self, NAME};
+use acyclic::short_hex;
 use clap::{Parser, Subcommand};
 
 use client::{Client, ConnectError, Spawn};
@@ -61,9 +61,6 @@ enum Command {
         /// a queued snapshot can include edits made before it runs.
         #[arg(long, conflicts_with = "durable")]
         no_wait: bool,
-        /// Accepted for compatibility: waiting is now the default.
-        #[arg(long, hide = true)]
-        wait: bool,
         /// Also publish to the durable authority (coarse boundary).
         #[arg(long)]
         durable: bool,
@@ -225,17 +222,6 @@ enum Command {
     /// Record a host session ending (hook use).
     #[command(hide = true)]
     SessionEnd { session_id: String },
-    /// Safe Mode: commit a session's shadow fork and show what it would
-    /// change, without touching the real tree yet.
-    #[command(hide = true)]
-    SessionResolve { session_id: String },
-    /// Safe Mode: apply a `session-resolve`d session's changes to the real
-    /// tree.
-    #[command(hide = true)]
-    SessionApply { session_id: String },
-    /// Safe Mode: discard a `session-resolve`d session without applying it.
-    #[command(hide = true)]
-    SessionDiscard { session_id: String },
     /// Internal: the per-repo daemon process.
     #[command(name = "__daemon", hide = true)]
     Daemon { repo_root: PathBuf },
@@ -259,17 +245,41 @@ fn main() {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
+    if matches!(cli.command, Command::Daemon { .. }) {
+        std::process::exit(run(cli, Path::new(".")));
+    }
     let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    // Before touching the repo path (canonicalize, config load, socket): a
-    // crashed Safe Mode daemon can leave a dead shadow mount over the repo
-    // root that wedges every stat under it. Force-unmount it first (a no-op
-    // unless a bounded probe shows the mount is genuinely wedged), so the
-    // real tree is back before we read anything.
-    acyclic_engine::fork::reap_dead_shadow(&repo_arg);
+    let (repo_arg, recovered) = acyclic::rewind::recover_before_repo_open(&repo_arg)
+        .unwrap_or_else(|error| {
+            eprintln!("{}: rewind recovery: {error}", product::NAME);
+            std::process::exit(1);
+        });
     let repo = repo_arg.canonicalize().unwrap_or_else(|error| {
         eprintln!("{}: bad repo path: {error}", product::NAME);
         std::process::exit(1);
     });
+    let recovery = match recovered {
+        Some(recovered) if recovered.reconcile_head => (|| -> Result<(), String> {
+            let config = acyclic::config::Config::load(&repo).map_err(|error| error.to_string())?;
+            let stores_root = config.store_dir.as_ref().map(PathBuf::from);
+            let paths = acyclic::store::StorePaths::for_repo(&repo, stores_root.as_deref())
+                .map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+            let mut store = runtime
+                .block_on(acyclic::store::Store::open(&repo, paths))
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(acyclic::rewind::recover_workspace(&mut store, recovered))
+                .map_err(|error| error.to_string())?;
+            acyclic::rewind::finish_recovery(&repo).map_err(|error| error.to_string())
+        })(),
+        Some(_) => acyclic::rewind::finish_recovery(&repo).map_err(|error| error.to_string()),
+        None => Ok(()),
+    };
+    if let Err(error) = recovery {
+        eprintln!("{}: finish rewind recovery: {error}", product::NAME);
+        std::process::exit(1);
+    }
     if cli.repo.is_none() && stranded_in_trash(&repo) {
         // A rewind or promote swaps the repo directory's inode; a shell that
         // was inside it now resolves its cwd to the replaced tree in trash.
@@ -287,7 +297,7 @@ fn main() {
 
 /// True when `repo` (canonical) lies inside a store's trash (an ancestor
 /// named `trash` whose parent is a store root, marked by `meta.json`), or
-/// inside a rewind's sibling fallback trash directory (`.<name>.acyclic-trash-*`).
+/// inside a rewind's sibling trash directory (`.<name>.acyclic-trash-*`).
 fn stranded_in_trash(repo: &Path) -> bool {
     repo.ancestors().any(|ancestor| {
         let Some(name) = ancestor.file_name().map(|name| name.to_string_lossy()) else {
@@ -360,7 +370,7 @@ fn run(cli: Cli, repo: &Path) -> i32 {
                     return 1;
                 }
             };
-            match execute(&mut client, command) {
+            match execute(&mut client, command, repo) {
                 Ok(()) => 0,
                 Err(message) => {
                     eprintln!("{}: {message}", product::NAME);
@@ -389,10 +399,10 @@ fn step_aside() {
 #[cfg(not(windows))]
 fn step_aside() {}
 
-fn store_paths(repo: &Path) -> Result<acyclic_engine::store::StorePaths, String> {
-    let config = acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+fn store_paths(repo: &Path) -> Result<acyclic::store::StorePaths, String> {
+    let config = acyclic::config::Config::load(repo).map_err(|error| error.to_string())?;
     let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-    acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+    acyclic::store::StorePaths::for_repo(repo, stores_root.as_deref())
         .map_err(|error| error.to_string())
 }
 
@@ -402,21 +412,18 @@ fn connect(repo: &Path, spawn: Spawn) -> Result<Client, ConnectError> {
     Client::connect(&paths.socket(), repo, &log, spawn)
 }
 
-/// One line on what forks and Safe Mode can do here, plus setup steps when
-/// the host lacks a mount provider. Shown by `init` and `install`.
+/// One line on native fork support, plus setup steps when the host lacks a
+/// mount provider. Shown by `init` and `install`.
 fn print_mount_capability() {
-    let capability = acyclic_engine::fork::mount_capability();
+    let capability = acyclic::fork::mount_capability();
     if capability.available {
-        println!(
-            "mounts:        {} (forks and Safe Mode available)",
-            capability.provider
-        );
+        println!("mounts:        {} (forks mount)", capability.provider);
     } else {
         println!(
             "mounts:        unavailable ({})",
             capability.reason.as_deref().unwrap_or("unknown reason")
         );
-        println!("{}", acyclic_engine::fork::mount_setup_hint());
+        println!("{}", acyclic::fork::mount_setup_hint());
     }
 }
 
@@ -533,7 +540,7 @@ fn print_speculation(spec: &proto::SpecStatus) {
 }
 
 fn policy(repo: &Path) -> i32 {
-    match acyclic_engine::config::Config::load(repo) {
+    match acyclic::config::Config::load(repo) {
         Ok(config) => {
             let d = config.decompose;
             println!("fan_out = {}", d.fan_out);
@@ -560,28 +567,28 @@ fn policy(repo: &Path) -> i32 {
 
 fn init(repo: &Path) -> i32 {
     let result = (|| -> Result<(), String> {
-        let config =
-            acyclic_engine::config::Config::load(repo).map_err(|error| error.to_string())?;
+        let config = acyclic::config::Config::load(repo).map_err(|error| error.to_string())?;
         let stores_root = config.store_dir.as_ref().map(PathBuf::from);
-        let paths = acyclic_engine::store::StorePaths::for_repo(repo, stores_root.as_deref())
+        let paths = acyclic::store::StorePaths::for_repo(repo, stores_root.as_deref())
             .map_err(|error| error.to_string())?;
         if paths.meta().exists() {
             println!("store already exists at {}", paths.root.display());
         } else {
             let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
             runtime
-                .block_on(acyclic_engine::store::Store::init(repo, paths.clone()))
+                .block_on(acyclic::store::Store::init(repo, paths.clone()))
                 .map_err(|error| error.to_string())?;
             println!("store created at {}", paths.root.display());
         }
-        // Spawning the daemon builds (or refreshes) the baseline.
+        // Spawning opens metadata and the watcher without scanning descendants.
+        // The first content-dependent operation establishes the baseline.
         let mut client = connect(repo, Spawn::Allowed).map_err(|error| match error {
             ConnectError::NoDaemon => "daemon failed to start".to_owned(),
             ConnectError::Starting => "daemon is still starting".to_owned(),
             ConnectError::Other(message) => message,
         })?;
         client.call(proto::Op::Ping)?;
-        println!("daemon ready — checkpointing is on");
+        println!("daemon ready — checkpointing activates on first use");
         print_mount_capability();
         Ok(())
     })();
@@ -598,12 +605,11 @@ fn init(repo: &Path) -> i32 {
     clippy::too_many_lines,
     reason = "one arm per Command; each arm is a single call plus its printing"
 )]
-fn execute(client: &mut Client, command: Command) -> Result<(), String> {
+fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), String> {
     match command {
         Command::Checkpoint {
             message,
             no_wait,
-            wait: _,
             durable,
             kind,
             session_id,
@@ -636,14 +642,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
             turn,
             limit,
         } => {
-            let reply = client.call(proto::Op::Timeline {
-                session_id: session,
-                turn,
-                limit,
-            })?;
-            let proto::Reply::Timeline(entries) = reply else {
-                return Err("unexpected reply".into());
-            };
+            let entries = client.timeline(session, turn, limit)?;
             if entries.is_empty() {
                 println!("no checkpoints yet");
                 return Ok(());
@@ -836,13 +835,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         }
         Command::Restore { checkpoint, paths } => {
             for path in paths {
-                let reply = client.call(proto::Op::Rewind {
-                    target: proto::RewindTarget::Checkpoint(checkpoint),
-                    path: Some(path),
-                })?;
-                let proto::Reply::Restore(info) = reply else {
-                    return Err("unexpected reply".into());
-                };
+                let info = client.restore(checkpoint, path)?;
                 match info.action {
                     proto::RestoreAction::Removed => {
                         println!("{}: absent at #{}, removed", info.path, info.checkpoint);
@@ -881,10 +874,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 }
             }
             step_aside();
-            let reply = client.call(proto::Op::Rewind { target, path: None })?;
-            let proto::Reply::Rewind(info) = reply else {
-                return Err("unexpected reply".into());
-            };
+            let info = client.rewind(target)?;
             println!("restored checkpoint #{}", info.restored_checkpoint);
             println!("old tree kept at {}", info.old_tree);
             println!("note: {}", info.warning);
@@ -905,15 +895,7 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 let (after, after_hex) = checkpoint_ref(after.as_deref())?;
                 (before, after, before_hex, after_hex)
             };
-            let reply = client.call(proto::Op::Diff {
-                before,
-                after,
-                before_hex,
-                after_hex,
-            })?;
-            let proto::Reply::Diff(entries) = reply else {
-                return Err("unexpected reply".into());
-            };
+            let entries = client.diff(before, after, before_hex, after_hex)?;
             print_diff(&entries);
             Ok(())
         }
@@ -926,18 +908,12 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                 return Err("unexpected reply".into());
             };
             for entry in &entries {
-                println!("fork {}  ({})  {}", entry.id, entry.mode, entry.path);
+                println!("fork {}  {}", entry.id, entry.path);
             }
             println!(
                 "{} fork(s) ready — work in them freely; `{NAME} promote <id>` keeps a winner",
                 entries.len()
             );
-            if entries.iter().any(|entry| entry.mode == "copy") {
-                println!(
-                    "note: no mount provider on this host, so these are full copies \
-                     (`{NAME} status` explains; promote works the same)"
-                );
-            }
             Ok(())
         }
         Command::Forks => {
@@ -959,9 +935,8 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     )
                 };
                 println!(
-                    "{}  {}  {}  {}  base {}{conflict}",
+                    "{}  {}  {}  base {}{conflict}",
                     entry.id,
-                    entry.mode,
                     age(entry.created_at),
                     entry.path,
                     short_hex(&entry.base)
@@ -1028,15 +1003,11 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
                     .map_or_else(|| "none".into(), |id| format!("#{id}"))
             );
             println!("unpublished:   {}", info.unpublished);
-            println!("store size:    {}", human_bytes(info.store_bytes));
             if info.mount_available {
-                println!(
-                    "mounts:        {} (forks mount, Safe Mode on)",
-                    info.mount_provider
-                );
+                println!("mounts:        {} (forks mount)", info.mount_provider);
             } else {
                 println!(
-                    "mounts:        unavailable ({}) — forks copy, Safe Mode off",
+                    "mounts:        unavailable ({}) — forks disabled",
                     info.mount_reason.as_deref().unwrap_or("unknown reason")
                 );
             }
@@ -1071,7 +1042,15 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         }
         Command::Stop => {
             client.call(proto::Op::Stop)?;
-            println!("daemon stopping");
+            let pidfile = store_paths(repo)?.pidfile();
+            let started = std::time::Instant::now();
+            while pidfile.exists() {
+                if started.elapsed() >= std::time::Duration::from_secs(30) {
+                    return Err("daemon did not finish stopping within 30 seconds".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("daemon stopped");
             Ok(())
         }
         Command::SessionStart { session_id, host } => {
@@ -1080,50 +1059,6 @@ fn execute(client: &mut Client, command: Command) -> Result<(), String> {
         }
         Command::SessionEnd { session_id } => {
             client.call(proto::Op::SessionEnd { session_id })?;
-            Ok(())
-        }
-        Command::SessionResolve { session_id } => {
-            let reply = client.call(proto::Op::SessionResolve { session_id })?;
-            let proto::Reply::SessionPending(info) = reply else {
-                return Err("unexpected reply".into());
-            };
-            if info.diff.is_empty() {
-                println!("session {}: no changes", info.session_id);
-                return Ok(());
-            }
-            for entry in &info.diff {
-                println!("{} {}", entry.change.tag(), entry.path);
-            }
-            println!(
-                "{} paths changed; run `{NAME} session-apply {}` to land them or \
-                 `{NAME} session-discard {}` to throw them away",
-                info.diff.len(),
-                info.session_id,
-                info.session_id
-            );
-            Ok(())
-        }
-        Command::SessionApply { session_id } => {
-            step_aside();
-            let reply = client.call(proto::Op::SessionApply { session_id })?;
-            let proto::Reply::Promote(info) = reply else {
-                return Err("unexpected reply".into());
-            };
-            match info.old_tree {
-                Some(old_tree) => {
-                    println!(
-                        "applied: working tree now at {}",
-                        short_hex(&info.generation)
-                    );
-                    println!("old tree kept at {old_tree}");
-                    println!("note: {}", info.warning);
-                }
-                None => println!("session had no changes; nothing to land"),
-            }
-            Ok(())
-        }
-        Command::SessionDiscard { session_id } => {
-            client.call(proto::Op::SessionDiscard { session_id })?;
             Ok(())
         }
         Command::Init
@@ -1225,7 +1160,7 @@ pub(crate) fn short_session(session_id: &str) -> String {
 }
 
 fn age(created_at: i64) -> String {
-    let delta = (acyclic_engine::unix_now() - created_at).max(0);
+    let delta = (acyclic::unix_now() - created_at).max(0);
     if delta < 60 {
         format!("{delta}s ago")
     } else if delta < 3600 {

@@ -6,8 +6,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::ipc::ClientStream;
-use acyclic_engine::product::NAME;
-use acyclic_proto as proto;
+use crate::proto;
+use acyclic::product::NAME;
 
 #[derive(Clone, Copy)]
 pub enum Spawn {
@@ -25,8 +25,11 @@ pub enum Spawn {
 pub struct Client {
     stream: BufReader<ClientStream>,
     next_id: u64,
+    call_timeout: Option<Duration>,
+    usable: bool,
 }
 
+#[derive(Debug)]
 pub enum ConnectError {
     /// No daemon and spawning was not allowed.
     NoDaemon,
@@ -44,17 +47,17 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         let started = std::time::Instant::now();
         if let Ok(stream) = ClientStream::connect(socket) {
-            acyclic_engine::trace!(
+            acyclic::trace!(
                 "client",
                 "connected to running daemon at {} in {:.1}ms",
                 crate::ipc::endpoint_display(socket),
-                acyclic_engine::trace::ms(started)
+                acyclic::trace::ms(started)
             );
             return Self::from_stream(stream);
         }
         match spawn {
             Spawn::Never => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "no daemon at {} and spawning is not allowed here",
                     crate::ipc::endpoint_display(socket)
@@ -62,7 +65,7 @@ impl Client {
                 Err(ConnectError::NoDaemon)
             }
             Spawn::Allowed | Spawn::AllowedFor(_) => {
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "no daemon at {}: spawning one",
                     crate::ipc::endpoint_display(socket)
@@ -73,10 +76,10 @@ impl Client {
                     _ => None,
                 };
                 let client = wait_for_socket(socket, child, log_path, bound);
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "daemon spawn + socket wait took {:.1}ms",
-                    acyclic_engine::trace::ms(started)
+                    acyclic::trace::ms(started)
                 );
                 client
             }
@@ -90,45 +93,135 @@ impl Client {
         Ok(Self {
             stream: BufReader::new(stream),
             next_id: 1,
+            call_timeout: None,
+            usable: true,
         })
     }
 
     /// Bounds how long a single call may wait for its reply. Used by the
     /// pre-tool hook: an exact boundary is worth milliseconds, not seconds.
     pub fn set_deadline(&mut self, deadline: std::time::Duration) {
-        let _ = self.stream.get_ref().set_read_timeout(Some(deadline));
-        let _ = self.stream.get_ref().set_write_timeout(Some(deadline));
+        self.call_timeout = Some(deadline);
     }
 
     pub fn call(&mut self, op: proto::Op) -> Result<proto::Reply, String> {
+        if !self.usable {
+            return Err("daemon connection requires reconnect after a transport failure".into());
+        }
         let id = self.next_id;
         self.next_id += 1;
         let name = format!("{op:?}");
         let name = name.split([' ', '{', '(']).next().unwrap_or("?").to_owned();
         let started = std::time::Instant::now();
-        acyclic_engine::trace!("client", "call #{id} {name}");
-        let result = self.call_inner(id, op);
+        acyclic::trace!("client", "call #{id} {name}");
+        let result = match self.call_inner(id, op) {
+            Ok(proto::Payload::Ok(reply)) => Ok(*reply),
+            Ok(proto::Payload::Err { message }) => Err(message),
+            Err(error) => {
+                self.usable = false;
+                Err(error)
+            }
+        };
         match &result {
             Ok(reply) => {
                 let reply_name = format!("{reply:?}");
                 let reply_name = reply_name.split([' ', '{', '(']).next().unwrap_or("?");
-                acyclic_engine::trace!(
+                acyclic::trace!(
                     "client",
                     "call #{id} {name} -> {reply_name} in {:.1}ms",
-                    acyclic_engine::trace::ms(started)
+                    acyclic::trace::ms(started)
                 );
             }
-            Err(message) => acyclic_engine::trace!(
+            Err(message) => acyclic::trace!(
                 "client",
                 "call #{id} {name} -> error in {:.1}ms: {}",
-                acyclic_engine::trace::ms(started),
+                acyclic::trace::ms(started),
                 message.lines().next().unwrap_or("")
             ),
         }
         result
     }
 
-    fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Reply, String> {
+    /// Take a user-requested checkpoint and wait until it has landed.
+    ///
+    /// Product consumers should use this instead of constructing the wire
+    /// operation themselves. Hook-specific checkpoint metadata remains on
+    /// [`Client::call`] until it has a real consumer-facing abstraction.
+    pub fn manual_checkpoint(
+        &mut self,
+        label: Option<String>,
+    ) -> Result<proto::CheckpointInfo, String> {
+        match self.call(proto::Op::Checkpoint {
+            kind: proto::CheckpointRequestKind::Manual,
+            session_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            label,
+            wait: true,
+            durable: false,
+        })? {
+            proto::Reply::Checkpoint(info) => Ok(info),
+            other => Err(unexpected_reply("checkpoint", &other)),
+        }
+    }
+
+    /// List checkpoints through the stable, typed client surface.
+    pub fn timeline(
+        &mut self,
+        session_id: Option<String>,
+        turn: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<proto::TimelineEntry>, String> {
+        match self.call(proto::Op::Timeline {
+            session_id,
+            turn,
+            limit,
+        })? {
+            proto::Reply::Timeline(entries) => Ok(entries),
+            other => Err(unexpected_reply("timeline", &other)),
+        }
+    }
+
+    /// Replace the working tree at a checkpoint.
+    pub fn rewind(&mut self, target: proto::RewindTarget) -> Result<proto::RewindInfo, String> {
+        match self.call(proto::Op::Rewind { target, path: None })? {
+            proto::Reply::Rewind(info) => Ok(info),
+            other => Err(unexpected_reply("rewind", &other)),
+        }
+    }
+
+    /// Restore one path while leaving the rest of the tree untouched.
+    pub fn restore(&mut self, checkpoint: i64, path: String) -> Result<proto::RestoreInfo, String> {
+        match self.call(proto::Op::Rewind {
+            target: proto::RewindTarget::Checkpoint(checkpoint),
+            path: Some(path),
+        })? {
+            proto::Reply::Restore(info) => Ok(info),
+            other => Err(unexpected_reply("restore", &other)),
+        }
+    }
+
+    /// Compute a diff using either row ids or generation prefixes.
+    pub fn diff(
+        &mut self,
+        before: Option<i64>,
+        after: Option<i64>,
+        before_hex: Option<String>,
+        after_hex: Option<String>,
+    ) -> Result<Vec<proto::DiffEntry>, String> {
+        match self.call(proto::Op::Diff {
+            before,
+            after,
+            before_hex,
+            after_hex,
+        })? {
+            proto::Reply::Diff(entries) => Ok(entries),
+            other => Err(unexpected_reply("diff", &other)),
+        }
+    }
+
+    fn call_inner(&mut self, id: u64, op: proto::Op) -> Result<proto::Payload, String> {
+        let deadline = self.call_timeout.map(|timeout| Instant::now() + timeout);
         let request = proto::Request {
             v: proto::PROTOCOL_VERSION,
             id,
@@ -136,34 +229,129 @@ impl Client {
         };
         let mut line = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
         line.push(b'\n');
-        self.stream
-            .get_mut()
-            .write_all(&line)
-            .map_err(|error| format!("send: {error}"))?;
-        let mut response_line = String::new();
-        self.stream
-            .read_line(&mut response_line)
-            .map_err(|error| format!("receive: {error}"))?;
-        // A daemon that exits mid-answer closes the socket, so the read
-        // succeeds with nothing. Left to serde that surfaced as
-        // "decode: EOF while parsing a value at line 1 column 0", which reads
-        // like corruption rather than what it is: the daemon stopped. Anyone
-        // running `stop` and then any other verb hit it.
-        parse_response(&response_line)
+
+        let mut sent = 0;
+        while sent < line.len() {
+            self.stream
+                .get_ref()
+                .set_write_timeout(remaining(deadline)?)
+                .map_err(|error| format!("send timeout: {error}"))?;
+            let count = self
+                .stream
+                .get_mut()
+                .write(line.get(sent..).ok_or("send: invalid offset")?)
+                .map_err(|error| format!("send: {error}"))?;
+            if count == 0 {
+                return Err("send: daemon closed the connection".to_owned());
+            }
+            sent += count;
+        }
+        let mut response_line = Vec::new();
+        loop {
+            self.stream
+                .get_ref()
+                .set_read_timeout(remaining(deadline)?)
+                .map_err(|error| format!("receive timeout: {error}"))?;
+            let available = self
+                .stream
+                .fill_buf()
+                .map_err(|error| format!("receive: {error}"))?;
+            if available.is_empty() {
+                return Err("daemon stopped while answering; nothing was recorded".to_owned());
+            }
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if response_line.len() + count > 64 * 1024 * 1024 {
+                return Err("receive: response exceeds 64 MiB".to_owned());
+            }
+            response_line
+                .extend_from_slice(available.get(..count).ok_or("receive: invalid offset")?);
+            self.stream.consume(count);
+            if response_line.last() == Some(&b'\n') {
+                break;
+            }
+        }
+        let response = parse_response(&response_line)?;
+        if response.id != id {
+            return Err(format!(
+                "receive: response id {} does not match request {id}",
+                response.id
+            ));
+        }
+        Ok(response.payload)
     }
 }
 
-/// One response line to a reply. Split out from the socket so the
-/// shutdown case can be tested without a daemon.
-fn parse_response(line: &str) -> Result<proto::Reply, String> {
-    if line.trim().is_empty() {
+fn parse_response(line: &[u8]) -> Result<proto::Response, String> {
+    if line.iter().all(u8::is_ascii_whitespace) {
         return Err("daemon stopped while answering; nothing was recorded".to_owned());
     }
-    let response: proto::Response =
-        serde_json::from_str(line).map_err(|error| format!("decode: {error}"))?;
-    match response.payload {
-        proto::Payload::Ok(reply) => Ok(*reply),
-        proto::Payload::Err { message } => Err(message),
+    serde_json::from_slice(line).map_err(|error| format!("decode: {error}"))
+}
+
+fn unexpected_reply(operation: &str, reply: &proto::Reply) -> String {
+    format!("{operation}: unexpected daemon reply {reply:?}")
+}
+
+fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, String> {
+    match deadline {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                Err("daemon call timed out".to_owned())
+            } else {
+                Ok(Some(left))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn call_deadline_bounds_silent_reply() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let socket = std::path::PathBuf::from(format!("call-{}-{nonce}", std::process::id()));
+        let name = crate::ipc::endpoint_display(&socket);
+        let (ready, connected) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let pipe = tokio::net::windows::named_pipe::ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&name)
+                    .expect("pipe");
+                ready.send(()).expect("ready");
+                pipe.connect().await.expect("connect");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+        });
+        connected.recv().expect("server ready");
+        let stream = ClientStream::connect(&socket).expect("client connect");
+        let mut client = Client::from_stream(stream).expect("client");
+        client.set_deadline(Duration::from_millis(30));
+        let started = Instant::now();
+        let error = client
+            .call(proto::Op::Ping)
+            .expect_err("call should time out");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(180));
+        let retry = client
+            .call(proto::Op::Ping)
+            .expect_err("connection is poisoned");
+        assert!(retry.contains("requires reconnect"), "{retry}");
+        server.join().expect("server exit");
     }
 }
 
@@ -307,25 +495,33 @@ fn wait_for_socket(
     let started = Instant::now();
     let deadline = bound.unwrap_or(Duration::from_secs(30 * 60));
     let mut reported = false;
+    let mut retry_delay = Duration::from_millis(1);
     loop {
         if let Ok(stream) = ClientStream::connect(socket) {
             if let Ok(mut client) = Client::from_stream(stream) {
-                // The daemon binds its socket before it opens the store, so
-                // a connect can succeed while the ping waits on the store
-                // open; bound the ping too so a caller with a bound never
-                // sits on it.
-                client.set_deadline(bound.unwrap_or(Duration::from_secs(60)));
-                if client.call(proto::Op::Ping).is_ok() {
-                    client.set_deadline(Duration::from_secs(24 * 60 * 60));
-                    return Ok(client);
+                // The socket can accept connections before the pipeline has
+                // completed its baseline. Ping waits for that pipeline and
+                // carries a startup error back to this caller.
+                client.set_deadline(deadline.saturating_sub(started.elapsed()));
+                match client.call(proto::Op::Ping) {
+                    Ok(_) => {
+                        client.set_deadline(Duration::from_secs(24 * 60 * 60));
+                        return Ok(client);
+                    }
+                    Err(message) if client.usable => {
+                        // A protocol error is the pipeline's completed startup
+                        // result; reconnecting cannot repair that baseline.
+                        return Err(ConnectError::Other(message));
+                    }
+                    Err(_) => {}
                 }
             }
         }
         if bound.is_some_and(|bound| started.elapsed() > bound) {
-            acyclic_engine::trace!(
+            acyclic::trace!(
                 "client",
                 "daemon still starting after {:.1}ms; not waiting",
-                acyclic_engine::trace::ms(started)
+                acyclic::trace::ms(started)
             );
             return Err(ConnectError::Starting);
         }
@@ -346,7 +542,8 @@ fn wait_for_socket(
             eprintln!("{NAME}: daemon starting (building the first snapshot of the tree)...");
             reported = true;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(retry_delay);
+        retry_delay = (retry_delay * 2).min(Duration::from_millis(25));
     }
 }
 
@@ -361,7 +558,7 @@ mod tests {
         // "decode: EOF while parsing a value at line 1 column 0" — which reads
         // as corruption. Anyone running `stop` then any other verb saw it.
         for line in ["", "\n", "   \n"] {
-            let error = parse_response(line).expect_err("empty must be an error");
+            let error = parse_response(line.as_bytes()).expect_err("empty must be an error");
             assert!(
                 error.contains("daemon stopped"),
                 "unhelpful message for {line:?}: {error}"
@@ -373,7 +570,7 @@ mod tests {
     #[test]
     fn malformed_json_still_reports_a_decode_error() {
         // Genuine corruption must stay distinguishable from a clean shutdown.
-        let error = parse_response("{not json").expect_err("must be an error");
+        let error = parse_response(b"{not json").expect_err("must be an error");
         assert!(error.starts_with("decode:"), "{error}");
     }
 
@@ -390,8 +587,11 @@ mod tests {
             },
         })
         .expect("serialize");
-        let error = parse_response(&line).expect_err("must be an error");
-        assert_eq!(error, "no such checkpoint");
+        let response = parse_response(line.as_bytes()).expect("valid response");
+        let proto::Payload::Err { message } = response.payload else {
+            panic!("expected error payload");
+        };
+        assert_eq!(message, "no such checkpoint");
     }
 
     #[test]
@@ -402,8 +602,8 @@ mod tests {
         })
         .expect("serialize");
         assert!(matches!(
-            parse_response(&line).expect("ok payload"),
-            proto::Reply::Pong
+            parse_response(line.as_bytes()).expect("ok payload").payload,
+            proto::Payload::Ok(reply) if matches!(*reply, proto::Reply::Pong)
         ));
     }
 }

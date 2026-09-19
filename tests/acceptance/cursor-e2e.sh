@@ -12,8 +12,8 @@
 #
 # Cursor's own session id (reported here as `session_id` in --output-format
 # json) is the same identifier its beforeShellExecution/afterFileEdit hooks
-# send as `conversation_id` — that's the fallback `hook::Payload::session()`
-# resolves to `session_id` for attribution (Cursor's own `sessionStart`
+# send as `conversation_id`; `hook::Payload::session()` maps that field to
+# the timeline session (Cursor's own `sessionStart`
 # event does send `session_id` directly). If Cursor ever splits these, the
 # timeline/diff assertions below will fail loudly rather than silently
 # mis-attribute.

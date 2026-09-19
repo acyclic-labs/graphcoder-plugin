@@ -7,10 +7,11 @@
 
 use std::path::Path;
 
+pub use crate::checkpoint_kind::CheckpointKind;
 use acyclic_fs::{Digest, GenerationId};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::{EngineError, Result};
+use crate::Result;
 
 /// One checkpoint row.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,58 +70,7 @@ impl CheckpointRow {
     /// `failed` rows carry the generation from BEFORE the failed capture —
     /// restoring one would claim a state the row does not represent.
     pub fn is_restorable(&self) -> bool {
-        self.kind != CheckpointKind::Failed
-    }
-}
-
-/// Why a checkpoint exists.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CheckpointKind {
-    Baseline,
-    Pre,
-    Post,
-    Manual,
-    PreRewind,
-    Recovered,
-    Failed,
-    Noop,
-    /// Taken by the idle timer, not any request: the safety net for hosts
-    /// with no lifecycle-hook API (see `Pipeline::auto_checkpoint`).
-    Auto,
-}
-
-impl CheckpointKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::Pre => "pre",
-            Self::Post => "post",
-            Self::Manual => "manual",
-            Self::PreRewind => "pre_rewind",
-            Self::Recovered => "recovered",
-            Self::Failed => "failed",
-            Self::Noop => "noop",
-            Self::Auto => "auto",
-        }
-    }
-
-    fn parse(text: &str) -> Result<Self> {
-        Ok(match text {
-            "baseline" => Self::Baseline,
-            "pre" => Self::Pre,
-            "post" => Self::Post,
-            "manual" => Self::Manual,
-            "pre_rewind" => Self::PreRewind,
-            "recovered" => Self::Recovered,
-            "failed" => Self::Failed,
-            "noop" => Self::Noop,
-            "auto" => Self::Auto,
-            other => {
-                return Err(EngineError::Store(format!(
-                    "unknown checkpoint kind {other}"
-                )))
-            }
-        })
+        self.kind.is_restorable()
     }
 }
 
@@ -198,11 +148,14 @@ impl Index {
         kind: CheckpointKind,
         attribution: &Attribution,
     ) -> Result<i64> {
-        let turn = self.effective_turn(attribution)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(session_id) = attribution.session_id.as_deref() {
-            self.ensure_session(session_id)?;
+            ensure_session_on(&transaction, session_id)?;
         }
-        self.connection.execute(
+        let turn = effective_turn_on(&transaction, attribution)?;
+        transaction.execute(
             "INSERT INTO checkpoints
                (generation, created_at, kind, session_id, tool_call_id, tool_name, label,
                 turn, rewind_target)
@@ -219,25 +172,9 @@ impl Index {
                 attribution.rewind_target,
             ],
         )?;
-        Ok(self.connection.last_insert_rowid())
-    }
-
-    /// The turn a new checkpoint belongs to: the explicit one, else the
-    /// session's latest recorded turn (hooks don't know turn numbers; the
-    /// `UserPromptSubmit` hook records them and tool hooks inherit).
-    fn effective_turn(&self, attribution: &Attribution) -> Result<Option<i64>> {
-        if attribution.turn.is_some() {
-            return Ok(attribution.turn);
-        }
-        let Some(session_id) = attribution.session_id.as_deref() else {
-            return Ok(None);
-        };
-        let turn: Option<i64> = self.connection.query_row(
-            "SELECT MAX(turn) FROM turns WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get(0),
-        )?;
-        Ok(turn)
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(id)
     }
 
     /// Records a failed capture attempt (no generation advanced: the previous
@@ -248,8 +185,14 @@ impl Index {
         error: &str,
         attribution: &Attribution,
     ) -> Result<i64> {
-        let turn = self.effective_turn(attribution)?;
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(session_id) = attribution.session_id.as_deref() {
+            ensure_session_on(&transaction, session_id)?;
+        }
+        let turn = effective_turn_on(&transaction, attribution)?;
+        transaction.execute(
             "INSERT INTO checkpoints
                (generation, created_at, kind, session_id, tool_call_id, tool_name, error, turn)
              VALUES (?1, ?2, 'failed', ?3, ?4, ?5, ?6, ?7)",
@@ -263,7 +206,9 @@ impl Index {
                 turn,
             ],
         )?;
-        Ok(self.connection.last_insert_rowid())
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(id)
     }
 
     /// Marks every checkpoint up to `through_id` as covered by an authority
@@ -307,8 +252,9 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS}
-                 FROM checkpoints WHERE kind IN ('baseline','pre','post','manual','auto')
-                 ORDER BY id DESC LIMIT 1"
+                 FROM checkpoints WHERE kind IN ({})
+                 ORDER BY id DESC LIMIT 1",
+                    CheckpointKind::TARGETS_SQL
                 ),
                 [],
                 row_to_checkpoint,
@@ -324,8 +270,9 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                     WHERE id < ?1 AND kind IN ('baseline','pre','post','manual','auto')
-                     ORDER BY id DESC LIMIT 1"
+                     WHERE id < ?1 AND kind IN ({})
+                     ORDER BY id DESC LIMIT 1",
+                    CheckpointKind::TARGETS_SQL
                 ),
                 params![id],
                 row_to_checkpoint,
@@ -427,8 +374,9 @@ impl Index {
             .query_row(
                 &format!(
                     "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                     WHERE session_id = ?1 AND kind IN ('baseline','pre','post','manual','auto')
-                     ORDER BY id DESC LIMIT 1"
+                     WHERE session_id = ?1 AND kind IN ({})
+                     ORDER BY id DESC LIMIT 1",
+                    CheckpointKind::TARGETS_SQL
                 ),
                 params![session_id],
                 row_to_checkpoint,
@@ -456,8 +404,9 @@ impl Index {
     pub fn between(&self, after_id: i64, before_id: i64) -> Result<Vec<CheckpointRow>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-             WHERE id > ?1 AND id < ?2 AND kind IN ('baseline','pre','post','manual','auto')
-             ORDER BY id ASC"
+             WHERE id > ?1 AND id < ?2 AND kind IN ({})
+             ORDER BY id ASC",
+            CheckpointKind::TARGETS_SQL
         ))?;
         let rows = statement.query_map(params![after_id, before_id], row_to_checkpoint)?;
         rows.map(|row| row.map_err(Into::into)).collect()
@@ -466,16 +415,20 @@ impl Index {
     /// Records the start of a conversation turn; returns its 1-based number.
     /// The prompt is truncated to an excerpt on a char boundary.
     pub fn turn_started(&mut self, session_id: &str, prompt: &str) -> Result<i64> {
-        self.ensure_session(session_id)?;
-        let next: i64 = self.connection.query_row(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_session_on(&transaction, session_id)?;
+        let next: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(turn), 0) + 1 FROM turns WHERE session_id = ?1",
             params![session_id],
             |row| row.get(0),
         )?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO turns(session_id, turn, started_at, prompt) VALUES (?1, ?2, ?3, ?4)",
             params![session_id, next, now(), excerpt(prompt)],
         )?;
+        transaction.commit()?;
         Ok(next)
     }
 
@@ -566,19 +519,6 @@ impl Index {
         Ok(())
     }
 
-    /// A turn or checkpoint for a session the daemon never saw start (its
-    /// `SessionStart` hook fired while the daemon was down) still gets a
-    /// session row, so `sessions`, `diff --turn`, and `brief` can find it.
-    /// The host is unknown at this point; a later `session_started` is
-    /// ignored by the primary key, so the row keeps its earliest start.
-    fn ensure_session(&mut self, session_id: &str) -> Result<()> {
-        self.connection.execute(
-            "INSERT OR IGNORE INTO sessions(session_id, host, started_at) VALUES (?1, NULL, ?2)",
-            params![session_id, now()],
-        )?;
-        Ok(())
-    }
-
     pub fn session_ended(&mut self, session_id: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE sessions SET ended_at = ?2 WHERE session_id = ?1",
@@ -586,6 +526,35 @@ impl Index {
         )?;
         Ok(())
     }
+}
+
+fn ensure_session_on(connection: &Connection, session_id: &str) -> Result<()> {
+    // A turn or checkpoint for a session whose SessionStart hook was missed
+    // still needs a discoverable session row. A later session_started call
+    // fills in its host without replacing this earlier start time.
+    connection.execute(
+        "INSERT OR IGNORE INTO sessions(session_id, host, started_at) VALUES (?1, NULL, ?2)",
+        params![session_id, now()],
+    )?;
+    Ok(())
+}
+
+/// Use an explicit turn when supplied; otherwise inherit the session's most
+/// recent turn. Checkpoint insertion and this lookup share one write transaction.
+fn effective_turn_on(connection: &Connection, attribution: &Attribution) -> Result<Option<i64>> {
+    if attribution.turn.is_some() {
+        return Ok(attribution.turn);
+    }
+    let Some(session_id) = attribution.session_id.as_deref() else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT MAX(turn) FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
@@ -606,7 +575,9 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow>
         id: row.get(0)?,
         generation: GenerationId::new(Digest::from_bytes(bytes)),
         created_at: row.get(2)?,
-        kind: CheckpointKind::parse(&kind_text).map_err(|error| corrupt(&error.to_string()))?,
+        kind: kind_text
+            .parse::<CheckpointKind>()
+            .map_err(|error| corrupt(&error.to_string()))?,
         published: row.get::<_, i64>(4)? != 0,
         session_id: row.get(5)?,
         tool_call_id: row.get(6)?,
@@ -695,9 +666,19 @@ fn ensure_auto_kind_allowed(connection: &Connection) -> Result<()> {
     if sql.contains("'auto'") {
         return Ok(());
     }
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         ALTER TABLE checkpoints RENAME TO checkpoints_pre_auto;
+    let saved_schema = connection
+        .prepare(
+            "SELECT type, sql FROM sqlite_master
+             WHERE tbl_name = 'checkpoints' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+             ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE checkpoints RENAME TO checkpoints_pre_auto;
          CREATE TABLE checkpoints(
             id INTEGER PRIMARY KEY,
             generation BLOB NOT NULL,
@@ -719,25 +700,60 @@ fn ensure_auto_kind_allowed(connection: &Connection) -> Result<()> {
                 tool_name, label, error, turn, rewind_target
          FROM checkpoints_pre_auto;
          DROP TABLE checkpoints_pre_auto;
-         CREATE INDEX IF NOT EXISTS checkpoints_by_generation ON checkpoints(generation);
-         CREATE INDEX IF NOT EXISTS checkpoints_by_session ON checkpoints(session_id, id);
-         COMMIT;",
+        ",
     )?;
+    for (_, definition) in saved_schema {
+        transaction.execute_batch(&definition)?;
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS checkpoints_by_generation ON checkpoints(generation);
+         CREATE INDEX IF NOT EXISTS checkpoints_by_session ON checkpoints(session_id, id);",
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
 /// Bounded, single-line prompt excerpt: whitespace runs collapsed, cut on a
 /// char boundary at [`PROMPT_EXCERPT_BYTES`] with an ellipsis.
+///
+/// The original prompt is scanned only until the excerpt fills.
 pub fn excerpt(prompt: &str) -> String {
-    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= PROMPT_EXCERPT_BYTES {
-        return collapsed;
+    let mut collapsed = String::with_capacity(PROMPT_EXCERPT_BYTES);
+    let mut words = prompt.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        let separator = usize::from(!collapsed.is_empty());
+        let remaining = PROMPT_EXCERPT_BYTES.saturating_sub(collapsed.len() + separator);
+        if word.len() > remaining {
+            let target = PROMPT_EXCERPT_BYTES - 1;
+            if separator != 0 && collapsed.len() < target {
+                collapsed.push(' ');
+            }
+            if word.len() >= target.saturating_sub(collapsed.len()) {
+                for character in word.chars() {
+                    if collapsed.len() + character.len_utf8() > target {
+                        break;
+                    }
+                    collapsed.push(character);
+                }
+            } else {
+                collapsed.push_str(word);
+            }
+            collapsed.push('…');
+            return collapsed;
+        }
+        if separator != 0 {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+        if collapsed.len() == PROMPT_EXCERPT_BYTES && words.peek().is_some() {
+            if let Some((index, _)) = collapsed.char_indices().next_back() {
+                collapsed.truncate(index);
+            }
+            collapsed.push('…');
+            return collapsed;
+        }
     }
-    let mut cut = PROMPT_EXCERPT_BYTES - 1;
-    while !collapsed.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", collapsed.get(..cut).unwrap_or(&collapsed))
+    collapsed
 }
 
 fn now() -> i64 {
@@ -884,6 +900,48 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_turn_writers_get_distinct_numbers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.db");
+        let mut first = Index::open(&path).expect("first index");
+        let mut second = Index::open(&path).expect("second index");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = barrier.clone();
+        let other = std::thread::spawn(move || {
+            other_barrier.wait();
+            second.turn_started("shared", "second")
+        });
+        barrier.wait();
+        let first_turn = first.turn_started("shared", "first").expect("first turn");
+        let second_turn = other.join().expect("writer thread").expect("second turn");
+        assert_ne!(first_turn, second_turn);
+        assert_eq!(first.turns(Some("shared")).expect("turns").len(), 2);
+    }
+
+    #[test]
+    fn failed_capture_backfills_its_session_and_inherits_the_latest_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut index = Index::open(&dir.path().join("index.db")).expect("open");
+        let attribution = Attribution {
+            session_id: Some("missed-start".into()),
+            ..Attribution::default()
+        };
+        let first = index
+            .record_failure(generation(1), "capture failed", &attribution)
+            .expect("first failed capture");
+        assert_eq!(index.by_id(first).expect("query").expect("row").turn, None);
+        assert_eq!(index.sessions(10).expect("sessions").len(), 1);
+        index.turn_started("missed-start", "retry").expect("turn");
+        let second = index
+            .record_failure(generation(1), "capture failed again", &attribution)
+            .expect("second failed capture");
+        assert_eq!(
+            index.by_id(second).expect("query").expect("row").turn,
+            Some(1)
+        );
+    }
+
+    #[test]
     fn turns_link_checkpoints_and_resolve_both_ways() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut index = Index::open(&dir.path().join("index.db")).expect("open");
@@ -1015,6 +1073,45 @@ mod tests {
         assert!(cut.len() <= PROMPT_EXCERPT_BYTES + "…".len());
         assert!(cut.ends_with('…'));
         assert_eq!(excerpt("a  b\n\tc"), "a b c");
+        let exact = "x".repeat(PROMPT_EXCERPT_BYTES);
+        assert_eq!(excerpt(&exact), exact);
+        assert_eq!(
+            excerpt(&format!("{exact} tail")),
+            format!("{}…", "x".repeat(PROMPT_EXCERPT_BYTES - 1))
+        );
+        let boundary = format!("{} é", "x".repeat(PROMPT_EXCERPT_BYTES - 2));
+        assert_eq!(
+            excerpt(&boundary),
+            format!("{} …", "x".repeat(PROMPT_EXCERPT_BYTES - 2))
+        );
+    }
+
+    #[test]
+    fn excerpt_matches_the_full_normalization_model() {
+        fn full(prompt: &str) -> String {
+            let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.len() <= PROMPT_EXCERPT_BYTES {
+                return collapsed;
+            }
+            let mut cut = PROMPT_EXCERPT_BYTES - 1;
+            while !collapsed.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}…", collapsed.get(..cut).expect("character boundary"))
+        }
+
+        let atoms = ["a", " ", "\n", "é", "☃", "𐍈", " ", "xyz"];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..1_000 {
+            let mut prompt = String::new();
+            for _ in 0..400 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                prompt.push_str(atoms[(state as usize) % atoms.len()]);
+            }
+            assert_eq!(excerpt(&prompt), full(&prompt));
+        }
     }
 
     #[test]
@@ -1031,7 +1128,9 @@ mod tests {
                         published INTEGER NOT NULL DEFAULT 0, session_id TEXT,
                         tool_call_id TEXT, tool_name TEXT, label TEXT, error TEXT);
                      INSERT INTO checkpoints(generation, created_at, kind)
-                        VALUES (zeroblob(32), 1, 'post');",
+                        VALUES (zeroblob(32), 1, 'post');
+                     CREATE INDEX checkpoints_by_generation ON checkpoints(generation);
+                     CREATE INDEX checkpoints_by_session ON checkpoints(session_id, id);",
                 )
                 .expect("seed");
         }
@@ -1062,7 +1161,11 @@ mod tests {
                         tool_call_id TEXT, tool_name TEXT, label TEXT, error TEXT,
                         turn INTEGER, rewind_target INTEGER);
                      INSERT INTO checkpoints(generation, created_at, kind)
-                        VALUES (zeroblob(32), 1, 'post');",
+                        VALUES (zeroblob(32), 1, 'post');
+                     CREATE TABLE checkpoint_audit(inserted INTEGER NOT NULL);
+                     CREATE INDEX custom_post_idx ON checkpoints(created_at) WHERE kind = 'post';
+                     CREATE TRIGGER audit_checkpoint_insert AFTER INSERT ON checkpoints
+                       BEGIN INSERT INTO checkpoint_audit(inserted) VALUES (NEW.id); END;",
                 )
                 .expect("seed");
         }
@@ -1078,5 +1181,25 @@ mod tests {
             .expect("auto checkpoint should now be a valid kind");
         let row = index.by_id(row_id).expect("q").expect("row");
         assert_eq!(row.kind, CheckpointKind::Auto);
+        let indexes: Vec<String> = index
+            .connection
+            .prepare("PRAGMA index_list(checkpoints)")
+            .expect("prepare index list")
+            .query_map([], |row| row.get(1))
+            .expect("index list")
+            .collect::<rusqlite::Result<_>>()
+            .expect("index names");
+        assert!(indexes
+            .iter()
+            .any(|name| name == "checkpoints_by_generation"));
+        assert!(indexes.iter().any(|name| name == "checkpoints_by_session"));
+        assert!(indexes.iter().any(|name| name == "custom_post_idx"));
+        let audit_id: i64 = index
+            .connection
+            .query_row("SELECT inserted FROM checkpoint_audit", [], |row| {
+                row.get(0)
+            })
+            .expect("custom trigger fired after migration");
+        assert_eq!(audit_id, row_id);
     }
 }

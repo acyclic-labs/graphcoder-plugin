@@ -25,7 +25,6 @@ Each launch is one engine increment plus one coherent story, ordered by dependen
 | 1 | Rewind | Merkle snapshot store + host hooks | Never fear letting the agent loose | [01-rewind.md](01-rewind.md) |
 | 2 | Timeline | Turn-linked metadata index | The repo at any point in the conversation | [02-timeline.md](02-timeline.md) |
 | 3 | Forks | Copy-on-write materialization | N parallel attempts, pick the winner | [03-forks.md](03-forks.md) |
-| 4 | Safe Mode | Session redirection + write interposition | Agents on the codebase, not agents' mistakes in it | [04-safe-mode.md](04-safe-mode.md) |
 | 5 | Monorepo | Merkle-aware content + symbol index | The repo that finally works with agents | [05-monorepo.md](05-monorepo.md) |
 
 Cross-cutting, not a launch: **[Speculation](08-speculation.md)** — the daemon computes what the agent is about to ask for (the session brief, a turn summary) in the time when nobody is waiting. Off by default.
@@ -33,7 +32,6 @@ Cross-cutting, not a launch: **[Speculation](08-speculation.md)** — the daemon
 Sequencing rationale:
 
 - Launches 1–2 ship on the cheap engine (hooks + snapshot store) without committing to how forks work. The hard CoW decision only becomes due at Launch 3.
-- Launch 4 depends on Launch 3's fork engine (dry-run and scratch trees are fork features).
 - Launch 5 is dependency-independent (separate index engine) — pull it forward if monorepo teams become the target buyer.
 
 ## The load-bearing decision
@@ -45,14 +43,13 @@ Second load-bearing constraint, from compliance: **purge-through-history and sna
 ## Strategic risks (from the design review)
 
 1. **Launch 1 collides with native host features.** Claude Code ships its own checkpoint/rewind. Differentiation must be the headline, not fine print: we capture what Bash did (installs, migrations, generated files), untracked/gitignored state, cross-session persistence, cross-host consistency — and checkpoints become forks. Expect hosts to keep commoditizing the basic rewind; the moat is the Merkle/CoW engine and Launches 3/5.
-2. **Unverified host-API assumptions** — validate before public promises: (a) transparent tool interception for indexed search (hook rewrite limits differ per host); (b) session redirection for dry-run (path display, git status confusion); (c) checkpoint alignment in hosts without lifecycle hooks.
+2. **Unverified host-API assumptions** — validate before public promises: (a) transparent tool interception for indexed search (hook rewrite limits differ per host); (b) checkpoint alignment in hosts without lifecycle hooks.
 3. **Naming**: repo is `graphcoder-plugin`, CLI is `acyclic`, and Graphcoder is a different product on the roadmap. Resolve before launch.
 
 ## Settled since this was written
 
-1. **Fork engine mechanism** — decided the opposite way to the lean recorded here. Mounts shipped; there is no reflink or `clonefile` path in the codebase, and the fallback when no mount provider is available is a **full copy**, not a reflink. Forks are routes inside one kernel mount rather than N mounts. See `implementation-forks.md`.
+1. **Fork engine mechanism** — mounts shipped. Forks require the native provider and are routes inside one kernel mount rather than N mounts. See `implementation-forks.md`.
 2. **Checkpoint alignment in hosts without lifecycle hooks** — resolved by the MCP adapter plus the `auto_checkpoint_idle_ms` timer. MCP is a second adapter shape this doc's thesis line does not yet mention.
-3. **Session redirection for dry-run** — built and tested as Safe Mode, mount-only.
 
 ## Open questions (not yet settled)
 
@@ -61,5 +58,4 @@ Second load-bearing constraint, from compliance: **purge-through-history and sna
 3. **Naming**: repo is `graphcoder-plugin`, CLI is `acyclic`, and Graphcoder is a different product on the roadmap. Still unresolved.
 4. **Repo visibility** — this repo is private while its `acyclic-fs` dependency is public, which blocks the curl installer, the attestations, and the open-source claim. Carried in `06-installation.md` and `07-compliance.md`; it belongs at overview level because it gates positioning, not just packaging.
 5. **The upstream retention dependency.** GC, purge and enforced retention all wait on an `acyclic-fs` retention-release fact that does not exist. This is the single largest gap between the compliance story and the code, and it is not ours to close.
-6. **Degrade or refuse without a mount provider.** Forks silently fall back to full copies; Safe Mode refuses to start. A repo with `dry_run = true` checked in therefore runs against the real tree on a host without mounts. Which of those two behaviours is right has never been decided as a policy.
 7. **What remains unvalidated at scale.** Store performance on a real 10GB tree is still the first thing to validate, as it was when this doc was written. The latency gate runs 20k files / 256 MB, and `init` baseline capture runs ~230 s/GiB.

@@ -8,7 +8,61 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub use acyclic::diff::ChangeKind;
+pub use acyclic::index::CheckpointKind;
+pub use acyclic::rewind::RestoreAction;
+
+#[cfg(test)]
+mod domain_wire_tests {
+    use super::{ChangeKind, CheckpointKind, RestoreAction};
+
+    #[test]
+    fn domain_enums_preserve_version_one_wire_names() {
+        let checkpoint_kinds = [
+            (CheckpointKind::Baseline, "baseline"),
+            (CheckpointKind::Pre, "pre"),
+            (CheckpointKind::Post, "post"),
+            (CheckpointKind::Manual, "manual"),
+            (CheckpointKind::PreRewind, "pre_rewind"),
+            (CheckpointKind::Recovered, "recovered"),
+            (CheckpointKind::Failed, "failed"),
+            (CheckpointKind::Noop, "noop"),
+            (CheckpointKind::Auto, "auto"),
+        ];
+        for (kind, name) in checkpoint_kinds {
+            let encoded = serde_json::to_string(&kind).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<CheckpointKind>(&encoded).unwrap(),
+                kind
+            );
+        }
+        let changes = [
+            (ChangeKind::Added, "added"),
+            (ChangeKind::Removed, "removed"),
+            (ChangeKind::Modified, "modified"),
+            (ChangeKind::MetadataOnly, "metadata"),
+        ];
+        for (kind, name) in changes {
+            let encoded = serde_json::to_string(&kind).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<ChangeKind>(&encoded).unwrap(), kind);
+        }
+        for (action, name) in [
+            (RestoreAction::Restored, "restored"),
+            (RestoreAction::Removed, "removed"),
+        ] {
+            let encoded = serde_json::to_string(&action).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<RestoreAction>(&encoded).unwrap(),
+                action
+            );
+        }
+    }
+}
+
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The kinds a client may ask for. Bookkeeping kinds (`baseline`,
 /// `noop`, `auto`, ...) exist only on replies: the daemon decides those.
@@ -46,93 +100,6 @@ impl FromStr for CheckpointRequestKind {
 }
 
 impl fmt::Display for CheckpointRequestKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(self.as_str())
-    }
-}
-
-/// Why a checkpoint row exists, as the timeline reports it. Mirrors the
-/// engine's `index::CheckpointKind`; the daemon converts between them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointKind {
-    Baseline,
-    Pre,
-    Post,
-    Manual,
-    PreRewind,
-    Recovered,
-    Failed,
-    Noop,
-    Auto,
-}
-
-impl CheckpointKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::Pre => "pre",
-            Self::Post => "post",
-            Self::Manual => "manual",
-            Self::PreRewind => "pre_rewind",
-            Self::Recovered => "recovered",
-            Self::Failed => "failed",
-            Self::Noop => "noop",
-            Self::Auto => "auto",
-        }
-    }
-}
-
-impl fmt::Display for CheckpointKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(self.as_str())
-    }
-}
-
-/// What a single-path restore did to the path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RestoreAction {
-    /// The path now has the checkpoint's contents.
-    Restored,
-    /// The path was absent at the checkpoint, so it was removed.
-    Removed,
-}
-
-/// How a path differs between two checkpoints.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeKind {
-    Added,
-    Removed,
-    Modified,
-    /// Mode or other metadata only; contents are identical.
-    Metadata,
-}
-
-impl ChangeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-            Self::Modified => "modified",
-            Self::Metadata => "metadata",
-        }
-    }
-
-    /// The one-letter tag `diff` listings use: A / D / M, and `m` for
-    /// metadata-only, so real blast radius stands out from noise.
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Added => "A",
-            Self::Removed => "D",
-            Self::Modified => "M",
-            Self::Metadata => "m",
-        }
-    }
-}
-
-impl fmt::Display for ChangeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(self.as_str())
     }
@@ -272,26 +239,6 @@ pub enum Op {
         #[serde(rename = "fork")]
         id: String,
     },
-    /// Safe Mode: forks one checkout and mounts it directly at the repo
-    /// root for the session's duration (see `dry_run` in `.acyclic/config.toml`).
-    SessionFork {
-        session_id: String,
-    },
-    /// Safe Mode: unmounts the session's shadow mount, commits its overlay,
-    /// and returns the resulting diff without touching the real tree yet.
-    /// The fork is held pending `SessionApply`/`SessionDiscard`.
-    SessionResolve {
-        session_id: String,
-    },
-    /// Safe Mode: applies a `SessionResolve`d session's changes to the real
-    /// tree (the deferred half of promote).
-    SessionApply {
-        session_id: String,
-    },
-    /// Safe Mode: discards a `SessionResolve`d session without applying it.
-    SessionDiscard {
-        session_id: String,
-    },
 }
 
 fn default_fork_count() -> u32 {
@@ -346,8 +293,6 @@ pub enum Reply {
     Summary(SummaryInfo),
     Forks(Vec<ForkEntry>),
     Promote(PromoteInfo),
-    /// A `SessionResolve`d session awaiting `SessionApply`/`SessionDiscard`.
-    SessionPending(SessionPendingInfo),
 }
 
 /// One turn's summary, and where it came from.
@@ -369,18 +314,9 @@ pub struct SummaryInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SessionPendingInfo {
-    pub session_id: String,
-    pub diff: Vec<DiffEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ForkEntry {
     pub id: String,
     pub path: String,
-    /// "mount" (routed native mount) or "copy" (materialized directory).
-    #[serde(default = "default_fork_mode")]
-    pub mode: String,
     /// Hex of the published generation the fork was cut from.
     pub base: String,
     pub created_at: i64,
@@ -450,9 +386,8 @@ pub struct StatusInfo {
     pub state: String,
     pub last_checkpoint: Option<i64>,
     pub unpublished: u64,
-    pub store_bytes: u64,
     pub repo_root: String,
-    /// Mount provider this daemon would use for forks and Safe Mode.
+    /// Mount provider this daemon would use for forks.
     #[serde(default)]
     pub mount_provider: String,
     #[serde(default)]
@@ -648,8 +583,4 @@ pub struct DiffEntry {
     /// shown, since rewind restores it, but not blast radius.
     #[serde(default)]
     pub ignored: bool,
-}
-
-fn default_fork_mode() -> String {
-    "mount".to_owned()
 }

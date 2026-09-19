@@ -14,13 +14,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use acyclic_engine::config::Config;
-use acyclic_engine::fork::{PromoteOutcome, SessionResolveOutcome};
-use acyclic_engine::index::{Attribution, CheckpointKind, Index};
-use acyclic_engine::pipeline::{self, PipelineHandle};
-use acyclic_engine::store::{Store, StorePaths};
-use acyclic_fs::kernel::{LogicalName, NamespacePath};
-use acyclic_fs::model::VolumeLimits;
+use acyclic::config::Config;
+use acyclic::fork::PromoteOutcome;
+use acyclic::index::{Attribution, CheckpointKind, Index};
+use acyclic::pipeline::{self, PipelineHandle, State};
+use acyclic::store::{Store, StorePaths};
+use acyclic_fs::kernel::NamespacePath;
 use acyclic_fs::{CancellationToken, WorkCounters};
 
 fn fast_config() -> Config {
@@ -85,37 +84,47 @@ impl Rig {
 /// Built in the host's encoding rather than as a portable path: these names
 /// stand in for what the mount layer writes, and a diff decodes them with
 /// the same encoding on the way back out.
-fn namespace(path: &str) -> NamespacePath {
-    let limits = VolumeLimits::default();
-    let names = path
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            LogicalName::new(
-                acyclic_engine::names::encoding(),
-                acyclic_engine::names::str_to_bytes(part),
-                limits.maximum_component_bytes,
-            )
-            .expect("name")
-        })
-        .collect();
-    NamespacePath::new(names, limits).expect("namespace path")
+fn namespace(path: &str, config: acyclic_fs::model::VolumeConfig) -> NamespacePath {
+    acyclic_fs::host_path_to_namespace(
+        Path::new(path.trim_start_matches('/')),
+        config.profile,
+        config.limits,
+    )
+    .expect("namespace path")
 }
 
 /// Writes into a fork's overlay exactly as a mount callback would: through
 /// the shared checkout.
-async fn write_in_fork(seed: &acyclic_engine::fork::ForkSeed, path: &str, bytes: &[u8]) {
+async fn write_in_fork(seed: &acyclic::fork::ForkSeed, path: &str, bytes: &[u8]) {
     let cancel = CancellationToken::new();
     let mut guard = seed.shared.lock().await;
+    let config = guard.volume_config();
     guard
         .create_file(
-            namespace(path),
+            namespace(path, config),
             bytes::Bytes::copy_from_slice(bytes),
             WorkCounters::UNBOUNDED,
             &cancel,
         )
         .await
         .expect("create file in fork overlay");
+}
+
+fn assert_watcher_recovers_after_swap(rig: &Rig) {
+    rig.runtime.block_on(async {
+        rig.handle
+            .checkpoint(CheckpointKind::Post, Attribution::default())
+            .await
+            .expect("checkpoint after root swap");
+        let status = rig.handle.status().await.expect("status after root swap");
+        assert_eq!(status.state, State::Ready, "{status:?}");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(status.watcher.invalidations, 0, "{status:?}");
+        // FSEvents can replay a root move after the new watcher opens. A
+        // bounded recovery scan is safe; discarding that hint is not.
+        #[cfg(target_os = "macos")]
+        assert!(status.watcher.invalidations <= 1, "{status:?}");
+    });
 }
 
 /// P1 + P5: promote lands the fork's exact content and records attribution.
@@ -162,74 +171,7 @@ fn promote_lands_fork_changes() {
     assert!(rows.iter().any(|row| {
         row.kind == CheckpointKind::Manual && row.label.as_deref() == Some("promote test-fork")
     }));
-    rig.finish();
-}
-
-/// Safe Mode: `resolve_session` + `apply_session` together must land a fork's
-/// changes identically to promote's single-shot version.
-#[test]
-fn resolve_then_apply_session_lands_fork_changes() {
-    let rig = Rig::start();
-    let (diffable_base, outcome) = rig.runtime.block_on(async {
-        let seed = rig.handle.fork().await.expect("fork");
-        write_in_fork(&seed, "/fork-note.txt", b"written in fork\n").await;
-        let resolved = rig
-            .handle
-            .resolve_session(
-                Arc::clone(&seed.shared),
-                seed.base,
-                "safe-mode session".into(),
-            )
-            .await
-            .expect("resolve_session");
-        let SessionResolveOutcome::Resolved { generation } = resolved else {
-            panic!("expected Resolved, got {resolved:?}");
-        };
-        let diff = rig.handle.diff(seed.base, generation).await.expect("diff");
-        let outcome = rig
-            .handle
-            .apply_session(generation, seed.base, "safe-mode session".into())
-            .await
-            .expect("apply_session");
-        (diff, outcome)
-    });
-
-    // The pre-apply diff already shows the new file, before anything landed.
-    assert!(diffable_base
-        .iter()
-        .any(|change| change.path == Path::new("fork-note.txt")));
-
-    let PromoteOutcome::Promoted { old_tree, .. } = outcome else {
-        panic!("expected Promoted, got {outcome:?}");
-    };
-    assert!(old_tree.is_some(), "a real change must swap the tree");
-    assert_eq!(
-        std::fs::read(rig.repo_path().join("fork-note.txt")).expect("landed file"),
-        b"written in fork\n"
-    );
-    rig.finish();
-}
-
-/// Safe Mode: discarding a resolved session (never calling `apply_session`)
-/// must leave the real tree completely untouched.
-#[test]
-fn resolved_session_left_unapplied_leaves_zero_trace() {
-    let rig = Rig::start();
-    rig.runtime.block_on(async {
-        let seed = rig.handle.fork().await.expect("fork");
-        write_in_fork(&seed, "/fork-note.txt", b"written in fork\n").await;
-        let resolved = rig
-            .handle
-            .resolve_session(
-                Arc::clone(&seed.shared),
-                seed.base,
-                "safe-mode session".into(),
-            )
-            .await
-            .expect("resolve_session");
-        assert!(matches!(resolved, SessionResolveOutcome::Resolved { .. }));
-    });
-    assert!(!rig.repo_path().join("fork-note.txt").exists());
+    assert_watcher_recovers_after_swap(&rig);
     rig.finish();
 }
 

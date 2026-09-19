@@ -3,8 +3,8 @@
 Ships `03-forks.md`: N-way local forks, pick the winner. Built on fs's native
 mounts — the resolution of the plan's open CoW question is **mounts, not
 reflinks**: fs now ships qualified FUSE-T/FUSE/ProjFS drivers and the mount
-path is the strategic asset (lazy hydration, Launch 4's filesystem-level
-enforcement). Reflinks remain a fallback if mount UX disappoints.
+path is the strategic asset (lazy hydration and filesystem-level guarded-path
+enforcement). A native mount provider is required.
 
 ## How a fork works (the fs wiring, verified against fsd's usage)
 

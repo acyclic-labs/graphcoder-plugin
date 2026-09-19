@@ -23,12 +23,9 @@ The fork engine. The headline demo launch.
 This section previously read as a forward plan. Launch 3 shipped; what follows
 is what exists, including where it diverged from the plan.
 
-- **Copy-on-write materialization** — decided as **mounts**, the opposite of the
-  lean this doc recorded. There is no reflink or `clonefile` path in the
-  codebase. All forks are routes inside **one** kernel mount, not N mounts.
-  Without a mount provider every fork is a **full copy**, so the O(1) claim holds
-  in mount mode only — the degraded path is keyed on mount availability, not on
-  filesystem reflink support.
+- **Copy-on-write materialization** — implemented as native mounts. There is no
+  reflink, `clonefile`, or full-copy path. All forks are routes inside one
+  kernel mount, and a supported native mount provider is required.
 - **Fork workspace management** — partially. Teardown and placement exist;
   per-fork port allocation and env provisioning were dropped as out of scope.
 - **Subagent orchestration wiring** — shipped, but as a prompt-level skill and a

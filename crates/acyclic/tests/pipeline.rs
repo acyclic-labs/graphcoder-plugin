@@ -11,11 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use acyclic_engine::config::Config;
-use acyclic_engine::diff::{self, ChangeKind};
-use acyclic_engine::index::{Attribution, CheckpointKind, Index};
-use acyclic_engine::pipeline;
-use acyclic_engine::store::{Store, StorePaths};
+use acyclic::config::Config;
+use acyclic::diff::{self, ChangeKind};
+use acyclic::index::{Attribution, CheckpointKind, Index};
+use acyclic::pipeline;
+use acyclic::store::{Store, StorePaths};
 
 fn read_only_index(path: &Path) -> Index {
     Index::open(path).expect("open index")
@@ -31,6 +31,69 @@ fn fast_config() -> Config {
         store_dir: None,
         ..Config::default()
     }
+}
+
+#[test]
+fn native_startup_failure_is_deferred_until_filesystem_demand() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    std::fs::remove_dir(repo.path()).expect("remove empty repo before watcher opens");
+    let (handle, thread) = pipeline::spawn(store, index, fast_config());
+
+    let status = runtime
+        .block_on(handle.status())
+        .expect("metadata-only startup remains available");
+    assert_eq!(status.state, pipeline::State::NeedsBaseline);
+    let error = runtime
+        .block_on(handle.checkpoint(CheckpointKind::Manual, Attribution::default()))
+        .expect_err("filesystem demand must fail");
+    assert!(error.to_string().contains("root identity"));
+    runtime.block_on(handle.shutdown()).expect("shutdown");
+    thread.join().expect("pipeline thread");
+}
+
+/// Starting the daemon and polling metadata must stay constant in repository
+/// size. Even an enabled idle timer cannot authenticate content before a real
+/// content operation asks for it.
+#[test]
+fn idle_metadata_traffic_never_establishes_the_baseline() {
+    let repo = tempfile::tempdir().expect("repo");
+    let stores = tempfile::tempdir().expect("stores");
+    std::fs::write(repo.path().join("a.txt"), b"one\n").expect("seed");
+
+    let paths = StorePaths::for_repo(repo.path(), Some(stores.path())).expect("paths");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let store = runtime
+        .block_on(Store::init(repo.path(), paths.clone()))
+        .expect("init store");
+    let index = Index::open(&paths.index_db()).expect("index");
+    let config = Config {
+        auto_checkpoint_idle_ms: 20,
+        ..fast_config()
+    };
+    let (handle, thread) = pipeline::spawn(store, index, config);
+
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+        while tokio::time::Instant::now() < deadline {
+            let status = handle.status().await.expect("status");
+            assert_eq!(status.state, pipeline::State::NeedsBaseline);
+            assert_eq!(status.last_checkpoint, None);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.shutdown().await.expect("shutdown");
+    });
+    thread.join().expect("pipeline thread");
+    assert!(read_only_index(&paths.index_db())
+        .latest()
+        .expect("query")
+        .is_none());
 }
 
 #[test]
@@ -106,15 +169,25 @@ fn checkpoint_rewind_journey() {
         );
 
         // Diff before → after names exactly the changed paths.
+        handle
+            .checkpoint(CheckpointKind::Post, Attribution::default())
+            .await
+            .expect("checkpoint after rewind");
         let status = handle.status().await.expect("status");
         assert_eq!(status.state, pipeline::State::Ready);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(status.watcher.invalidations, 0, "{status:?}");
+        #[cfg(target_os = "macos")]
+        assert!(status.watcher.invalidations <= 1, "{status:?}");
         handle.shutdown().await.expect("shutdown");
         (before.generation, after.generation)
     });
     thread.join().expect("pipeline thread");
 
     // Diff runs against the reopened store (no daemon needed).
-    let store = runtime.block_on(Store::open(paths)).expect("reopen");
+    let store = runtime
+        .block_on(Store::open(repo.path(), paths))
+        .expect("reopen");
     let changes = runtime
         .block_on(diff::diff(&store, pre_generation, post_generation))
         .expect("diff");
@@ -129,9 +202,8 @@ fn checkpoint_rewind_journey() {
     assert!(by_name.contains(&(PathBuf::from(".env"), ChangeKind::Removed)));
 }
 
-/// The safety net for hosts with no lifecycle-hook API (Claude Desktop over
-/// MCP): an edit with no `handle.checkpoint()` call at all still gets
-/// checkpointed once the idle timer fires.
+/// Once a consumer establishes the authenticated baseline, the safety net for
+/// hosts with no lifecycle-hook API still checkpoints later unannounced edits.
 #[test]
 fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
     let repo = tempfile::tempdir().expect("repo");
@@ -157,10 +229,13 @@ fn idle_timer_auto_checkpoints_changes_no_host_asked_for() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        // A round trip first, so baseline capture is guaranteed done before
-        // the edit — otherwise the edit can race into the baseline itself
-        // and leave nothing pending for the idle timer to find.
-        let baseline_row = handle.status().await.expect("status").last_checkpoint;
+        let baseline_row = Some(
+            handle
+                .checkpoint(CheckpointKind::Baseline, Attribution::default())
+                .await
+                .expect("baseline")
+                .row_id,
+        );
 
         // No hook, no explicit checkpoint call — just an edit, like a host
         // with no lifecycle-hook API would produce.
@@ -227,10 +302,12 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        // Baseline done first, so the edit is guaranteed to be pending
-        // rather than absorbed into the baseline (which would pass this
-        // test for the wrong reason).
-        handle.status().await.expect("status");
+        // An explicit checkpoint is the readiness boundary when background
+        // auto capture is disabled; status deliberately remains scan free.
+        handle
+            .checkpoint(CheckpointKind::Manual, Attribution::default())
+            .await
+            .expect("baseline checkpoint");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         tokio::time::sleep(Duration::from_millis(500)).await;
         handle.shutdown().await.expect("shutdown");
@@ -238,9 +315,10 @@ fn zero_auto_checkpoint_idle_ms_disables_the_idle_timer() {
     thread.join().expect("pipeline thread");
 
     let index = read_only_index(&paths.index_db());
-    // Only the baseline row from init: the idle timer never ran.
+    // The explicit readiness request may be a baseline or a noop immediately
+    // after it; the disabled idle timer must add no later row.
     let latest = index.latest().expect("query").expect("a row exists");
-    assert_eq!(latest.kind, CheckpointKind::Baseline);
+    assert_eq!(latest.kind, CheckpointKind::Noop);
 }
 
 /// An idle tick that has drained an edit into the checkout but not yet
@@ -274,7 +352,10 @@ fn requested_checkpoint_records_changes_an_idle_tick_already_drained() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     let outcome = runtime.block_on(async {
-        handle.status().await.expect("status");
+        handle
+            .checkpoint(CheckpointKind::Manual, Attribution::default())
+            .await
+            .expect("establish baseline");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         tokio::time::sleep(Duration::from_millis(600)).await;
         let outcome = handle
@@ -321,7 +402,10 @@ fn periodic_requests_do_not_postpone_the_auto_checkpoint() {
     let (handle, thread) = pipeline::spawn(store, index, config);
 
     runtime.block_on(async {
-        handle.status().await.expect("status");
+        handle
+            .checkpoint(CheckpointKind::Baseline, Attribution::default())
+            .await
+            .expect("baseline");
         std::fs::write(repo.path().join("a.txt"), b"two\n").expect("edit");
         // Poll far more often than the idle interval, for far longer.
         for _ in 0..40 {
@@ -354,8 +438,12 @@ fn enqueued_checkpoint_survives_immediate_shutdown() {
     let (handle, thread) = pipeline::spawn(store, index, fast_config());
 
     runtime.block_on(async {
-        // Sync on Ready first: a write issued during the startup baseline is
-        // captured by it, and the enqueued checkpoint would be a noop.
+        // An explicit checkpoint is the readiness boundary; status remains
+        // metadata only and does not scan the repository.
+        handle
+            .checkpoint(CheckpointKind::Manual, Attribution::default())
+            .await
+            .expect("baseline checkpoint");
         let status = handle.status().await.expect("status");
         assert_eq!(status.state, pipeline::State::Ready);
         std::fs::write(repo.path().join("file.txt"), b"after\n").expect("edit");
@@ -400,7 +488,19 @@ fn single_path_restore_leaves_the_rest_alone() {
     std::fs::write(root.join("src/main.rs"), b"v1\n").expect("seed");
     std::fs::write(root.join("src/deep/a.txt"), b"a1\n").expect("seed");
     std::fs::write(root.join("src/deep/b.txt"), b"b1\n").expect("seed");
+    std::fs::write(root.join("src/deep/hard-a.txt"), b"linked\n").expect("seed hard link");
+    std::fs::hard_link(
+        root.join("src/deep/hard-a.txt"),
+        root.join("src/deep/hard-b.txt"),
+    )
+    .expect("hard link");
+    std::fs::hard_link(
+        root.join("src/deep/hard-a.txt"),
+        root.join("outside-hard.txt"),
+    )
+    .expect("hard link outside restored subtree");
     std::fs::write(root.join("other.txt"), b"keep\n").expect("seed");
+    std::fs::write(root.join("source.txt"), b"link source\n").expect("seed");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -425,9 +525,15 @@ fn single_path_restore_leaves_the_rest_alone() {
             .expect("v1");
 
         // Mutate everything.
+        // A new hard link can arrive as a lone watcher hint. The SDK must
+        // request a baseline instead of recording it as an independent file.
+        std::fs::hard_link(root.join("source.txt"), root.join("late-link.txt"))
+            .expect("late hard link");
         std::fs::write(root.join("src/main.rs"), b"v2\n").expect("edit");
         std::fs::write(root.join("src/deep/a.txt"), b"a2\n").expect("edit");
         std::fs::remove_file(root.join("src/deep/b.txt")).expect("rm");
+        std::fs::remove_file(root.join("src/deep/hard-b.txt")).expect("rm hard link");
+        std::fs::write(root.join("src/deep/hard-a.txt"), b"changed\n").expect("edit hard link");
         std::fs::write(root.join("src/deep/c.txt"), b"c2\n").expect("add");
         std::fs::write(root.join("other.txt"), b"changed\n").expect("edit");
         std::fs::write(root.join("new.txt"), b"new\n").expect("add");
@@ -454,10 +560,7 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "src/main.rs".into())
             .await
             .expect("restore file");
-        assert_eq!(
-            outcome.action,
-            acyclic_engine::rewind::RestoreAction::Restored
-        );
+        assert_eq!(outcome.action, acyclic::rewind::RestoreAction::Restored);
         assert_eq!(
             std::fs::read(root.join("src/main.rs")).expect("read"),
             b"v1\n"
@@ -486,9 +589,42 @@ fn single_path_restore_leaves_the_rest_alone() {
             b"b1\n"
         );
         assert!(!root.join("src/deep/c.txt").exists());
+        std::fs::write(root.join("src/deep/hard-a.txt"), b"relinked\n")
+            .expect("write restored hard link");
+        assert_eq!(
+            std::fs::read(root.join("src/deep/hard-b.txt")).expect("read restored hard link"),
+            b"relinked\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("outside-hard.txt")).expect("read untouched outside link"),
+            b"changed\n"
+        );
         assert_eq!(
             std::fs::read(root.join("other.txt")).expect("read"),
             b"changed\n"
+        );
+
+        // Batched callers may contain duplicates and descendants of a root.
+        // The pipeline must materialize and reconcile the minimal root once.
+        std::fs::write(root.join("src/deep/a.txt"), b"a3\n").expect("edit again");
+        let restored = handle
+            .restore_paths(
+                target(v1.row_id),
+                vec![
+                    "src/deep/a.txt".into(),
+                    "src/deep".into(),
+                    "src/deep".into(),
+                ],
+                false,
+                Some("deduplicated restore".into()),
+            )
+            .await
+            .expect("restore minimal roots");
+        assert_eq!(restored.outcomes.len(), 1);
+        assert_eq!(restored.outcomes[0].path, Path::new("src/deep"));
+        assert_eq!(
+            std::fs::read(root.join("src/deep/a.txt")).expect("read"),
+            b"a1\n"
         );
 
         // A path absent at the checkpoint is removed.
@@ -496,10 +632,7 @@ fn single_path_restore_leaves_the_rest_alone() {
             .restore_path(target(v1.row_id), "new.txt".into())
             .await
             .expect("restore absent");
-        assert_eq!(
-            outcome.action,
-            acyclic_engine::rewind::RestoreAction::Removed
-        );
+        assert_eq!(outcome.action, acyclic::rewind::RestoreAction::Removed);
         assert!(!root.join("new.txt").exists());
 
         #[cfg(unix)]

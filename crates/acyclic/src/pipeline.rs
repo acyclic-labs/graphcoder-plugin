@@ -9,11 +9,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use acyclic_fs::model::VolumeLimits;
-use acyclic_fs::{capture_baseline, capture_root_identity, capture_watch_batch, CaptureOptions};
+use acyclic_fs::{
+    capture_baseline_with_policy, capture_root_identity, capture_subtrees_with_policy,
+    capture_watch_batch_with_policy, CaptureOptions,
+};
 use acyclic_fs::{
     CancellationToken, CheckoutCommitOutcome, GenerationId, MountPublication, NativeWatch,
     NativeWatchOptions, OperationId, WatchBatch, WatchChange, WatchEpoch, WatchSequence,
-    WorkCounters,
+    WorkCounters, WorkspaceRestore,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -22,7 +25,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::diff::{self, FileChange};
 use crate::exclude::Exclusions;
-use crate::fork::{ForkSeed, PromoteOutcome, SessionResolveOutcome, SharedLocalCheckout};
+use crate::fork::{ForkSeed, PromoteOutcome, SharedLocalCheckout};
 use crate::index::{Attribution, CheckpointKind, CheckpointRow, Index};
 use crate::rewind::{self, RestoreOutcome, RewindOutcome};
 use crate::store::Store;
@@ -33,9 +36,64 @@ const MAXIMUM_EXTENT_SPANS: u32 = 65_536;
 const WATCH_QUEUE: u32 = 65_536;
 const POLL_CHANGES: u32 = 16_384;
 
+#[cfg(target_os = "windows")]
+const CONTINUITY_MAGIC: &[u8; 8] = b"ACCONT\0\x01";
+#[cfg(target_os = "windows")]
+const CONTINUITY_BYTES: usize = 88;
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct ContinuityRecord {
+    generation: GenerationId,
+    row: i64,
+    usn: acyclic_fs::WindowsUsnCheckpoint,
+}
+
+#[cfg(target_os = "windows")]
+impl ContinuityRecord {
+    fn encode(self) -> [u8; CONTINUITY_BYTES] {
+        let mut bytes = [0_u8; CONTINUITY_BYTES];
+        bytes[..8].copy_from_slice(CONTINUITY_MAGIC);
+        bytes[8..40].copy_from_slice(self.generation.digest().as_bytes());
+        bytes[40..48].copy_from_slice(&self.row.to_le_bytes());
+        bytes[48..].copy_from_slice(&self.usn.to_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != CONTINUITY_BYTES || !bytes.starts_with(CONTINUITY_MAGIC) {
+            return None;
+        }
+        let mut generation = [0_u8; 32];
+        generation.copy_from_slice(bytes.get(8..40)?);
+        let mut row = [0_u8; 8];
+        row.copy_from_slice(bytes.get(40..48)?);
+        let row = i64::from_le_bytes(row);
+        if row <= 0 {
+            return None;
+        }
+        Some(Self {
+            generation: GenerationId::new(acyclic_fs::Digest::from_bytes(generation)),
+            row,
+            usn: acyclic_fs::WindowsUsnCheckpoint::from_bytes(bytes.get(48..)?).ok()?,
+        })
+    }
+}
+
+fn fork_moved(base: GenerationId) -> PromoteOutcome {
+    PromoteOutcome::Conflict {
+        message: format!(
+            "the working tree moved past the fork's base ({}); promote in v1 requires an unmoved mainline — rewind to the base or re-fork and re-apply",
+            crate::generation_hex(base)
+        ),
+    }
+}
+
 /// Pipeline state reported by `status`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
+    /// Metadata and watcher are open; no repository descendants were scanned.
+    NeedsBaseline,
     Baselining,
     Ready,
     Rewinding,
@@ -191,43 +249,14 @@ enum Request {
         paths: Vec<PathBuf>,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// Restores one path from `target` into `root` (a copy fork's directory).
-    RestorePathInto {
-        target: GenerationId,
-        root: PathBuf,
-        path: PathBuf,
-        reply: oneshot::Sender<Result<RestoreOutcome>>,
-    },
-    /// Copy-mode fork: write `generation` out to `destination`.
-    Materialize {
-        generation: GenerationId,
-        destination: PathBuf,
-        reply: oneshot::Sender<Result<()>>,
-    },
     Promote {
         shared: Arc<SharedLocalCheckout>,
         base: GenerationId,
         label: String,
         reply: oneshot::Sender<Result<PromoteOutcome>>,
     },
-    ResolveSession {
-        shared: Arc<SharedLocalCheckout>,
-        base: GenerationId,
-        label: String,
-        reply: oneshot::Sender<Result<SessionResolveOutcome>>,
-    },
-    ApplySession {
-        generation: GenerationId,
-        base: GenerationId,
-        label: String,
-        reply: oneshot::Sender<Result<PromoteOutcome>>,
-    },
     Status {
-        reply: oneshot::Sender<StatusReport>,
-    },
-    SetShadowed {
-        active: bool,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<StatusReport>>,
     },
     SessionStarted {
         session_id: String,
@@ -241,6 +270,20 @@ enum Request {
     Shutdown {
         reply: oneshot::Sender<Result<()>>,
     },
+}
+
+impl Request {
+    const fn requires_ready(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status { .. }
+                | Self::TurnStarted { .. }
+                | Self::RecordGeneration { .. }
+                | Self::SessionStarted { .. }
+                | Self::SessionEnded { .. }
+                | Self::Shutdown { .. }
+        )
+    }
 }
 
 /// Cloneable handle used by the daemon to talk to the pipeline.
@@ -534,34 +577,6 @@ impl PipelineHandle {
         )?
     }
 
-    /// Restores one path from `target` into `root` rather than the working tree.
-    pub async fn restore_path_into(
-        &self,
-        target: GenerationId,
-        root: PathBuf,
-        path: PathBuf,
-    ) -> Result<RestoreOutcome> {
-        request!(
-            self,
-            RestorePathInto {
-                target: target,
-                root: root,
-                path: path
-            }
-        )?
-    }
-
-    /// Copy-mode fork: materializes `generation` into `destination`.
-    pub async fn materialize(&self, generation: GenerationId, destination: PathBuf) -> Result<()> {
-        request!(
-            self,
-            Materialize {
-                generation: generation,
-                destination: destination
-            }
-        )?
-    }
-
     pub async fn promote(
         &self,
         shared: Arc<SharedLocalCheckout>,
@@ -578,54 +593,8 @@ impl PipelineHandle {
         )?
     }
 
-    /// Safe Mode's commit half of promote: commits the overlay (or reports
-    /// a conflict) without touching the real tree, so the caller can show
-    /// an approval-gated diff before deciding whether to `apply_session`.
-    pub async fn resolve_session(
-        &self,
-        shared: Arc<SharedLocalCheckout>,
-        base: GenerationId,
-        label: String,
-    ) -> Result<SessionResolveOutcome> {
-        request!(
-            self,
-            ResolveSession {
-                shared: shared,
-                base: base,
-                label: label
-            }
-        )?
-    }
-
-    /// Safe Mode's swap half of promote: lands an already-`resolve_session`d
-    /// generation onto the real tree.
-    pub async fn apply_session(
-        &self,
-        generation: GenerationId,
-        base: GenerationId,
-        label: String,
-    ) -> Result<PromoteOutcome> {
-        request!(
-            self,
-            ApplySession {
-                generation: generation,
-                base: base,
-                label: label
-            }
-        )?
-    }
-
     pub async fn status(&self) -> Result<StatusReport> {
-        request!(self, Status {})
-    }
-
-    /// Safe Mode: while a session's fork is shadow-mounted over the real repo
-    /// root, mainline capture must pause — the pipeline's watcher would
-    /// otherwise observe the fork's content and the mount/unmount lifecycle
-    /// (which can map to the volume root) instead of real-tree mutations.
-    /// `resolve_session`/`apply_session` clear it and rebuild the watcher.
-    pub async fn set_shadowed(&self, active: bool) -> Result<()> {
-        request!(self, SetShadowed { active: active })?
+        request!(self, Status {})?
     }
 
     pub async fn session_started(&self, session_id: String, host: String) -> Result<()> {
@@ -670,7 +639,7 @@ enum RootHint {
 /// Removes hints that target the volume root from a batch. The engine
 /// refuses any mutation of the root ("mutation cannot target the volume
 /// root"), and such hints only ever come from mount lifecycle events on the
-/// repo directory (Safe Mode shadowing it, or a fork session tearing down),
+/// repo directory (for example, a fork session tearing down),
 /// never from the user's edits.
 fn strip_root_hints(batch: WatchBatch) -> (WatchBatch, RootHint) {
     let WatchBatch::Changes {
@@ -739,11 +708,7 @@ pub fn spawn(
     let (sender, receiver) = mpsc::channel(1024);
     let thread = std::thread::Builder::new()
         .name(format!("{}-pipeline", crate::product::NAME))
-        // The fs facade's futures are large and a few of them nest per
-        // request (a subtree copy, a restore); the 2 MiB default is tight
-        // in debug builds. Virtual reservation only: untouched pages cost
-        // nothing.
-        .stack_size(32 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -759,19 +724,17 @@ struct Pipeline {
     store: Store,
     index: Index,
     config: Config,
-    watch: NativeWatch,
+    watch: Option<NativeWatch>,
     options: CaptureOptions,
     /// Paths that never enter a checkpoint (`exclude` in the config).
     exclusions: Exclusions,
+    capture_policy: acyclic_fs::CapturePolicy,
     cancel: CancellationToken,
     state: State,
     last_generation: GenerationId,
     last_checkpoint_row: Option<i64>,
     checkpoints_since_commit: u32,
     last_activity: Instant,
-    /// A Safe Mode session's fork is shadow-mounted over the repo root:
-    /// mainline capture is suspended until `resolve_session`/`apply_session`.
-    shadowed: bool,
     /// Watcher invalidations and recovery rescans since start; see
     /// [`WatcherHealth`].
     watcher_health: WatcherHealth,
@@ -839,8 +802,9 @@ async fn run(store: Store, index: Index, config: Config, mut receiver: mpsc::Rec
     clippy::match_same_arms,
     reason = "the arms look identical but each `reply` is a differently typed sender"
 )]
-fn fail_request(request: Request, message: &str) {
-    let error = || EngineError::Store(message.to_owned());
+fn fail_request(request: Request, error: impl std::fmt::Display) {
+    let message = error.to_string();
+    let error = || EngineError::Store(message.clone());
     match request {
         Request::Checkpoint { reply, .. } => drop(reply.send(Err(error()))),
         Request::Commit { reply } => drop(reply.send(Err(error()))),
@@ -848,30 +812,19 @@ fn fail_request(request: Request, message: &str) {
         Request::Diff { reply, .. } => drop(reply.send(Err(error()))),
         Request::Fork { reply } => drop(reply.send(Err(error()))),
         Request::Promote { reply, .. } => drop(reply.send(Err(error()))),
-        Request::Materialize { reply, .. } => drop(reply.send(Err(error()))),
         Request::ScratchCheckout { reply, .. } => drop(reply.send(Err(error()))),
         Request::PublishHead { reply } => drop(reply.send(Err(error()))),
         Request::MergePlan { reply, .. } => drop(reply.send(Err(error()))),
         Request::BuildGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::ApplyToOverlay { reply, .. } => drop(reply.send(Err(error()))),
         Request::ReadFiles { reply, .. } => drop(reply.send(Err(error()))),
-        Request::RestorePathInto { reply, .. } => drop(reply.send(Err(error()))),
         Request::MaterializePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::RecordGeneration { reply, .. } => drop(reply.send(Err(error()))),
         Request::SnapshotOverlay { reply, .. } => drop(reply.send(Err(error()))),
-        Request::ResolveSession { reply, .. } => drop(reply.send(Err(error()))),
-        Request::ApplySession { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePath { reply, .. } => drop(reply.send(Err(error()))),
         Request::RestorePaths { reply, .. } => drop(reply.send(Err(error()))),
         Request::TurnStarted { reply, .. } => drop(reply.send(Err(error()))),
-        Request::SetShadowed { reply, .. } => drop(reply.send(Err(error()))),
-        Request::Status { reply } => drop(reply.send(StatusReport {
-            state: State::Baselining,
-            last_checkpoint: None,
-            unpublished: 0,
-            checkpoints_since_commit: 0,
-            watcher: WatcherHealth::default(),
-        })),
+        Request::Status { reply } => drop(reply.send(Err(error()))),
         Request::SessionStarted { reply, .. } | Request::SessionEnded { reply, .. } => {
             drop(reply.send(Err(error())));
         }
@@ -884,51 +837,108 @@ impl Pipeline {
         let cancel = CancellationToken::new();
         let repo_root: PathBuf = store.repo_root.clone();
 
-        let mut watch = NativeWatch::open(
-            &repo_root,
-            NativeWatchOptions {
-                limits: VolumeLimits::default(),
-                maximum_queued_changes: WATCH_QUEUE,
-                recursive: true,
-            },
-        )
-        .map_err(EngineError::fs("open watcher"))?;
-        watch
-            .begin_rescan()
-            .map_err(EngineError::fs("begin rescan"))?;
-
         let options = CaptureOptions {
-            source_root: repo_root.clone(),
-            expected_root_identity: capture_root_identity(&repo_root)
-                .map_err(EngineError::fs("root identity"))?,
+            source_root: repo_root,
+            // First filesystem demand replaces this before any capture. Keeping
+            // startup free of native root access lets metadata-only consumers
+            // run even when the repository is temporarily unavailable.
+            expected_root_identity: acyclic_fs::NativeRootIdentity::from_bytes([0; 16]),
             maximum_paths: MAXIMUM_CAPTURE_PATHS,
             maximum_extent_spans: MAXIMUM_EXTENT_SPANS,
         };
 
         let exclusions = Exclusions::parse(&config.exclude)?;
-        let mut pipeline = Self {
+        let capture_policy = exclusions.capture_policy()?;
+        let pipeline = Self {
             store,
             index,
             config,
-            watch,
+            watch: None,
             options,
             exclusions,
+            capture_policy,
             cancel,
-            state: State::Baselining,
+            state: State::NeedsBaseline,
             last_generation: GenerationId::new(acyclic_fs::Digest::ZERO),
             last_checkpoint_row: None,
             checkpoints_since_commit: 0,
             last_activity: Instant::now(),
-            shadowed: false,
             watcher_health: WatcherHealth::default(),
             auto_pending: None,
         };
-        pipeline.baseline(CheckpointKind::Baseline).await?;
         Ok(pipeline)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn admit_continuity(store: &Store, index: &Index, watch: &mut NativeWatch) -> Result<bool> {
+        let bytes = match std::fs::read(store.paths.continuity()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Ok(false),
+        };
+        let Some(record) = ContinuityRecord::decode(&bytes) else {
+            return Ok(false);
+        };
+        let Some(row) = index.latest()? else {
+            return Ok(false);
+        };
+        if !row.published
+            || row.id != record.row
+            || row.generation != record.generation
+            || store.checkout.generation_id() != record.generation
+        {
+            return Ok(false);
+        }
+        Ok(matches!(
+            watch
+                .accept_windows_usn_baseline(record.usn)
+                .map_err(EngineError::fs("admit Windows continuity"))?,
+            Ok(acyclic_fs::WindowsUsnContinuity::Unchanged)
+        ))
+    }
+
+    async fn ensure_ready(&mut self) -> Result<()> {
+        if self.state == State::Ready {
+            return Ok(());
+        }
+        if self.watch.is_none() {
+            let repo_root = self.store.repo_root.clone();
+            self.options.expected_root_identity =
+                capture_root_identity(&repo_root).map_err(EngineError::fs("root identity"))?;
+            let mut watch = NativeWatch::open(
+                &repo_root,
+                NativeWatchOptions {
+                    limits: VolumeLimits::default(),
+                    maximum_queued_changes: WATCH_QUEUE,
+                    recursive: true,
+                },
+            )
+            .map_err(EngineError::fs("open watcher"))?;
+            #[cfg(target_os = "windows")]
+            if Self::admit_continuity(&self.store, &self.index, &mut watch)? {
+                let latest = self.index.latest()?.ok_or_else(|| {
+                    EngineError::Store("continuity admitted without an index row".into())
+                })?;
+                self.last_generation = latest.generation;
+                self.last_checkpoint_row = Some(latest.id);
+                self.watch = Some(watch);
+                self.state = State::Ready;
+                return Ok(());
+            }
+            watch
+                .begin_rescan()
+                .map_err(EngineError::fs("begin rescan"))?;
+            self.watch = Some(watch);
+        }
+        self.baseline(CheckpointKind::Baseline).await
     }
 
     /// Full baseline: capture the whole tree, checkpoint, finish the watcher
     /// rescan, publish. Used at startup and after RescanRequired/rewind.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "rescan retries share one publication boundary"
+    )]
     async fn baseline(&mut self, kind: CheckpointKind) -> Result<()> {
         crate::trace!(
             "pipeline",
@@ -936,81 +946,130 @@ impl Pipeline {
         );
         let baseline_started = Instant::now();
         self.state = State::Baselining;
-        // A baseline requires a clean checkout. Mid-session (watcher
-        // invalidation, rewind) the overlay holds uncommitted captures:
-        // publish them first. At startup this is a no-op.
-        let phase = Instant::now();
-        self.commit_engine().await?;
-        let precommit_ms = crate::trace::ms(phase);
-        let phase = Instant::now();
-        capture_baseline(
-            &mut self.store.checkout,
-            &self.options,
-            WorkCounters::UNBOUNDED,
-            &self.cancel,
-        )
-        .await
-        .map_err(EngineError::fs("capture baseline"))?;
-        let capture_ms = crate::trace::ms(phase);
-        let phase = Instant::now();
-        self.scrub_exclusions().await?;
-        let generation = self.checkpoint_engine().await?;
-        let snapshot_ms = crate::trace::ms(phase);
-        let row = self
-            .index
-            .record(generation, kind, &Attribution::default())?;
-        self.last_generation = generation;
-        self.last_checkpoint_row = Some(row);
-
-        // Changes that raced the baseline arrive as the rescan-completion
-        // batch; fold them in before declaring Ready.
-        let batch = self
-            .watch
-            .finish_rescan()
-            .map_err(EngineError::fs("finish rescan"))?;
-        // A root hint here is already covered by the rescan that just ran.
-        let (batch, root) = strip_root_hints(batch);
-        if root != RootHint::None {
+        // A newly created hard link can race the rescan tail. Restart with a
+        // fresh watcher so the next full capture sees every alias together.
+        for attempt in 0..3 {
+            #[cfg(target_os = "windows")]
+            let continuity = acyclic_fs::capture_windows_usn_checkpoint(&self.store.repo_root).ok();
+            // A baseline requires a clean checkout. Mid-session (watcher
+            // invalidation, rewind) the overlay holds uncommitted captures:
+            // publish them first. At startup this is a no-op.
+            let phase = Instant::now();
+            self.commit_engine().await?;
+            let precommit_ms = crate::trace::ms(phase);
+            let phase = Instant::now();
+            capture_baseline_with_policy(
+                &mut self.store.checkout,
+                &self.options,
+                &self.capture_policy,
+                WorkCounters::UNBOUNDED,
+                &self.cancel,
+            )
+            .await
+            .map_err(EngineError::fs("capture baseline"))?;
+            let capture_ms = crate::trace::ms(phase);
+            // Changes that raced the baseline arrive as the rescan-completion
+            // batch; fold them in before declaring Ready.
+            let batch = self
+                .watch
+                .as_mut()
+                .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
+                .finish_rescan()
+                .map_err(EngineError::fs("finish rescan"))?;
+            // A root hint here is already covered by the rescan that just ran.
+            let (batch, root) = strip_root_hints(batch);
+            if matches!(batch, WatchBatch::RescanRequired { .. }) {
+                self.watcher_health.invalidations += 1;
+                self.watcher_health.last_reason = Some("rescan tail invalidated".into());
+                self.reset_watch().await?;
+                crate::trace!(
+                    "pipeline",
+                    "baseline rescan tail invalidated; retry {}",
+                    attempt + 1
+                );
+                continue;
+            }
+            if root != RootHint::None {
+                crate::trace!(
+                    "pipeline",
+                    "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
+                );
+            }
+            if let WatchBatch::Changes { ref changes, .. } = batch {
+                if !changes.is_empty() {
+                    let captured = capture_watch_batch_with_policy(
+                        &mut self.store.checkout,
+                        batch,
+                        &self.options,
+                        &self.capture_policy,
+                        WorkCounters::UNBOUNDED,
+                        &self.cancel,
+                    )
+                    .await;
+                    if let Err(failure) = captured {
+                        if matches!(
+                            failure.error,
+                            acyclic_fs::CaptureError::RescanRequired { .. }
+                        ) {
+                            self.watcher_health.invalidations += 1;
+                            self.watcher_health.last_reason = Some(failure.error.to_string());
+                            self.reset_watch().await?;
+                            crate::trace!(
+                                "pipeline",
+                                "baseline rescan tail needs full capture; retry {}",
+                                attempt + 1
+                            );
+                            continue;
+                        }
+                        return Err(EngineError::fs("capture rescan tail")(failure));
+                    }
+                }
+            }
+            let phase = Instant::now();
+            let generation = self.checkpoint_engine().await?;
+            let snapshot_ms = crate::trace::ms(phase);
+            let row = self
+                .index
+                .record(generation, kind, &Attribution::default())?;
+            self.last_generation = generation;
+            self.last_checkpoint_row = Some(row);
+            let phase = Instant::now();
+            self.commit_engine().await?;
+            #[cfg(target_os = "windows")]
+            if let Some(usn) = continuity {
+                crate::store::durable_replace(
+                    &self.store.paths.continuity(),
+                    &ContinuityRecord {
+                        generation,
+                        row,
+                        usn,
+                    }
+                    .encode(),
+                )?;
+            }
+            let postcommit_ms = crate::trace::ms(phase);
+            self.state = State::Ready;
+            if kind == CheckpointKind::Recovered {
+                let ms = crate::trace::ms(baseline_started);
+                self.watcher_health.recovery_rescans += 1;
+                self.watcher_health.recovery_ms_total += ms;
+                self.watcher_health.last_recovery_ms = ms;
+            }
             crate::trace!(
                 "pipeline",
-                "rescan tail: root hint ({root:?}) dropped, covered by the rescan"
+                "baseline phases: pre-commit {precommit_ms:.1}ms, full capture {capture_ms:.1}ms, \
+             snapshot {snapshot_ms:.1}ms, post-commit {postcommit_ms:.1}ms"
             );
+            crate::trace!(
+                "pipeline",
+                "baseline done in {:.1}ms; state Ready",
+                crate::trace::ms(baseline_started)
+            );
+            return Ok(());
         }
-        if let WatchBatch::Changes { ref changes, .. } = batch {
-            if !changes.is_empty() {
-                capture_watch_batch(
-                    &mut self.store.checkout,
-                    batch,
-                    &self.options,
-                    WorkCounters::UNBOUNDED,
-                    &self.cancel,
-                )
-                .await
-                .map_err(EngineError::fs("capture rescan tail"))?;
-                self.scrub_exclusions().await?;
-            }
-        }
-        let phase = Instant::now();
-        self.commit_engine().await?;
-        let postcommit_ms = crate::trace::ms(phase);
-        self.state = State::Ready;
-        if kind == CheckpointKind::Recovered {
-            let ms = crate::trace::ms(baseline_started);
-            self.watcher_health.recovery_rescans += 1;
-            self.watcher_health.recovery_ms_total += ms;
-            self.watcher_health.last_recovery_ms = ms;
-        }
-        crate::trace!(
-            "pipeline",
-            "baseline phases: pre-commit {precommit_ms:.1}ms, full capture {capture_ms:.1}ms, \
-             scrub+snapshot {snapshot_ms:.1}ms, rescan tail+post-commit {postcommit_ms:.1}ms"
-        );
-        crate::trace!(
-            "pipeline",
-            "baseline done in {:.1}ms; state Ready",
-            crate::trace::ms(baseline_started)
-        );
-        Ok(())
+        Err(EngineError::Store(
+            "baseline rescan repeatedly invalidated".into(),
+        ))
     }
 
     /// Handles one request; returns true when the pipeline should exit.
@@ -1020,6 +1079,12 @@ impl Pipeline {
     )]
     async fn handle(&mut self, request: Request) -> bool {
         self.last_activity = Instant::now();
+        if request.requires_ready() {
+            if let Err(error) = self.ensure_ready().await {
+                fail_request(request, error);
+                return false;
+            }
+        }
         match request {
             Request::Checkpoint {
                 kind,
@@ -1186,12 +1251,9 @@ impl Pipeline {
                 reply,
             } => {
                 let result = Box::pin(async {
-                    let mut out = Vec::with_capacity(paths.len());
-                    for path in paths {
-                        let bytes = crate::merge::read_file(&self.store, generation, &path).await?;
-                        out.push((path, bytes));
-                    }
-                    Ok(out)
+                    let contents =
+                        crate::merge::read_files(&self.store, generation, &paths).await?;
+                    Ok(paths.into_iter().zip(contents).collect())
                 })
                 .await;
                 let _ = reply.send(result);
@@ -1213,26 +1275,6 @@ impl Pipeline {
                 let _ = reply.send(result);
                 false
             }
-            Request::RestorePathInto {
-                target,
-                root,
-                path,
-                reply,
-            } => {
-                let result =
-                    Box::pin(rewind::restore_path_into(&self.store, target, &root, &path)).await;
-                let _ = reply.send(result);
-                false
-            }
-            Request::Materialize {
-                generation,
-                destination,
-                reply,
-            } => {
-                let _ = reply
-                    .send(rewind::materialize_into(&self.store, generation, &destination).await);
-                false
-            }
             Request::Promote {
                 shared,
                 base,
@@ -1242,37 +1284,14 @@ impl Pipeline {
                 let _ = reply.send(self.promote(shared, base, &label).await);
                 false
             }
-            Request::ResolveSession {
-                shared,
-                base,
-                label,
-                reply,
-            } => {
-                let _ = reply.send(self.resolve_session(shared, base, &label).await);
-                false
-            }
-            Request::ApplySession {
-                generation,
-                base,
-                label,
-                reply,
-            } => {
-                let _ = reply.send(self.apply_session(generation, base, &label).await);
-                false
-            }
             Request::Status { reply } => {
-                let _ = reply.send(StatusReport {
+                let _ = reply.send(Ok(StatusReport {
                     state: self.state,
                     last_checkpoint: self.last_checkpoint_row,
                     unpublished: self.index.unpublished_count().unwrap_or(0),
                     checkpoints_since_commit: self.checkpoints_since_commit,
                     watcher: self.watcher_health.clone(),
-                });
-                false
-            }
-            Request::SetShadowed { active, reply } => {
-                self.shadowed = active;
-                let _ = reply.send(Ok(()));
+                }));
                 false
             }
             Request::SessionStarted {
@@ -1283,7 +1302,10 @@ impl Pipeline {
                 let result = async {
                     self.index.session_started(&session_id, &host)?;
                     // Session start is a coarse boundary.
-                    self.commit_engine().await
+                    if self.state == State::Ready {
+                        self.commit_engine().await?;
+                    }
+                    Ok(())
                 }
                 .await;
                 let _ = reply.send(result);
@@ -1292,7 +1314,10 @@ impl Pipeline {
             Request::SessionEnded { session_id, reply } => {
                 let result = async {
                     self.index.session_ended(&session_id)?;
-                    self.commit_engine().await
+                    if self.state == State::Ready {
+                        self.commit_engine().await?;
+                    }
+                    Ok(())
                 }
                 .await;
                 let _ = reply.send(result);
@@ -1313,26 +1338,6 @@ impl Pipeline {
         attribution: &Attribution,
     ) -> Result<CheckpointOutcome> {
         let started = Instant::now();
-        if self.shadowed {
-            // A Safe Mode session's fork is mounted over the repo root; the
-            // real tree is frozen and the watcher sees only fork/mount noise.
-            // Record a noop so the hook gets a clean reply, but never drain
-            // the watcher or snapshot the mainline mid-session.
-            crate::trace!(
-                "pipeline",
-                "checkpoint kind={:?}: shadowed -> noop row, watcher untouched",
-                kind
-            );
-            let row = self
-                .index
-                .record(self.last_generation, CheckpointKind::Noop, attribution)?;
-            self.last_checkpoint_row = Some(row);
-            return Ok(CheckpointOutcome {
-                row_id: row,
-                generation: self.last_generation,
-                kind: CheckpointKind::Noop,
-            });
-        }
         if self.state != State::Ready {
             // A failed recovery leaves state at Baselining; a request is the
             // natural moment to retry rather than staying down forever.
@@ -1396,14 +1401,18 @@ impl Pipeline {
         })
     }
 
-    /// Polls the watcher until it stays quiet for `quiesce_ms` (capped at
-    /// `quiesce_cap_ms`), capturing every non-empty batch. Returns whether
-    /// anything was captured.
+    /// Captures every available watcher batch, then waits for `quiesce_ms`
+    /// of quiet after the first change (capped at `quiesce_cap_ms`). An empty
+    /// first poll returns immediately. Returns whether anything was captured.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "watch invalidation and capture share one poll loop"
+    )]
     async fn drain_watcher(&mut self) -> Result<bool> {
         let quiesce = Duration::from_millis(self.config.quiesce_ms);
         let cap = Duration::from_millis(self.config.quiesce_cap_ms);
         let started = Instant::now();
-        let mut last_change = Instant::now();
+        let mut last_change = None;
         let mut changed = false;
         let mut polls = 0u32;
         let mut batches = 0u32;
@@ -1412,6 +1421,8 @@ impl Pipeline {
             polls += 1;
             let batch = self
                 .watch
+                .as_mut()
+                .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
                 .poll(POLL_CHANGES, WorkCounters::UNBOUNDED, &self.cancel)
                 .map_err(EngineError::fs("watch poll"))?
                 .value;
@@ -1422,7 +1433,6 @@ impl Pipeline {
                     "drain: watcher hinted at the volume root ({root:?}); dropped"
                 );
             }
-            let (batch, scrub) = self.exclusions.filter_batch(batch);
             if root == RootHint::Structural {
                 // The repo directory itself changed identity (a mount came
                 // or went): re-baseline on a fresh watcher rather than apply
@@ -1439,29 +1449,44 @@ impl Pipeline {
                 WatchBatch::Changes { ref changes, .. } if !changes.is_empty() => {
                     batches += 1;
                     hints += changes.len();
-                    capture_watch_batch(
+                    let captured = capture_watch_batch_with_policy(
                         &mut self.store.checkout,
                         batch,
                         &self.options,
+                        &self.capture_policy,
                         WorkCounters::UNBOUNDED,
                         &self.cancel,
                     )
-                    .await
-                    .map_err(EngineError::fs("capture watch batch"))?;
-                    if scrub {
-                        self.scrub_exclusions().await?;
+                    .await;
+                    if let Err(failure) = captured {
+                        if matches!(
+                            failure.error,
+                            acyclic_fs::CaptureError::RescanRequired { .. }
+                        ) {
+                            self.watcher_health.invalidations += 1;
+                            self.watcher_health.last_reason = Some(failure.error.to_string());
+                            self.reset_watch().await?;
+                            self.baseline(CheckpointKind::Recovered).await?;
+                            return Ok(true);
+                        }
+                        return Err(EngineError::fs("capture watch batch")(failure));
                     }
                     changed = true;
-                    last_change = Instant::now();
+                    last_change = Some(Instant::now());
                 }
                 WatchBatch::Changes { .. } => {
-                    if last_change.elapsed() >= quiesce || started.elapsed() >= cap {
+                    if last_change.is_none()
+                        || last_change.is_some_and(|last| last.elapsed() >= quiesce)
+                        || started.elapsed() >= cap
+                    {
                         crate::trace!(
                             "pipeline",
                             "drain: done after {:.1}ms, {polls} polls, {batches} batch(es), \
                              {hints} hint(s); stopped by {}",
                             crate::trace::ms(started),
-                            if started.elapsed() >= cap {
+                            if last_change.is_none() {
+                                "empty poll"
+                            } else if started.elapsed() >= cap {
                                 "cap"
                             } else {
                                 "quiesce window"
@@ -1491,19 +1516,6 @@ impl Pipeline {
                 }
             }
         }
-    }
-
-    /// Drops excluded paths a capture may have pulled into the checkout,
-    /// before the generation they would otherwise land in is checkpointed.
-    async fn scrub_exclusions(&mut self) -> Result<()> {
-        let removed = self.exclusions.scrub(&mut self.store.checkout).await?;
-        if removed > 0 {
-            crate::trace!(
-                "pipeline",
-                "exclusions: scrubbed {removed} excluded path(s) from the checkout"
-            );
-        }
-        Ok(())
     }
 
     /// `checkpoint()`: snapshot without authority publish. The fast path.
@@ -1565,14 +1577,23 @@ impl Pipeline {
     /// The safety net for hosts with no lifecycle-hook API (Claude Desktop
     /// over MCP): a checkpoint no request asked for, taken once the watcher
     /// has been quiet for `auto_checkpoint_idle_ms`. Runs on every idle
-    /// tick: drains whatever the watcher has (cheap, bounded by
-    /// `quiesce_ms`; usually nothing, since hook-driven hosts drain on their
-    /// own pre/post-tool checkpoints), then records a row only once a full
-    /// tick has passed with no further changes and nothing else has
-    /// checkpointed them in the meantime. Never records a row when nothing
-    /// changed, so it cannot spam the timeline.
+    /// tick: drains whatever the watcher has (an empty watcher returns after
+    /// one poll; hook-driven hosts usually drained on their own pre/post-tool
+    /// checkpoints), then records a row only once a full tick has passed with
+    /// no further changes and nothing else has checkpointed them in the
+    /// meantime. Never records a row when nothing changed, so it cannot spam
+    /// the timeline.
     async fn auto_checkpoint(&mut self) {
-        if self.config.auto_checkpoint_idle_ms == 0 || self.shadowed || self.state != State::Ready {
+        if self.config.auto_checkpoint_idle_ms == 0 {
+            return;
+        }
+        // An idle daemon must remain O(1) in repository size. The first
+        // consumer operation that needs authenticated contents performs the
+        // baseline; a timer alone is not such an operation.
+        if self.state == State::NeedsBaseline {
+            return;
+        }
+        if self.state != State::Ready {
             return;
         }
         // Like `idle_commit`, failures here are advisory: the pending state
@@ -1682,20 +1703,7 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
-        let outcome = rewind::execute(
-            &self.store,
-            target.generation,
-            self.config.trash_ttl_days,
-            &self.exclusions,
-        )
-        .await;
-
-        // The swap replaced the repo directory's inode: the pinned root
-        // identity and the watcher both point at the old tree. Rebuild both,
-        // then re-baseline.
-        self.reset_watch().await?;
-        self.baseline(CheckpointKind::Recovered).await?;
-        outcome
+        self.swap_root_and_rebaseline(target.generation).await
     }
 
     /// Single-path restore, bracketed by checkpoints: a `manual` safety row
@@ -1745,7 +1753,7 @@ impl Pipeline {
                 &parent,
             )?));
         }
-        capture_watch_batch(
+        let captured = capture_watch_batch_with_policy(
             &mut self.store.checkout,
             WatchBatch::Changes {
                 epoch: WatchEpoch::from_u64(0),
@@ -1754,12 +1762,47 @@ impl Pipeline {
                 changes: hints,
             },
             &self.options,
+            &self.capture_policy,
+            WorkCounters::UNBOUNDED,
+            &self.cancel,
+        )
+        .await;
+        if let Err(failure) = captured {
+            if matches!(
+                failure.error,
+                acyclic_fs::CaptureError::RescanRequired { .. }
+            ) {
+                self.watcher_health.invalidations += 1;
+                self.watcher_health.last_reason = Some(failure.error.to_string());
+                self.reset_watch().await?;
+                self.baseline(CheckpointKind::Recovered).await?;
+                return Ok(());
+            }
+            return Err(EngineError::fs("capture restored paths")(failure));
+        }
+        Ok(())
+    }
+
+    /// Reconciles exact restored roots immediately, including all descendants
+    /// of a directory that was replaced or removed. The SDK unions the host
+    /// and checkout subtrees, so stale descendants are removed without waiting
+    /// for the native watcher to enumerate the write.
+    async fn capture_restored_subtrees(&mut self, paths: &[PathBuf]) -> Result<()> {
+        let roots = paths
+            .iter()
+            .map(|path| crate::merge::namespace_of(path))
+            .collect::<Result<Vec<_>>>()?;
+        capture_subtrees_with_policy(
+            &mut self.store.checkout,
+            &roots,
+            &self.options,
+            &self.capture_policy,
             WorkCounters::UNBOUNDED,
             &self.cancel,
         )
         .await
-        .map_err(EngineError::fs("capture restored paths"))?;
-        self.scrub_exclusions().await
+        .map_err(EngineError::fs("capture restored subtrees"))?;
+        Ok(())
     }
 
     /// Restores `paths` from `target` as one event: at most one safety row
@@ -1771,12 +1814,8 @@ impl Pipeline {
         safety: bool,
         label: Option<String>,
     ) -> Result<RestoredPaths> {
-        if self.shadowed {
-            return Err(EngineError::Restore(
-                "a Safe Mode session is shadowing the repo root; resolve it first".into(),
-            ));
-        }
-        for path in paths {
+        let paths = crate::merge::subtree_roots(paths);
+        for path in &paths {
             if self.exclusions.covers_host(path) {
                 return Err(EngineError::Restore(format!(
                     "{} is excluded from snapshots (`exclude` in {}); no checkpoint holds it",
@@ -1789,7 +1828,7 @@ impl Pipeline {
             self.reset_watch().await?;
             self.baseline(CheckpointKind::Recovered).await?;
         }
-        let what = match paths {
+        let what = match paths.as_slice() {
             [path] => format!("{} from #{}", path.display(), target.id),
             _ => format!("{} path(s) from #{}", paths.len(), target.id),
         };
@@ -1817,7 +1856,7 @@ impl Pipeline {
 
         let write_started = Instant::now();
         let mut outcomes = Vec::with_capacity(paths.len());
-        for path in paths {
+        for path in &paths {
             outcomes.push(rewind::restore_path(&self.store, target.generation, path).await?);
         }
         let write_ms = crate::trace::ms(write_started);
@@ -1827,21 +1866,20 @@ impl Pipeline {
         // later. The echo is harmless when it comes: a modified hint on a
         // path whose content already matches captures nothing, and the
         // staged sibling's create+rename resolves to an absent path.
-        // Direct capture describes each path with one hint, which is exact
-        // for a regular file or symlink and wrong for a subtree (a removed
-        // or replaced directory needs a hint per descendant). Anything
-        // else waits for the native watcher, which delivers those.
+        // Leaf batches avoid directory traversal. Directory and absent roots
+        // use the SDK subtree reconciler, which unions live and stored
+        // descendants and therefore captures replacements and removals exactly.
         let post_started = Instant::now();
         let all_leaves = paths.iter().all(|path| {
             std::fs::symlink_metadata(self.store.repo_root.join(path))
                 .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink())
         });
         let capture_mode = if all_leaves {
-            self.capture_paths_directly(paths).await?;
+            self.capture_paths_directly(&paths).await?;
             "direct capture"
         } else {
-            self.drain_watcher().await?;
-            "watcher drain (a path is a directory or absent)"
+            self.capture_restored_subtrees(&paths).await?;
+            "direct subtree capture"
         };
         let post_ms = crate::trace::ms(post_started);
         let capture_started = Instant::now();
@@ -1908,16 +1946,13 @@ impl Pipeline {
     async fn scratch_checkout(&mut self, base: GenerationId) -> Result<Arc<SharedLocalCheckout>> {
         let checkout = self
             .store
-            .volume
+            .workspace
             .checkout(
                 acyclic_fs::model::GenerationSelector::Exact(base),
                 crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
             )
             .await
-            .map_err(EngineError::fs("scratch checkout"))?
-            .value;
+            .map_err(EngineError::fs("scratch checkout"))?;
         Ok(Arc::new(SharedLocalCheckout::with_publication(
             checkout,
             MountPublication::Manual,
@@ -1970,22 +2005,19 @@ impl Pipeline {
         // front of a fork.
         let checkout = self
             .store
-            .volume
+            .workspace
             .checkout(
                 acyclic_fs::model::GenerationSelector::Exact(base),
                 crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
             )
             .await
-            .map_err(EngineError::fs("fork checkout"))?
-            .value;
+            .map_err(EngineError::fs("fork checkout"))?;
         let config = checkout.volume_config();
         let volume_id = checkout.volume_id();
         Ok(ForkSeed {
             // Native close/flush must never publish: sibling forks share one
             // volume head, so a seal on close makes the next fork's mutations
-            // Stale. Promote/resolve are the only commits.
+            // stale. Promote is the only commit.
             shared: Arc::new(SharedLocalCheckout::with_publication(
                 checkout,
                 MountPublication::Manual,
@@ -2021,6 +2053,13 @@ impl Pipeline {
         self.last_checkpoint_row = Some(safety_row);
         self.commit_engine().await?;
 
+        // The fork may have been cut from an unpublished checkpoint. Publishing
+        // that same generation advances the authority sequence, so its checkout
+        // must rebase before committing even though the mainline did not move.
+        if self.store.checkout.generation_id() != base {
+            return Ok(fork_moved(base));
+        }
+
         let outcome = {
             let mut guard = shared.lock().await;
             if !guard.has_pending_mutations() {
@@ -2030,6 +2069,17 @@ impl Pipeline {
                     generation: base,
                     old_tree: None,
                 });
+            }
+            let rebased = guard
+                .rebase_head(0, WorkCounters::UNBOUNDED, &self.cancel)
+                .await
+                .map_err(EngineError::fs("fork rebase"))?
+                .value;
+            if matches!(
+                rebased,
+                acyclic_fs::kernel::RebaseDecision::Conflicted { .. }
+            ) {
+                return Ok(fork_moved(base));
             }
             guard
                 .commit(OperationId::new(), WorkCounters::UNBOUNDED, &self.cancel)
@@ -2041,14 +2091,7 @@ impl Pipeline {
             CheckoutCommitOutcome::Committed { generation_id, .. }
             | CheckoutCommitOutcome::AlreadyCommitted { generation_id, .. } => generation_id,
             CheckoutCommitOutcome::Conflict { .. } | CheckoutCommitOutcome::Fenced { .. } => {
-                return Ok(PromoteOutcome::Conflict {
-                    message: format!(
-                        "the working tree moved past the fork's base \
-                         ({}); promote in v1 requires an unmoved mainline — \
-                         rewind to the base or re-fork and re-apply",
-                        crate::generation_hex(base)
-                    ),
-                });
+                return Ok(fork_moved(base));
             }
             other => {
                 return Err(EngineError::Fs(format!(
@@ -2062,16 +2105,13 @@ impl Pipeline {
         self.state = State::Rewinding;
         self.store.checkout = self
             .store
-            .volume
+            .workspace
             .checkout(
                 acyclic_fs::model::GenerationSelector::Head,
                 crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
             )
             .await
-            .map_err(EngineError::fs("refresh checkout"))?
-            .value;
+            .map_err(EngineError::fs("refresh checkout"))?;
         let row = self.index.record(
             generation,
             CheckpointKind::Manual,
@@ -2083,150 +2123,75 @@ impl Pipeline {
         self.last_generation = generation;
         self.last_checkpoint_row = Some(row);
 
-        let swap = rewind::execute(
-            &self.store,
-            generation,
-            self.config.trash_ttl_days,
-            &self.exclusions,
-        )
-        .await;
-        self.reset_watch().await?;
-        self.baseline(CheckpointKind::Recovered).await?;
-        let swap = swap?;
+        let swap = self.swap_root_and_rebaseline(generation).await?;
         Ok(PromoteOutcome::Promoted {
             generation,
             old_tree: Some(swap.old_tree),
         })
     }
 
-    /// The commit half of promote, split out for Safe Mode: publishes the
-    /// mainline safety net and commits the fork's overlay, but never
-    /// touches the real tree — the caller diffs `base` against the
-    /// returned generation and decides whether to `apply_session` it.
-    async fn resolve_session(
-        &mut self,
-        shared: Arc<SharedLocalCheckout>,
-        base: GenerationId,
-        label: &str,
-    ) -> Result<SessionResolveOutcome> {
-        // The server unmounts the shadow before calling us, so the pipeline
-        // watcher's queue is full of mount-teardown hints — some of which map
-        // to the volume root and would fail capture outright. Leave shadow
-        // mode and swap in a fresh watcher on the now-real tree to DISCARD
-        // that queue. The pipeline's own checkout never moved during the
-        // session (mainline checkpoints no-op while shadowed), so it still
-        // sits at `base`; we must not re-baseline/publish it here or the
-        // mainline HEAD would advance past the fork and the overlay commit
-        // below would spuriously conflict.
-        if self.shadowed {
-            self.shadowed = false;
-            self.reset_watch().await?;
-            let _ = self
-                .watch
-                .finish_rescan()
-                .map_err(EngineError::fs("finish rescan"))?;
-            self.state = State::Ready;
-        } else {
-            // No shadow (direct callers, e.g. tests): the watcher is trusted,
-            // so fold any pending real-tree change into the safety net.
-            self.drain_watcher().await?;
-        }
-        let safety = self.checkpoint_engine().await?;
-        let safety_row = self.index.record(
-            safety,
-            CheckpointKind::PreRewind,
-            &Attribution {
-                label: Some(format!("before {label}")),
-                ..Attribution::default()
-            },
-        )?;
-        self.last_generation = safety;
-        self.last_checkpoint_row = Some(safety_row);
-        // The safety checkpoint stays UNPUBLISHED (checkpoint, not commit):
-        // publishing it would move the authority head off `base`, and Safe
-        // Mode must leave the head at base until `apply_session` so that
-        // `session-discard` truly changes nothing and the next session forks
-        // cleanly. Unpublished checkpoint generations are fully restorable.
-        let _ = base; // conflict against a moved mainline is detected at apply
-
-        // Snapshot the fork's overlay as an unpublished generation: diffable
-        // and rewind-applyable by id, without advancing the head.
-        let generation = {
-            let guard = shared.lock().await;
-            if !guard.has_pending_mutations() {
-                return Ok(SessionResolveOutcome::NoChanges);
-            }
-            guard
-                .checkpoint(WorkCounters::UNBOUNDED, &self.cancel)
-                .await
-                .map_err(EngineError::fs("session checkpoint"))?
-                .value
-        };
-        Ok(SessionResolveOutcome::Resolved { generation })
-    }
-
-    /// The swap half of promote, split out for Safe Mode: lands an
-    /// already-committed generation (from `resolve_session`) onto the real
-    /// tree, exactly like `promote`'s own tail.
-    async fn apply_session(
+    /// Stops the old event source before the intentional root exchange. An
+    /// old callback must never publish a hint into the new watcher's epoch.
+    async fn swap_root_and_rebaseline(
         &mut self,
         generation: GenerationId,
-        base: GenerationId,
-        label: &str,
-    ) -> Result<PromoteOutcome> {
-        self.state = State::Rewinding;
-        self.store.checkout = self
-            .store
-            .volume
-            .checkout(
-                acyclic_fs::model::GenerationSelector::Head,
-                crate::store::writable_head(),
-                WorkCounters::UNBOUNDED,
-                &self.cancel,
-            )
-            .await
-            .map_err(EngineError::fs("refresh checkout"))?
-            .value;
-        // Same v1 stance as promote: if the mainline published anything since
-        // the fork's base, the head has moved off `base` and applying would
-        // clobber it. Detected here rather than at resolve, because resolve
-        // deliberately leaves the head at base (unpublished overlay).
-        if self.store.checkout.generation_id() != base {
-            self.state = State::Ready;
-            return Ok(PromoteOutcome::Conflict {
-                message: format!(
-                    "the working tree moved past the session's base ({}); \
-                     Safe Mode in v1 requires an unmoved mainline — rewind to \
-                     the base or start a new session",
-                    crate::generation_hex(base)
-                ),
-            });
-        }
-        let row = self.index.record(
-            generation,
-            CheckpointKind::Manual,
-            &Attribution {
-                label: Some(label.to_owned()),
-                ..Attribution::default()
-            },
-        )?;
-        self.last_generation = generation;
-        self.last_checkpoint_row = Some(row);
-
-        let swap = rewind::execute(
+    ) -> Result<RewindOutcome> {
+        drop(self.watch.take());
+        let prepared = rewind::prepare(
             &self.store,
             generation,
             self.config.trash_ttl_days,
             &self.exclusions,
         )
-        .await;
+        .await?;
+        let current = self
+            .store
+            .workspace
+            .head()
+            .await
+            .map_err(EngineError::fs("workspace head before rewind"))?;
+        let target = self
+            .store
+            .workspace
+            .generation(generation)
+            .await
+            .map_err(EngineError::fs("rewind generation"))?;
+        prepared.mark_restoring_head()?;
+        match self
+            .store
+            .workspace
+            .restore_generation(
+                &target,
+                current.id(),
+                crate::rewind::publication_key(generation)?,
+            )
+            .await
+            .map_err(EngineError::fs("restore workspace generation"))?
+        {
+            WorkspaceRestore::Restored(_)
+            | WorkspaceRestore::AlreadyRestored(_)
+            | WorkspaceRestore::Current(_) => {}
+            WorkspaceRestore::Stale(_)
+            | WorkspaceRestore::Fenced
+            | WorkspaceRestore::IdempotencyConflict => {
+                return Err(EngineError::Store(
+                    "workspace head changed during rewind".into(),
+                ));
+            }
+        }
+        let outcome = prepared.publish();
+        self.store.checkout = self
+            .store
+            .workspace
+            .checkout(
+                acyclic_fs::model::GenerationSelector::Head,
+                crate::store::writable_head(),
+            )
+            .await
+            .map_err(EngineError::fs("refresh rewind checkout"))?;
         self.reset_watch().await?;
         self.baseline(CheckpointKind::Recovered).await?;
-        let swap = swap?;
-        Ok(PromoteOutcome::Promoted {
-            generation,
-            old_tree: Some(swap.old_tree),
-        })
+        outcome
     }
 
     /// Reopens the watcher and recomputes the capture root identity — needed
@@ -2239,16 +2204,20 @@ impl Pipeline {
         let repo_root = self.store.repo_root.clone();
         self.options.expected_root_identity =
             capture_root_identity(&repo_root).map_err(EngineError::fs("root identity"))?;
-        self.watch = NativeWatch::open(
-            &repo_root,
-            NativeWatchOptions {
-                limits: VolumeLimits::default(),
-                maximum_queued_changes: WATCH_QUEUE,
-                recursive: true,
-            },
-        )
-        .map_err(EngineError::fs("reopen watcher"))?;
+        self.watch = Some(
+            NativeWatch::open(
+                &repo_root,
+                NativeWatchOptions {
+                    limits: VolumeLimits::default(),
+                    maximum_queued_changes: WATCH_QUEUE,
+                    recursive: true,
+                },
+            )
+            .map_err(EngineError::fs("reopen watcher"))?,
+        );
         self.watch
+            .as_mut()
+            .ok_or_else(|| EngineError::Store("watcher is inactive".into()))?
             .begin_rescan()
             .map_err(EngineError::fs("begin rescan"))?;
         Ok(())
@@ -2258,8 +2227,9 @@ impl Pipeline {
 #[cfg(test)]
 mod root_hint_tests {
     use super::*;
-    use acyclic_fs::kernel::{LogicalName, NamespacePath};
+    use acyclic_fs::kernel::NamespacePath;
     use acyclic_fs::{WatchEpoch, WatchSequence};
+    use std::path::Path;
 
     fn root() -> NamespacePath {
         NamespacePath::new(Vec::new(), VolumeLimits::default()).unwrap()
@@ -2267,13 +2237,8 @@ mod root_hint_tests {
 
     fn file(name: &str) -> NamespacePath {
         let limits = VolumeLimits::default();
-        let name = LogicalName::new(
-            crate::names::encoding(),
-            crate::names::str_to_bytes(name),
-            limits.maximum_component_bytes,
-        )
-        .unwrap();
-        NamespacePath::new(vec![name], limits).unwrap()
+        acyclic_fs::host_path_to_namespace(Path::new(name), crate::store::host_profile(), limits)
+            .unwrap()
     }
 
     fn batch(changes: Vec<WatchChange>) -> WatchBatch {
@@ -2343,5 +2308,102 @@ mod root_hint_tests {
         let (out, hint) = strip_root_hints(input);
         assert_eq!(hint, RootHint::None);
         assert!(matches!(out, WatchBatch::RescanRequired { .. }));
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod continuity_tests {
+    use super::*;
+
+    fn record() -> ContinuityRecord {
+        let mut bytes = [0_u8; 40];
+        bytes[..8].copy_from_slice(b"ACYUSN\0\x01");
+        bytes[8..24].copy_from_slice(&[7; 16]);
+        bytes[24..32].copy_from_slice(&19_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&23_u64.to_le_bytes());
+        let usn = acyclic_fs::WindowsUsnCheckpoint::from_bytes(&bytes).expect("canonical fixture");
+        ContinuityRecord {
+            generation: GenerationId::new(acyclic_fs::Digest::from_bytes([3; 32])),
+            row: 7,
+            usn,
+        }
+    }
+
+    #[test]
+    fn continuity_record_is_canonical_and_rejects_torn_state() {
+        let record = record();
+        let bytes = record.encode();
+        let decoded = ContinuityRecord::decode(&bytes).expect("canonical record");
+        assert_eq!(decoded.generation, record.generation);
+        assert_eq!(decoded.row, record.row);
+        assert_eq!(decoded.usn, record.usn);
+        assert!(ContinuityRecord::decode(&bytes[..CONTINUITY_BYTES - 1]).is_none());
+        let mut wrong_version = bytes;
+        wrong_version[0] ^= 0xff;
+        assert!(ContinuityRecord::decode(&wrong_version).is_none());
+        let mut invalid_row = bytes;
+        invalid_row[40..48].copy_from_slice(&0_i64.to_le_bytes());
+        assert!(ContinuityRecord::decode(&invalid_row).is_none());
+    }
+
+    #[test]
+    fn durable_replacement_keeps_only_the_complete_new_record() {
+        let directory = tempfile::tempdir().expect("store");
+        let path = directory.path().join("continuity.bin");
+        let first = record().encode();
+        crate::store::durable_replace(&path, &first).expect("first replace");
+        let mut second = record();
+        second.row += 1;
+        crate::store::durable_replace(&path, &second.encode()).expect("second replace");
+        let stored = std::fs::read(path).expect("read marker");
+        assert_eq!(
+            ContinuityRecord::decode(&stored).expect("complete").row,
+            second.row
+        );
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_requests_do_not_force_a_repository_scan() {
+        let (status_reply, _) = oneshot::channel();
+        assert!(!Request::Status {
+            reply: status_reply
+        }
+        .requires_ready());
+
+        let (turn_reply, _) = oneshot::channel();
+        assert!(!Request::TurnStarted {
+            session_id: "session".to_owned(),
+            prompt: "prompt".to_owned(),
+            reply: turn_reply,
+        }
+        .requires_ready());
+
+        let (started_reply, _) = oneshot::channel();
+        assert!(!Request::SessionStarted {
+            session_id: "session".to_owned(),
+            host: "host".to_owned(),
+            reply: started_reply,
+        }
+        .requires_ready());
+
+        let (ended_reply, _) = oneshot::channel();
+        assert!(!Request::SessionEnded {
+            session_id: "session".to_owned(),
+            reply: ended_reply,
+        }
+        .requires_ready());
+
+        let (checkpoint_reply, _) = oneshot::channel();
+        assert!(Request::Checkpoint {
+            kind: CheckpointKind::Manual,
+            attribution: Attribution::default(),
+            reply: checkpoint_reply,
+        }
+        .requires_ready());
     }
 }

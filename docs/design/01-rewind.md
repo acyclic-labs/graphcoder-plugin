@@ -116,7 +116,7 @@ leads with what it can't do:
 4. **Hardcoded constants that are really policy** — mutation batch size,
    maximum capture paths, extent spans, watch queue depth, prompt excerpt
    bytes. None are configurable and none are documented.
-5. **Excluded paths are invisible to forks and Safe Mode sessions.** A secret
+5. **Excluded paths are invisible to forks.** A secret
    kept out of the store is also absent from every fork, which is either the
    correct safety property or a broken build, depending on the secret. *No
    lean.*

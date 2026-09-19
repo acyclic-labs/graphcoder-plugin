@@ -10,8 +10,8 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use acyclic_engine::product::NAME;
-use acyclic_proto as proto;
+use crate::proto;
+use acyclic::product::NAME;
 
 use crate::client::{Client, ConnectError, Spawn};
 
@@ -136,7 +136,7 @@ impl HookEvent {
 
 pub fn run(repo: &Path, event: &str) -> i32 {
     let Some(event) = HookEvent::parse(event) else {
-        acyclic_engine::trace!("hook", "unknown event {event:?}: ignored");
+        acyclic::trace!("hook", "unknown event {event:?}: ignored");
         return 0;
     };
     // Reading stdin can't hang the agent: hosts close it after writing.
@@ -164,7 +164,7 @@ pub fn run(repo: &Path, event: &str) -> i32 {
     } else {
         Spawn::Never
     };
-    acyclic_engine::trace!(
+    acyclic::trace!(
         "hook",
         "event {}: daemon spawn {}; pre-tool waits (bounded), post-tool enqueues (ack before capture)",
         event.as_arg(),
@@ -395,12 +395,11 @@ mod tests {
     fn scratch() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join(acyclic_engine::product::repo_config_dir()))
-            .expect("repo");
+        std::fs::create_dir_all(repo.join(acyclic::product::repo_config_dir())).expect("repo");
         let stores = dir.path().join("stores");
         std::fs::create_dir_all(&stores).expect("stores");
         std::fs::write(
-            repo.join(acyclic_engine::product::repo_config_file()),
+            repo.join(acyclic::product::repo_config_file()),
             format!("store_dir = {:?}\n", stores.to_string_lossy()),
         )
         .expect("config");

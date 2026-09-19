@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the full acceptance suite against the built binaries.
-#   ACYCLIC_BIN / ACYCLIC_QUAL   override binary paths (default: target/debug)
+#   ACYCLIC_BIN / ACYCLIC_QUAL   override plugin and SDK qualifier paths
 #   Individual scripts also run standalone.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

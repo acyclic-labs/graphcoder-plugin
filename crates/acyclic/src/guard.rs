@@ -5,7 +5,7 @@
 //! interposition, and its routing is single-level and non-overlaying — it
 //! cannot layer a read-only view over part of a writable fork. Guarding
 //! therefore wraps the *inner* source (a fork's `CheckoutMountSource`)
-//! directly, before it is ever registered as a route or shadow mount, so
+//! directly, before it is registered as a fork route, so
 //! guarded prefixes work at any depth.
 
 use acyclic_fs::kernel::FileMetadata;
@@ -44,18 +44,25 @@ impl GuardedPrefix {
 /// Splits a configured guarded path into the component bytes a
 /// [`MountPath`] carries.
 ///
-/// The encoding has to be the host's (see [`crate::names`]), not UTF-8: these
+/// The encoding has to be the host's, not UTF-8: these
 /// components are compared byte-for-byte against the names the mount layer
 /// hands us. Comparing UTF-8 against a host that speaks UTF-16LE never
 /// matches, and a guard that never matches fails *open* — every guarded path
 /// would silently accept writes.
 fn parse_guarded_path(path: &str) -> Vec<Vec<u8>> {
-    path.trim()
-        .trim_matches('/')
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .map(crate::names::str_to_bytes)
-        .collect()
+    let config = crate::store::volume_config();
+    acyclic_fs::host_path_to_namespace(
+        Path::new(path.trim().trim_matches('/')),
+        config.profile,
+        config.limits,
+    )
+    .map(|path| {
+        path.components()
+            .iter()
+            .map(|name| name.as_bytes().to_vec())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Wraps one [`MountFilesystem`] and rejects mutating calls under any
@@ -99,7 +106,7 @@ impl GuardedMountFilesystem {
     /// Whether a mutating call to `path` must be refused: either it falls
     /// under a configured guarded prefix, or its leaf is a macOS `AppleDouble`
     /// sidecar (`._X`). Sidecars are written by the macOS client over the
-    /// mount to carry a file's xattrs / resource fork; in a Safe Mode or fork
+    /// mount to carry a file's xattrs / resource fork; in a fork
     /// projection they are pure transport noise that would otherwise pollute
     /// the session diff and litter the real tree on apply, and a guarded
     /// file's metadata must not leak into one either. Dropping every sidecar
@@ -124,7 +131,7 @@ impl GuardedMountFilesystem {
 /// bytes the mount layer carries, and on a UTF-16LE host an ASCII literal
 /// matches nothing.
 fn is_appledouble(path: &MountPath) -> bool {
-    let prefix = crate::names::str_to_bytes("._");
+    let prefix = parse_guarded_path("._").pop().unwrap_or_default();
     path.components()
         .last()
         .is_some_and(|leaf| leaf.starts_with(&prefix))
@@ -466,6 +473,15 @@ impl MountFilesystem for GuardedMountFilesystem {
         self.guard(path)?;
         self.inner.capture_host_path(source_root, path)
     }
+
+    fn capture_host_subtree(
+        &self,
+        source_root: &Path,
+        path: &MountPath,
+    ) -> Result<(), MountSourceError> {
+        self.guard(path)?;
+        self.inner.capture_host_subtree(source_root, path)
+    }
 }
 
 #[cfg(test)]
@@ -484,7 +500,8 @@ mod tests {
     fn test_path(components: &[&str]) -> MountPath {
         let mut path = MountPath::root();
         for component in components {
-            path = path.child(crate::names::str_to_bytes(component));
+            let bytes = parse_guarded_path(component).pop().expect("component");
+            path = path.child(bytes);
         }
         path
     }

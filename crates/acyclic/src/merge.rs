@@ -4,149 +4,39 @@
 //! **H** ("theirs"), and the fork snapshot **F** ("ours"; the fork is
 //! `ours` because it merges *into* the mainline, graphcoder's convention).
 //! [`plan`] walks the union of changed paths, applies the entry-level
-//! decision table, runs [`merge3`] on regular text files both sides
+//! decision table, runs the SDK text driver on regular text files both sides
 //! changed, and returns everything the daemon needs to either land the
 //! merge or rebase the fork with conflict markers. Nothing here writes to
 //! the working tree.
 //!
-//! `merge3`, its trailing-newline rule, and [`has_conflict_markers`] are
-//! verbatim ports of graphcoder's `lib/compute/src/merge.rs` and
-//! `local/src/lib/worktree/conflict/markers.ts`.
+//! The SDK owns marker and newline semantics so every consumer sees the same result.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use acyclic_fs::kernel::{FileKind, FileMetadata, MetadataField, NamespacePath};
-use acyclic_fs::{ByteRange, CancellationToken, GenerationId, WorkCounters};
+use acyclic_fs::kernel::{FileKind, FileMetadata, FileRecord, MetadataField, NamespacePath};
+pub use acyclic_fs::text_merge::{
+    conflict_hunks, has_conflict_markers, ByteConflictKind as ConflictKind,
+};
+use acyclic_fs::text_merge::{
+    merge_bytes, ByteMerge as ContentMerge, ByteMergeError, ByteMergeLimits,
+};
+use acyclic_fs::{
+    AuthoredMutation, ByteRange, CancellationToken, GenerationId, ResolvedFileRangeReadRequest,
+    WorkCounters,
+};
 use bytes::Bytes;
 
-use crate::diff::{self, RecordSummary};
-use crate::rewind::{namespace_path, validate_relative};
+use crate::diff;
+use crate::rewind::validate_relative;
 use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
 
 /// Default `[merge] max_file_bytes`.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TRANSFER_BYTES: u64 = 8 * 1024 * 1024;
+const FILE_READ_CONCURRENCY: usize = 32;
 const PAGE_ENTRIES: u32 = 1_024;
-const BINARY_PROBE_BYTES: usize = 8 * 1024;
-
-// ---------------------------------------------------------------------------
-// merge3: graphcoder's three-way text merge, ported verbatim
-// ---------------------------------------------------------------------------
-
-/// Result of a 3-way merge operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Merge3Result {
-    /// True if merge completed without conflicts.
-    pub clean: bool,
-    /// Merged content. If clean=false, contains conflict markers.
-    pub content: String,
-}
-
-/// Ensures a string ends with a newline so conflict markers always occupy
-/// complete lines. Borrows when nothing needs adding.
-fn ensure_trailing_newline(s: &str) -> Cow<'_, str> {
-    if s.is_empty() || s.ends_with('\n') {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(format!("{s}\n"))
-    }
-}
-
-/// Whether the clean result keeps a trailing newline: if ours and theirs
-/// agree, that; else if ours agrees with base, theirs decides; else ours.
-fn merged_has_trailing_newline(base: &str, ours: &str, theirs: &str) -> bool {
-    let base_has_newline = base.ends_with('\n');
-    let ours_has_newline = ours.ends_with('\n');
-    let theirs_has_newline = theirs.ends_with('\n');
-    if ours_has_newline == theirs_has_newline {
-        ours_has_newline
-    } else if ours_has_newline == base_has_newline {
-        theirs_has_newline
-    } else {
-        ours_has_newline
-    }
-}
-
-/// Performs a 3-way merge (diffy, diff3 conflict style, marker length 7).
-///
-/// Conflict marker format:
-/// ```text
-/// <<<<<<< {ours_name}
-/// ... ours content ...
-/// ||||||| original
-/// ... base content ...
-/// =======
-/// ... theirs content ...
-/// >>>>>>> {theirs_name}
-/// ```
-pub fn merge3(
-    base: &str,
-    ours: &str,
-    theirs: &str,
-    ours_name: &str,
-    theirs_name: &str,
-) -> Merge3Result {
-    use diffy::{ConflictStyle, MergeOptions};
-
-    let mut options = MergeOptions::new();
-    options
-        .set_conflict_style(ConflictStyle::Diff3)
-        .set_conflict_marker_length(7);
-
-    let base_norm = ensure_trailing_newline(base);
-    let ours_norm = ensure_trailing_newline(ours);
-    let theirs_norm = ensure_trailing_newline(theirs);
-
-    match options.merge(&base_norm, &ours_norm, &theirs_norm) {
-        Ok(mut merged) => {
-            if !merged_has_trailing_newline(base, ours, theirs) {
-                merged.pop();
-            }
-            Merge3Result {
-                clean: true,
-                content: merged,
-            }
-        }
-        Err(merged_with_conflicts) => {
-            let content = merged_with_conflicts
-                .replace("<<<<<<< ours", &format!("<<<<<<< {ours_name}"))
-                .replace(">>>>>>> theirs", &format!(">>>>>>> {theirs_name}"));
-            Merge3Result {
-                clean: false,
-                content,
-            }
-        }
-    }
-}
-
-/// Whether `content` still holds a generated conflict block: a `<<<<<<< `
-/// marker at the start of a line AND a `=======` line. Recognizes the
-/// `(modified)` / `(deleted)` label variants by construction.
-pub fn has_conflict_markers(content: &str) -> bool {
-    let opens = content
-        .split_inclusive('\n')
-        .any(|line| line.starts_with("<<<<<<< ") || line.starts_with("<<<<<<<\t"));
-    if !opens {
-        return false;
-    }
-    content
-        .lines()
-        .any(|line| line == "=======" || line == "=======\r")
-}
-
-/// Number of conflict blocks in marker-bearing content.
-pub fn conflict_hunks(content: &str) -> u32 {
-    content
-        .lines()
-        .filter(|line| line.starts_with("<<<<<<< "))
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX)
-}
-
 // ---------------------------------------------------------------------------
 // Per-path decision table
 // ---------------------------------------------------------------------------
@@ -214,39 +104,6 @@ impl std::fmt::Display for Reason {
     }
 }
 
-/// What kind of conflict a marker-bearing file carries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ConflictKind {
-    /// Overlapping hunks; `hunks` counts the blocks.
-    Hunks,
-    /// The fork modified a file the mainline deleted.
-    TheirsDeleted,
-    /// The mainline modified a file the fork deleted.
-    OursDeleted,
-}
-
-/// Outcome of merging one regular file that both sides changed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ContentMerge {
-    Merged(Vec<u8>),
-    Conflicted {
-        bytes: Vec<u8>,
-        hunks: u32,
-        kind: ConflictKind,
-    },
-}
-
-/// The text gate: UTF-8, no NUL in the probe window, under the size cap.
-fn text_gate<'a>(bytes: &'a [u8], limits: &MergeLimits) -> std::result::Result<&'a str, Reason> {
-    if bytes.len() as u64 > limits.max_file_bytes {
-        return Err(Reason::TooLarge);
-    }
-    if bytes.iter().take(BINARY_PROBE_BYTES).any(|byte| *byte == 0) {
-        return Err(Reason::Binary);
-    }
-    std::str::from_utf8(bytes).map_err(|_| Reason::Binary)
-}
-
 /// Merges one regular file both sides changed. `None` on a side means that
 /// side deleted the file; `base` is `None` when both sides added it.
 pub fn merge_file(
@@ -257,82 +114,20 @@ pub fn merge_file(
     theirs_name: &str,
     limits: &MergeLimits,
 ) -> std::result::Result<ContentMerge, Reason> {
-    fn gate<'a>(
-        side: Option<&'a [u8]>,
-        limits: &MergeLimits,
-    ) -> std::result::Result<Option<&'a str>, Reason> {
-        match side {
-            None => Ok(None),
-            Some(bytes) => text_gate(bytes, limits).map(Some),
-        }
-    }
-    let base_text = gate(base, limits)?;
-    let ours_text = gate(ours, limits)?;
-    let theirs_text = gate(theirs, limits)?;
-    match (ours_text, theirs_text) {
-        (Some(ours), Some(theirs)) => {
-            if ours == theirs {
-                return Ok(ContentMerge::Merged(ours.as_bytes().to_vec()));
-            }
-            let result = merge3(
-                base_text.unwrap_or(""),
-                ours,
-                theirs,
-                ours_name,
-                theirs_name,
-            );
-            if result.clean {
-                Ok(ContentMerge::Merged(result.content.into_bytes()))
-            } else {
-                let hunks = conflict_hunks(&result.content);
-                Ok(ContentMerge::Conflicted {
-                    bytes: result.content.into_bytes(),
-                    hunks,
-                    kind: ConflictKind::Hunks,
-                })
-            }
-        }
-        (Some(ours), None) => Ok(modify_delete(
-            base_text.unwrap_or(""),
-            ours,
-            &format!("{ours_name} (modified)"),
-            &format!("{theirs_name} (deleted)"),
-            ConflictKind::TheirsDeleted,
-        )),
-        (None, Some(theirs)) => Ok(modify_delete(
-            base_text.unwrap_or(""),
-            theirs,
-            &format!("{ours_name} (deleted)"),
-            &format!("{theirs_name} (modified)"),
-            ConflictKind::OursDeleted,
-        )),
-        (None, None) => Ok(ContentMerge::Merged(Vec::new())),
-    }
-}
-
-/// A modify/delete conflict is always a conflict: one block holding the
-/// surviving content against nothing, with the base in the middle.
-fn modify_delete(
-    base: &str,
-    kept: &str,
-    ours_label: &str,
-    theirs_label: &str,
-    kind: ConflictKind,
-) -> ContentMerge {
-    let base = ensure_trailing_newline(base);
-    let kept = ensure_trailing_newline(kept);
-    let (ours_block, theirs_block) = match kind {
-        ConflictKind::TheirsDeleted => (kept.as_ref(), ""),
-        _ => ("", kept.as_ref()),
-    };
-    let content = format!(
-        "<<<<<<< {ours_label}\n{ours_block}||||||| original\n{base}=======\n{theirs_block}>>>>>>> {theirs_label}\n"
-    );
-    ContentMerge::Conflicted {
-        bytes: content.into_bytes(),
-        hunks: 1,
-        kind,
-    }
+    merge_bytes(
+        base,
+        ours,
+        theirs,
+        ours_name,
+        theirs_name,
+        ByteMergeLimits {
+            max_bytes: limits.max_file_bytes,
+        },
+    )
+    .map_err(|error| match error {
+        ByteMergeError::Binary => Reason::Binary,
+        ByteMergeError::TooLarge => Reason::TooLarge,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -444,28 +239,166 @@ fn descendants<'a>(
         .filter(move |next| next.as_path() != path)
 }
 
-/// Paths whose content differs between two summary maps (added, removed,
-/// or kind/payload changed). Metadata-only differences do not count.
-fn changed_paths(
-    before: &BTreeMap<PathBuf, RecordSummary>,
-    after: &BTreeMap<PathBuf, RecordSummary>,
-) -> BTreeSet<PathBuf> {
-    let mut set = BTreeSet::new();
-    for (path, summary) in before {
-        match after.get(path) {
-            Some(other) if other.same_content(summary) => {}
-            _ => {
-                set.insert(path.clone());
+async fn changed_paths(
+    before: &crate::store::LocalGeneration,
+    after: &crate::store::LocalGeneration,
+) -> Result<BTreeSet<PathBuf>> {
+    let changes = before
+        .diff_to(after, u32::MAX)
+        .await
+        .map_err(EngineError::fs("diff merge generations"))?
+        .changed_paths(u32::MAX)
+        .await
+        .map_err(EngineError::fs("resolve merge paths"))?;
+    changes
+        .into_iter()
+        .filter(|change| match (change.before, change.after) {
+            (Some(before), Some(after)) => {
+                before.kind != after.kind
+                    || (before.kind != FileKind::Directory && before.payload != after.payload)
             }
-        }
+            _ => true,
+        })
+        .map(|change| {
+            acyclic_fs::namespace_to_host_path(&change.path)
+                .map_err(EngineError::fs("resolve merge host path"))
+        })
+        .filter(|path| match path {
+            Ok(path) => !diff::is_git_internal(path),
+            Err(_) => true,
+        })
+        .collect()
+}
+
+async fn records_at(
+    generation: &crate::store::LocalGeneration,
+    paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, FileRecord>> {
+    if paths.is_empty() {
+        return Ok(BTreeMap::new());
     }
-    for path in after.keys() {
-        if !before.contains_key(path) {
-            set.insert(path.clone());
-        }
+    let namespaces = paths
+        .iter()
+        .map(|path| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    let records = generation
+        .lookup_paths(
+            &namespaces,
+            WorkCounters::UNBOUNDED,
+            &CancellationToken::new(),
+        )
+        .await
+        .map_err(EngineError::fs("lookup merge paths"))?
+        .value;
+    Ok(paths
+        .iter()
+        .cloned()
+        .zip(records)
+        .filter_map(|(path, record)| record.map(|record| (path, record)))
+        .collect())
+}
+
+struct MergeInputs {
+    base: BTreeMap<PathBuf, FileRecord>,
+    theirs: BTreeMap<PathBuf, FileRecord>,
+    ours: BTreeMap<PathBuf, FileRecord>,
+    ours_changed: BTreeSet<PathBuf>,
+    theirs_changed: BTreeSet<PathBuf>,
+}
+
+fn regular_paths(records: &BTreeMap<PathBuf, FileRecord>) -> Vec<PathBuf> {
+    records
+        .iter()
+        .filter(|(_, record)| record.kind == FileKind::Regular)
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+async fn regular_contents(
+    store: &Store,
+    generation: GenerationId,
+    records: &BTreeMap<PathBuf, FileRecord>,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let paths = regular_paths(records);
+    let contents = read_files(store, generation, &paths).await?;
+    paths
+        .into_iter()
+        .zip(contents)
+        .map(|(path, content)| {
+            content
+                .map(|content| (path.clone(), content))
+                .ok_or_else(|| {
+                    EngineError::Fs(format!("{}: regular file is absent", path.display()))
+                })
+        })
+        .collect()
+}
+
+async fn record_modes(
+    store: &Store,
+    generation: GenerationId,
+    records: &BTreeMap<PathBuf, FileRecord>,
+) -> Result<BTreeMap<PathBuf, Option<u32>>> {
+    if records.is_empty() {
+        return Ok(BTreeMap::new());
     }
-    set.retain(|path| !diff::is_git_internal(path));
-    set
+    let checkout = store.checkout_exact(generation).await?;
+    let reader = checkout
+        .pinned_reader()
+        .map_err(EngineError::fs("open pinned reader"))?;
+    let paths = records
+        .keys()
+        .map(|path| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    let metadata = reader
+        .describe_files(&paths, WorkCounters::UNBOUNDED, &CancellationToken::new())
+        .await
+        .map_err(EngineError::fs("batch read metadata"))?
+        .value;
+    Ok(records
+        .keys()
+        .cloned()
+        .zip(metadata)
+        .map(|(path, description)| {
+            let mode = description.and_then(|description| match description.metadata.posix_mode {
+                MetadataField::Value(mode) => Some(mode & 0o7777),
+                MetadataField::Unavailable => None,
+            });
+            (path, mode)
+        })
+        .collect())
+}
+
+fn regular_content<'a>(contents: &'a BTreeMap<PathBuf, Vec<u8>>, path: &Path) -> Result<&'a [u8]> {
+    contents
+        .get(path)
+        .map(Vec::as_slice)
+        .ok_or_else(|| EngineError::Fs(format!("{}: regular content is absent", path.display())))
+}
+
+fn mode_at(modes: &BTreeMap<PathBuf, Option<u32>>, path: &Path) -> Option<u32> {
+    modes.get(path).copied().flatten()
+}
+
+async fn merge_inputs(
+    store: &Store,
+    base: GenerationId,
+    theirs: GenerationId,
+    ours: GenerationId,
+) -> Result<MergeInputs> {
+    let base_generation = store.generation(base).await?;
+    let theirs_generation = store.generation(theirs).await?;
+    let ours_generation = store.generation(ours).await?;
+    let ours_changed = changed_paths(&base_generation, &ours_generation).await?;
+    let theirs_changed = changed_paths(&base_generation, &theirs_generation).await?;
+    let paths: Vec<_> = ours_changed.union(&theirs_changed).cloned().collect();
+    Ok(MergeInputs {
+        base: records_at(&base_generation, &paths).await?,
+        theirs: records_at(&theirs_generation, &paths).await?,
+        ours: records_at(&ours_generation, &paths).await?,
+        ours_changed,
+        theirs_changed,
+    })
 }
 
 /// Computes the merge of fork `ours` onto mainline `theirs` from `base`.
@@ -481,15 +414,23 @@ pub async fn plan(
     ours_name: &str,
     limits: &MergeLimits,
 ) -> Result<MergePlan> {
-    let base_map = diff::summaries(store, base).await?;
-    let theirs_map = diff::summaries(store, theirs).await?;
-    let ours_map = diff::summaries(store, ours).await?;
-    let ours_changed = changed_paths(&base_map, &ours_map);
-    let theirs_changed = changed_paths(&base_map, &theirs_map);
+    let inputs = merge_inputs(store, base, theirs, ours).await?;
+    let MergeInputs {
+        base: base_map,
+        theirs: theirs_map,
+        ours: ours_map,
+        ours_changed,
+        theirs_changed,
+    } = inputs;
 
-    let mut base_checkout = store.checkout_exact(base).await?;
-    let mut theirs_checkout = store.checkout_exact(theirs).await?;
-    let mut ours_checkout = store.checkout_exact(ours).await?;
+    let (base_contents, theirs_contents, ours_contents, base_modes, theirs_modes, ours_modes) = tokio::try_join!(
+        regular_contents(store, base, &base_map),
+        regular_contents(store, theirs, &theirs_map),
+        regular_contents(store, ours, &ours_map),
+        record_modes(store, base, &base_map),
+        record_modes(store, theirs, &theirs_map),
+        record_modes(store, ours, &ours_map),
+    )?;
 
     let mut plan = MergePlan::default();
     let mut decided_root: Option<PathBuf> = None;
@@ -516,7 +457,7 @@ pub async fn plan(
         let b = base_map.get(path);
         let h = theirs_map.get(path);
         let f = ours_map.get(path);
-        let kind = |summary: Option<&RecordSummary>| summary.map(|s| s.kind);
+        let kind = |record: Option<&FileRecord>| record.map(|record| record.kind);
         match (kind(b), kind(f), kind(h)) {
             // Nothing to decide here: both deleted it (or both changed it
             // inside a now-absent dir), or independent edits below one
@@ -529,11 +470,11 @@ pub async fn plan(
             ) => {}
             // Regular files on both sides.
             (_, Some(FileKind::Regular), Some(FileKind::Regular)) => {
-                if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) {
+                if f.map(|record| record.payload) == h.map(|record| record.payload) {
                     continue;
                 }
                 let base_bytes = match kind(b) {
-                    Some(FileKind::Regular) => Some(read_regular(&mut base_checkout, path).await?),
+                    Some(FileKind::Regular) => Some(regular_content(&base_contents, path)?),
                     None => None,
                     Some(_) => {
                         plan.refusals.push(Refusal {
@@ -543,21 +484,21 @@ pub async fn plan(
                         continue;
                     }
                 };
-                let ours_bytes = read_regular(&mut ours_checkout, path).await?;
-                let theirs_bytes = read_regular(&mut theirs_checkout, path).await?;
+                let ours_bytes = regular_content(&ours_contents, path)?;
+                let theirs_bytes = regular_content(&theirs_contents, path)?;
                 let mode = merged_mode(
-                    read_mode(&mut base_checkout, path).await?,
-                    read_mode(&mut ours_checkout, path).await?,
-                    read_mode(&mut theirs_checkout, path).await?,
+                    mode_at(&base_modes, path),
+                    mode_at(&ours_modes, path),
+                    mode_at(&theirs_modes, path),
                 );
                 push_content(
                     &mut plan,
                     path,
                     mode,
                     merge_file(
-                        base_bytes.as_deref(),
-                        Some(&ours_bytes),
-                        Some(&theirs_bytes),
+                        base_bytes,
+                        Some(ours_bytes),
+                        Some(theirs_bytes),
                         ours_name,
                         "mainline",
                         limits,
@@ -567,18 +508,18 @@ pub async fn plan(
             // Modify/delete in either direction.
             (Some(FileKind::Regular), Some(FileKind::Regular), None)
             | (Some(FileKind::Regular), None, Some(FileKind::Regular)) => {
-                let base_bytes = read_regular(&mut base_checkout, path).await?;
+                let base_bytes = regular_content(&base_contents, path)?;
                 let (ours_bytes, theirs_bytes, mode) = if f.is_some() {
                     (
-                        Some(read_regular(&mut ours_checkout, path).await?),
+                        Some(regular_content(&ours_contents, path)?),
                         None,
-                        read_mode(&mut ours_checkout, path).await?,
+                        mode_at(&ours_modes, path),
                     )
                 } else {
                     (
                         None,
-                        Some(read_regular(&mut theirs_checkout, path).await?),
-                        read_mode(&mut theirs_checkout, path).await?,
+                        Some(regular_content(&theirs_contents, path)?),
+                        mode_at(&theirs_modes, path),
                     )
                 };
                 push_content(
@@ -586,9 +527,9 @@ pub async fn plan(
                     path,
                     mode,
                     merge_file(
-                        Some(&base_bytes),
-                        ours_bytes.as_deref(),
-                        theirs_bytes.as_deref(),
+                        Some(base_bytes),
+                        ours_bytes,
+                        theirs_bytes,
                         ours_name,
                         "mainline",
                         limits,
@@ -614,7 +555,7 @@ pub async fn plan(
             }
             // Symlinks retargeted identically are fine.
             (_, Some(FileKind::SymbolicLink), Some(FileKind::SymbolicLink))
-                if f.and_then(|s| s.payload) == h.and_then(|s| s.payload) => {}
+                if f.map(|record| record.payload) == h.map(|record| record.payload) => {}
             // Everything else is a kind clash: a file on one side and a
             // directory or symlink on the other, symlinks retargeted
             // differently, or a file that became a directory on both sides.
@@ -670,99 +611,97 @@ fn merged_mode(base: Option<u32>, ours: Option<u32>, theirs: Option<u32>) -> Opt
 }
 
 pub(crate) fn namespace_of(path: &Path) -> Result<NamespacePath> {
-    let components = validate_relative(path)?;
-    namespace_path(&components, acyclic_fs::model::VolumeLimits::default())
+    validate_relative(path)?;
+    let config = crate::store::volume_config();
+    acyclic_fs::host_path_to_namespace(path, config.profile, config.limits)
+        .map_err(EngineError::fs("host path to namespace"))
 }
 
-/// Whole content of a regular file at `path` in `checkout`.
-pub(crate) async fn read_regular(checkout: &mut LocalCheckout, path: &Path) -> Result<Vec<u8>> {
+/// Contents of regular files in one generation, preserving request order.
+/// Opens and authenticates the generation once and resolves every namespace
+/// path in one SDK batch; absent and non-regular entries remain `None`.
+pub async fn read_files(
+    store: &Store,
+    generation: GenerationId,
+    paths: &[PathBuf],
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let checkout = store.checkout_exact(generation).await?;
+    let namespaces = paths
+        .iter()
+        .map(|path| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    if namespaces.is_empty() {
+        return Ok(Vec::new());
+    }
     let cancel = CancellationToken::new();
-    let namespace = namespace_of(path)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
+    let reader = checkout
+        .pinned_reader()
+        .map_err(EngineError::fs("open pinned reader"))?;
+    let files = reader
+        .resolve_files(&namespaces, WorkCounters::UNBOUNDED, &cancel)
         .await
-        .map_err(EngineError::fs("lookup"))?
+        .map_err(EngineError::fs("resolve files"))?
         .value;
-    let record = lookup
-        .record
-        .ok_or_else(|| EngineError::Fs(format!("{}: absent", path.display())))?;
-    let length = match record.payload {
-        acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
-        acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => logical_bytes,
-        _ => {
-            return Err(EngineError::Fs(format!(
-                "{}: not a regular file",
-                path.display()
-            )))
-        }
-    };
     let limits = checkout.volume_config().limits;
     let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
-    let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-    let mut offset = 0;
-    while offset < length {
-        let take = chunk.min(length - offset);
-        let read = checkout
-            .read_file_range(
-                &namespace,
-                ByteRange {
+    let mut contents = vec![None; paths.len()];
+    let mut pending = Vec::new();
+    let mut destinations = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let Some(file) = file else {
+            continue;
+        };
+        let description = file.description();
+        if description.kind != FileKind::Regular {
+            continue;
+        }
+        let length = description.logical_bytes;
+        let display_path = paths
+            .get(index)
+            .ok_or_else(|| EngineError::Fs("batch lookup returned too many entries".into()))?;
+        let capacity = usize::try_from(length).map_err(|_| {
+            EngineError::Fs(format!(
+                "{}: file is too large for this host",
+                display_path.display()
+            ))
+        })?;
+        *contents
+            .get_mut(index)
+            .ok_or_else(|| EngineError::Fs("batch lookup returned too many entries".into()))? =
+            Some(Vec::with_capacity(capacity));
+        let mut offset = 0_u64;
+        while offset < length {
+            let take = chunk.min(length - offset);
+            pending.push(ResolvedFileRangeReadRequest {
+                file,
+                range: ByteRange {
                     offset,
                     length: take,
                 },
-                WorkCounters::UNBOUNDED,
-                &cancel,
-            )
-            .await
-            .map_err(EngineError::fs("read file range"))?
-            .value;
-        out.extend_from_slice(&read.bytes);
-        offset += take;
-    }
-    Ok(out)
-}
-
-/// Content of `path` in `generation` if it is a regular file there.
-pub async fn read_file(
-    store: &Store,
-    generation: GenerationId,
-    path: &Path,
-) -> Result<Option<Vec<u8>>> {
-    let mut checkout = store.checkout_exact(generation).await?;
-    let cancel = CancellationToken::new();
-    let namespace = namespace_of(path)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("lookup"))?
-        .value;
-    match lookup.record {
-        Some(record) if record.kind == FileKind::Regular => {
-            Ok(Some(read_regular(&mut checkout, path).await?))
+            });
+            destinations.push(index);
+            offset += take;
         }
-        _ => Ok(None),
     }
-}
-
-async fn read_mode(checkout: &mut LocalCheckout, path: &Path) -> Result<Option<u32>> {
-    let cancel = CancellationToken::new();
-    let namespace = namespace_of(path)?;
-    let lookup = checkout
-        .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
+    let reads = reader
+        .read_resolved_ranges(
+            &pending,
+            FILE_READ_CONCURRENCY,
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
         .await
-        .map_err(EngineError::fs("lookup"))?
+        .map_err(EngineError::fs("read resolved file ranges"))?
         .value;
-    if lookup.record.is_none() {
-        return Ok(None);
+    for (destination, read) in destinations.into_iter().zip(reads) {
+        contents
+            .get_mut(destination)
+            .ok_or_else(|| EngineError::Fs("resolved read has an invalid destination".into()))?
+            .as_mut()
+            .ok_or_else(|| EngineError::Fs("resolved read lost its destination".into()))?
+            .extend_from_slice(&read.bytes);
     }
-    let metadata = checkout
-        .read_metadata(&namespace, WorkCounters::UNBOUNDED, &cancel)
-        .await
-        .map_err(EngineError::fs("read metadata"))?
-        .value;
-    Ok(match metadata.posix_mode {
-        MetadataField::Value(mode) => Some(mode & 0o7777),
-        MetadataField::Unavailable => None,
-    })
+    Ok(contents)
 }
 
 // ---------------------------------------------------------------------------
@@ -785,57 +724,49 @@ pub async fn apply_entries(
     entries: &[(PathBuf, Entry)],
 ) -> Result<()> {
     let cancel = CancellationToken::new();
-    for (path, entry) in entries {
-        let namespace = namespace_of(path)?;
-        // Boxed per entry: keeps the facade's large futures off the caller's
-        // stack frame.
-        Box::pin(apply_entry(store, dst, &namespace, entry, &cancel)).await?;
-    }
-    Ok(())
-}
-
-async fn apply_entry(
-    store: &Store,
-    dst: &mut LocalCheckout,
-    namespace: &NamespacePath,
-    entry: &Entry,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    {
-        {
-            match entry {
-                Entry::Regular { bytes, mode } => {
-                    remove_subtree(dst, namespace, cancel).await?;
-                    ensure_parents(dst, namespace, cancel).await?;
-                    dst.create_file(
-                        namespace.clone(),
-                        Bytes::copy_from_slice(bytes),
-                        WorkCounters::UNBOUNDED,
-                        cancel,
-                    )
-                    .await
-                    .map_err(EngineError::fs("create file"))?;
-                    if let Some(mode) = mode {
-                        let metadata = FileMetadata {
-                            posix_mode: MetadataField::Value(*mode),
-                            ..FileMetadata::default()
-                        };
-                        dst.set_metadata(
-                            namespace.clone(),
-                            metadata,
-                            WorkCounters::UNBOUNDED,
-                            cancel,
-                        )
-                        .await
-                        .map_err(EngineError::fs("set metadata"))?;
-                    }
+    let namespaces = entries
+        .iter()
+        .map(|(path, _)| namespace_of(path))
+        .collect::<Result<Vec<_>>>()?;
+    ensure_entry_parents(dst, &namespaces, &cancel).await?;
+    let mut source = None;
+    for ((_, entry), namespace) in entries.iter().zip(&namespaces) {
+        match entry {
+            Entry::Regular { bytes, mode } => {
+                source = None;
+                remove_subtree(dst, namespace, &cancel).await?;
+                let metadata = FileMetadata {
+                    posix_mode: mode.map_or(MetadataField::Unavailable, MetadataField::Value),
+                    ..FileMetadata::default()
+                };
+                dst.apply_authored_transaction(
+                    vec![AuthoredMutation::CreateFile {
+                        path: namespace.clone(),
+                        bytes: Bytes::copy_from_slice(bytes),
+                        metadata,
+                    }],
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
+                .await
+                .map_err(EngineError::fs("create merge file"))?;
+            }
+            Entry::FromGeneration { generation } => {
+                let needs_checkout =
+                    source
+                        .as_ref()
+                        .is_none_or(|(current, _): &(GenerationId, LocalCheckout)| {
+                            current != generation
+                        });
+                if needs_checkout {
+                    source = Some((*generation, store.checkout_exact(*generation).await?));
                 }
-                Entry::FromGeneration { generation } => {
-                    let mut src = store.checkout_exact(*generation).await?;
-                    remove_subtree(dst, namespace, cancel).await?;
-                    ensure_parents(dst, namespace, cancel).await?;
-                    copy_node(&mut src, dst, namespace, cancel).await?;
-                }
+                let src = &mut source
+                    .as_mut()
+                    .ok_or_else(|| EngineError::Fs("source checkout missing".into()))?
+                    .1;
+                remove_subtree(dst, namespace, &cancel).await?;
+                copy_node(src, dst, namespace, &cancel).await?;
             }
         }
     }
@@ -843,25 +774,47 @@ async fn apply_entry(
 }
 
 /// Creates missing ancestor directories of `namespace` in `dst`.
-async fn ensure_parents(
+async fn ensure_entry_parents(
     dst: &mut LocalCheckout,
-    namespace: &NamespacePath,
+    namespaces: &[NamespacePath],
     cancel: &CancellationToken,
 ) -> Result<()> {
     let limits = dst.volume_config().limits;
-    let components = namespace.components();
-    for depth in 1..components.len() {
-        let parent = NamespacePath::new(components.iter().take(depth).cloned().collect(), limits)
-            .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?;
-        let lookup = dst
-            .lookup_no_follow(&parent, WorkCounters::UNBOUNDED, cancel)
-            .await
-            .map_err(EngineError::fs("lookup"))?
-            .value;
-        if lookup.record.is_none() {
-            dst.create_directory(parent, WorkCounters::UNBOUNDED, cancel)
-                .await
-                .map_err(EngineError::fs("create directory"))?;
+    let mut parents = BTreeSet::new();
+    for namespace in namespaces {
+        let components = namespace.components();
+        for depth in 1..components.len() {
+            parents.insert(
+                NamespacePath::new(components.iter().take(depth).cloned().collect(), limits)
+                    .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))?,
+            );
+        }
+    }
+    let parents = parents.into_iter().collect::<Vec<_>>();
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let lookups = dst
+        .lookup_batch_no_follow(&parents, WorkCounters::UNBOUNDED, cancel)
+        .await
+        .map_err(EngineError::fs("batch parent lookup"))?
+        .value;
+    for (parent, lookup) in parents.into_iter().zip(lookups.entries) {
+        match lookup.record {
+            Some(record) if record.kind == FileKind::Directory => {}
+            Some(_) => {
+                return Err(EngineError::Fs(format!(
+                    "{}: parent is not a directory",
+                    acyclic_fs::namespace_to_host_path(&parent)
+                        .map_err(EngineError::fs("resolve parent path"))?
+                        .display()
+                )))
+            }
+            None => {
+                dst.create_directory(parent, WorkCounters::UNBOUNDED, cancel)
+                    .await
+                    .map_err(EngineError::fs("create directory"))?;
+            }
         }
     }
     Ok(())
@@ -878,34 +831,82 @@ fn child_path(
         .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
 }
 
-async fn list_children(
-    checkout: &mut LocalCheckout,
-    namespace: &NamespacePath,
+async fn resolved_child_paths<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
+    directory: &NamespacePath,
+    limits: acyclic_fs::model::VolumeLimits,
     cancel: &CancellationToken,
-) -> Result<Vec<acyclic_fs::kernel::LogicalName>> {
-    let mut names = Vec::new();
+) -> Result<Vec<NamespacePath>>
+where
+    A: acyclic_fs::AsyncAuthorityStore,
+    O: acyclic_fs::AsyncObjectStore,
+{
+    let mut children = Vec::new();
     let mut after = None;
     loop {
-        let page = checkout
-            .list_directory_records(
-                namespace,
+        let page = reader
+            .resolve_directory_page(
+                directory,
                 after.as_ref(),
                 PAGE_ENTRIES,
                 WorkCounters::UNBOUNDED,
                 cancel,
             )
             .await
-            .map_err(EngineError::fs("list directory"))?
+            .map_err(EngineError::fs("resolve subtree page"))?
             .value;
         for entry in &page.entries {
-            names.push(entry.name.clone());
+            children.push(child_path(directory, &entry.name, limits)?);
         }
-        match page.entries.last() {
-            Some(last) if page.has_more => after = Some(last.name.clone()),
-            _ => break,
+        if !page.has_more {
+            break;
         }
+        after = Some(
+            page.entries
+                .last()
+                .ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?
+                .name
+                .clone(),
+        );
     }
-    Ok(names)
+    Ok(children)
+}
+
+async fn resolved_children<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
+    directory: &NamespacePath,
+    limits: acyclic_fs::model::VolumeLimits,
+    cancel: &CancellationToken,
+) -> Result<Vec<(NamespacePath, acyclic_fs::ResolvedFile<A, O>)>>
+where
+    A: acyclic_fs::AsyncAuthorityStore,
+    O: acyclic_fs::AsyncObjectStore,
+{
+    let mut children = Vec::new();
+    let mut after = None;
+    loop {
+        let page = reader
+            .resolve_directory_page(
+                directory,
+                after.as_ref(),
+                PAGE_ENTRIES,
+                WorkCounters::UNBOUNDED,
+                cancel,
+            )
+            .await
+            .map_err(EngineError::fs("resolve subtree page"))?
+            .value;
+        let next = page.entries.last().map(|entry| entry.name.clone());
+        for entry in page.entries {
+            children.push((child_path(directory, &entry.name, limits)?, entry.file));
+        }
+        if !page.has_more {
+            break;
+        }
+        after =
+            Some(next.ok_or_else(|| EngineError::Fs("paged directory returned no cursor".into()))?);
+    }
+    Ok(children)
 }
 
 /// Removes `namespace` from `dst`, recursively for directories; absent is
@@ -917,32 +918,52 @@ async fn remove_subtree(
     namespace: &NamespacePath,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let limits = dst.volume_config().limits;
-    // (path, children_expanded)
-    let mut stack: Vec<(NamespacePath, bool)> = vec![(namespace.clone(), false)];
-    while let Some((path, expanded)) = stack.pop() {
-        if expanded {
-            dst.remove(path, None, WorkCounters::UNBOUNDED, cancel)
-                .await
-                .map_err(EngineError::fs("remove"))?;
-            continue;
+    let mut frontier = vec![namespace.clone()];
+    let reader = dst.snapshot_reader();
+    let roots = reader
+        .resolve_files(&frontier, WorkCounters::UNBOUNDED, cancel)
+        .await
+        .map_err(EngineError::fs("resolve subtree root"))?
+        .value;
+    let mut nodes = frontier
+        .drain(..)
+        .zip(roots)
+        .filter_map(|(path, file)| file.map(|file| (path, file)))
+        .collect::<Vec<_>>();
+    let mut levels = Vec::new();
+    while !nodes.is_empty() {
+        let limits = dst.volume_config().limits;
+        let mut next = Vec::new();
+        for directory in nodes
+            .iter()
+            .filter(|(_, file)| file.description().kind == FileKind::Directory)
+            .map(|(path, _)| path)
+        {
+            next.extend(resolved_children(&reader, directory, limits, cancel).await?);
         }
-        let lookup = dst
-            .lookup_no_follow(&path, WorkCounters::UNBOUNDED, cancel)
-            .await
-            .map_err(EngineError::fs("lookup"))?
-            .value;
-        let Some(record) = lookup.record else {
-            continue;
-        };
-        if record.kind == FileKind::Directory {
-            let children = list_children(dst, &path, cancel).await?;
-            stack.push((path.clone(), true));
-            for name in children {
-                stack.push((child_path(&path, &name, limits)?, false));
-            }
-        } else {
-            stack.push((path, true));
+        levels.push(
+            nodes
+                .into_iter()
+                .map(|(path, file)| (path, file.file_id()))
+                .collect::<Vec<_>>(),
+        );
+        nodes = next;
+    }
+    let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    for level in levels.into_iter().rev() {
+        let removals = level
+            .into_iter()
+            .map(|(path, file_id)| AuthoredMutation::Remove {
+                path,
+                expected_file_id: Some(file_id),
+            })
+            .collect::<Vec<_>>();
+        for chunk in removals.chunks(maximum) {
+            dst.apply_authored_transaction(chunk.to_vec(), WorkCounters::UNBOUNDED, cancel)
+                .await
+                .map_err(EngineError::fs("remove subtree frontier"))?;
         }
     }
     Ok(())
@@ -957,110 +978,139 @@ async fn copy_node(
     namespace: &NamespacePath,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let limits = src.volume_config().limits;
-    let mut queue: Vec<NamespacePath> = vec![namespace.clone()];
-    while let Some(path) = queue.pop() {
-        let lookup = src
-            .lookup_no_follow(&path, WorkCounters::UNBOUNDED, cancel)
+    let mut frontier = vec![namespace.clone()];
+    while !frontier.is_empty() {
+        let reader = src
+            .pinned_reader()
+            .map_err(EngineError::fs("open pinned reader"))?;
+        let files = reader
+            .resolve_files(&frontier, WorkCounters::UNBOUNDED, cancel)
             .await
-            .map_err(EngineError::fs("lookup"))?
-            .value;
-        let Some(record) = lookup.record else {
-            continue;
-        };
-        let metadata = src
-            .read_metadata(&path, WorkCounters::UNBOUNDED, cancel)
-            .await
-            .map_err(EngineError::fs("read metadata"))?
-            .value;
-        match record.kind {
-            FileKind::Regular => {
-                let bytes = read_regular_ns(src, &path, &record.payload, cancel).await?;
-                dst.create_file(
-                    path.clone(),
-                    Bytes::from(bytes),
-                    WorkCounters::UNBOUNDED,
-                    cancel,
-                )
-                .await
-                .map_err(EngineError::fs("create file"))?;
-            }
-            FileKind::SymbolicLink => {
-                let target = src
-                    .read_symbolic_link(&path, WorkCounters::UNBOUNDED, cancel)
-                    .await
-                    .map_err(EngineError::fs("read symlink"))?
-                    .value;
-                dst.create_symbolic_link(
-                    path.clone(),
-                    Bytes::copy_from_slice(&target),
-                    WorkCounters::UNBOUNDED,
-                    cancel,
-                )
-                .await
-                .map_err(EngineError::fs("create symlink"))?;
-            }
-            FileKind::Directory => {
-                dst.create_directory(path.clone(), WorkCounters::UNBOUNDED, cancel)
-                    .await
-                    .map_err(EngineError::fs("create directory"))?;
-                for name in list_children(src, &path, cancel).await? {
-                    queue.push(child_path(&path, &name, limits)?);
+            .map_err(EngineError::fs("batch subtree metadata"))?
+            .value
+            .into_iter();
+        let nodes = frontier
+            .into_iter()
+            .zip(files)
+            .filter_map(|(path, file)| file.map(|file| (path, file)))
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            break;
+        }
+        let files = nodes.iter().map(|(_, file)| file).collect::<Vec<_>>();
+        let regular = read_regular_frontier(&reader, &files, cancel).await?;
+        let limits = src.volume_config().limits;
+        frontier = Vec::new();
+        for (directory, _) in nodes
+            .iter()
+            .filter(|(_, file)| file.description().kind == FileKind::Directory)
+        {
+            frontier.extend(resolved_child_paths(&reader, directory, limits, cancel).await?);
+        }
+        let mut mutations = Vec::with_capacity(nodes.len());
+        for (index, (path, file)) in nodes.into_iter().enumerate() {
+            let metadata = file.description().metadata;
+            match file.description().kind {
+                FileKind::Regular => {
+                    let bytes = regular.get(index).ok_or_else(|| {
+                        EngineError::Fs("subtree read omitted a regular file".into())
+                    })?;
+                    mutations.push(AuthoredMutation::CreateFile {
+                        path,
+                        bytes: Bytes::from(bytes.clone()),
+                        metadata,
+                    });
+                }
+                FileKind::SymbolicLink => {
+                    let target = file
+                        .read_symbolic_link(WorkCounters::UNBOUNDED, cancel)
+                        .await
+                        .map_err(EngineError::fs("read resolved symlink"))?
+                        .value;
+                    mutations.push(AuthoredMutation::CreateSymbolicLink {
+                        path,
+                        target,
+                        metadata,
+                    });
+                }
+                FileKind::Directory => {
+                    mutations.push(AuthoredMutation::CreateDirectory { path, metadata });
+                }
+                other => {
+                    return Err(EngineError::Fs(format!(
+                        "cannot copy a {other:?} node (only files, symlinks, and directories)"
+                    )))
                 }
             }
-            other => {
-                return Err(EngineError::Fs(format!(
-                    "cannot copy a {other:?} node (only files, symlinks, and directories)"
-                )))
-            }
         }
-        if let MetadataField::Value(mode) = metadata.posix_mode {
-            let set = FileMetadata {
-                posix_mode: MetadataField::Value(mode),
-                ..FileMetadata::default()
-            };
-            dst.set_metadata(path, set, WorkCounters::UNBOUNDED, cancel)
+        let maximum = usize::try_from(dst.volume_config().limits.maximum_mutations_per_batch)
+            .unwrap_or(usize::MAX)
+            .saturating_div(2)
+            .max(1);
+        for chunk in mutations.chunks(maximum) {
+            dst.apply_authored_transaction(chunk.to_vec(), WorkCounters::UNBOUNDED, cancel)
                 .await
-                .map_err(EngineError::fs("set metadata"))?;
+                .map_err(EngineError::fs("create subtree frontier"))?;
         }
     }
     Ok(())
 }
 
-async fn read_regular_ns(
-    checkout: &mut LocalCheckout,
-    namespace: &NamespacePath,
-    payload: &acyclic_fs::kernel::FilePayload,
+async fn read_regular_frontier<A, O>(
+    reader: &acyclic_fs::PinnedReader<A, O>,
+    files: &[&acyclic_fs::ResolvedFile<A, O>],
     cancel: &CancellationToken,
-) -> Result<Vec<u8>> {
-    let length = match payload {
-        acyclic_fs::kernel::FilePayload::InlineRegular(inline) => inline.as_bytes().len() as u64,
-        acyclic_fs::kernel::FilePayload::Regular { logical_bytes, .. } => *logical_bytes,
-        _ => return Err(EngineError::Fs("regular file with foreign payload".into())),
-    };
-    let limits = checkout.volume_config().limits;
-    let chunk = TRANSFER_BYTES.min(limits.maximum_read_bytes.max(1));
-    let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-    let mut offset = 0;
-    while offset < length {
-        let take = chunk.min(length - offset);
-        let read = checkout
-            .read_file_range(
-                namespace,
-                ByteRange {
-                    offset,
+) -> Result<Vec<Vec<u8>>>
+where
+    A: acyclic_fs::AsyncAuthorityStore,
+    O: acyclic_fs::AsyncObjectStore,
+{
+    let mut contents = vec![Vec::new(); files.len()];
+    let mut offsets = vec![0_u64; files.len()];
+    loop {
+        let mut destinations = Vec::new();
+        let mut pending = Vec::new();
+        for (index, (file, offset)) in files.iter().zip(&mut offsets).enumerate() {
+            let description = file.description();
+            if description.kind != FileKind::Regular {
+                continue;
+            }
+            let length = description.logical_bytes;
+            if *offset >= length {
+                continue;
+            }
+            let take = TRANSFER_BYTES.min(length - *offset);
+            pending.push(ResolvedFileRangeReadRequest {
+                file,
+                range: ByteRange {
+                    offset: *offset,
                     length: take,
                 },
+            });
+            destinations.push(index);
+            *offset += take;
+        }
+        if pending.is_empty() {
+            break;
+        }
+        let chunks = reader
+            .read_resolved_ranges(
+                &pending,
+                FILE_READ_CONCURRENCY,
                 WorkCounters::UNBOUNDED,
                 cancel,
             )
             .await
-            .map_err(EngineError::fs("read file range"))?
+            .map_err(EngineError::fs("batch read resolved subtree ranges"))?
             .value;
-        out.extend_from_slice(&read.bytes);
-        offset += take;
+        for (index, chunk) in destinations.into_iter().zip(chunks) {
+            contents
+                .get_mut(index)
+                .ok_or_else(|| EngineError::Fs("batch read returned an invalid index".into()))?
+                .extend_from_slice(&chunk.bytes);
+        }
     }
-    Ok(out)
+    Ok(contents)
 }
 
 /// Which of `paths` the repo's `.gitignore` rules ignore, per
@@ -1133,35 +1183,16 @@ pub async fn materialize_paths(
     dir: &Path,
     paths: &[PathBuf],
 ) -> Result<()> {
-    let mut checkout = store.checkout_exact(generation).await?;
-    let limits = checkout.volume_config().limits;
-    let cancel = CancellationToken::new();
-    for path in paths {
-        let namespace = namespace_of(path)?;
-        let destination = dir.join(path);
-        crate::rewind::remove_any(&destination)?;
-        let lookup = checkout
-            .lookup_no_follow(&namespace, WorkCounters::UNBOUNDED, &cancel)
-            .await
-            .map_err(EngineError::fs("lookup"))?
-            .value;
-        let Some(record) = lookup.record else {
-            continue;
-        };
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        crate::rewind::write_node(
-            &mut checkout,
-            &namespace,
-            record.kind,
-            &record.payload,
-            &destination,
-            limits,
-            &cancel,
+    let generation = store.generation(generation).await?;
+    generation
+        .restore_host_paths(
+            paths,
+            acyclic_fs::HostPathReplacement::LiveMount,
+            &acyclic_fs::MaterializeOptions::native(dir),
+            &acyclic_fs::CancellationToken::new(),
         )
-        .await?;
-    }
+        .await
+        .map_err(EngineError::fs("materialize paths"))?;
     Ok(())
 }
 
@@ -1171,7 +1202,7 @@ pub fn subtree_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     sorted.sort();
     let mut roots: Vec<PathBuf> = Vec::new();
     for path in sorted {
-        if !roots.iter().any(|root| path.starts_with(root)) {
+        if roots.last().is_none_or(|root| !path.starts_with(root)) {
             roots.push(path);
         }
     }
@@ -1193,7 +1224,7 @@ mod tests {
         let base = "line 1\nline 2\nline 3\n";
         let ours = "OURS line 1\nline 2\nline 3\n";
         let theirs = "line 1\nline 2\nTHEIRS line 3\n";
-        let result = merge3(base, ours, theirs, "child", "parent");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "child", "parent");
         assert!(result.clean);
         assert_eq!(result.content, "OURS line 1\nline 2\nTHEIRS line 3\n");
     }
@@ -1203,7 +1234,8 @@ mod tests {
         let base = "line 1\nline 2\nline 3\n";
         let ours = "OURS line 1\nline 2\nline 3\n";
         let theirs = "THEIRS line 1\nline 2\nline 3\n";
-        let result = merge3(base, ours, theirs, "child-agent", "parent-agent");
+        let result =
+            acyclic_fs::text_merge::merge_text(base, ours, theirs, "child-agent", "parent-agent");
         assert!(!result.clean);
         assert!(result.content.contains("<<<<<<< child-agent\n"));
         assert!(result.content.contains("||||||| original\n"));
@@ -1216,14 +1248,15 @@ mod tests {
         let base = "line 1\nline 2\n";
         let ours = "SAME line 1\nline 2\n";
         let theirs = "SAME line 1\nline 2\n";
-        let result = merge3(base, ours, theirs, "child", "parent");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "child", "parent");
         assert!(result.clean);
         assert_eq!(result.content, "SAME line 1\nline 2\n");
     }
 
     #[test]
     fn conflict_markers_have_proper_newlines() {
-        let result = merge3("content", "ours", "theirs", "child", "parent");
+        let result =
+            acyclic_fs::text_merge::merge_text("content", "ours", "theirs", "child", "parent");
         assert!(!result.clean);
         assert!(result.content.contains("\n|||||||"));
         assert!(result.content.contains("\n=======\n"));
@@ -1232,32 +1265,18 @@ mod tests {
 
     #[test]
     fn empty_base_ours_added_theirs_empty() {
-        let result = merge3("", "added", "", "child", "parent");
+        let result = acyclic_fs::text_merge::merge_text("", "added", "", "child", "parent");
         assert!(result.clean);
         assert_eq!(result.content, "added");
     }
 
     #[test]
     fn empty_base_both_add_different() {
-        let result = merge3("", "ours\n", "theirs\n", "child", "parent");
+        let result =
+            acyclic_fs::text_merge::merge_text("", "ours\n", "theirs\n", "child", "parent");
         assert!(!result.clean);
         assert!(result.content.contains("<<<<<<< child"));
         assert!(result.content.contains(">>>>>>> parent"));
-    }
-
-    // --- trailing newline rule --------------------------------------------
-
-    #[test]
-    fn trailing_newline_rule() {
-        // ours and theirs agree: keep theirs' (== ours') state.
-        assert!(merged_has_trailing_newline("a", "a\n", "b\n"));
-        assert!(!merged_has_trailing_newline("a\n", "a", "b"));
-        // ours == base, theirs decides.
-        assert!(!merged_has_trailing_newline("a\n", "a\n", "b"));
-        assert!(merged_has_trailing_newline("a", "a", "b\n"));
-        // ours differs from base and theirs: ours decides.
-        assert!(!merged_has_trailing_newline("a\n", "x", "b\n"));
-        assert!(merged_has_trailing_newline("a", "x\n", "b"));
     }
 
     #[test]
@@ -1265,7 +1284,7 @@ mod tests {
         let base = "one\ntwo\nthree\n";
         let ours = "one\ntwo\nthree\nfour";
         let theirs = "ONE\ntwo\nthree\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         assert!(result.clean);
         assert_eq!(result.content, "ONE\ntwo\nthree\nfour");
     }
@@ -1275,7 +1294,7 @@ mod tests {
         let base = "a\r\nb\r\nc\r\n";
         let ours = "A\r\nb\r\nc\r\n";
         let theirs = "a\r\nb\r\nC\r\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         assert!(result.clean);
         assert_eq!(result.content, "A\r\nb\r\nC\r\n");
     }
@@ -1285,7 +1304,7 @@ mod tests {
         let base = "1\n2\n3\n4\n";
         let ours = "1x\n2\n3\n4\n";
         let theirs = "1\n2y\n3\n4\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         // Adjacent edits are a conflict for diff3 (git behaves the same);
         // whichever way diffy decides, the result must be consistent with clean.
         if result.clean {
@@ -1300,7 +1319,7 @@ mod tests {
         let base = "a\nb\nc\nd\n";
         let ours = "a\nd\n";
         let theirs = "a\nB\nc\nd\n";
-        let result = merge3(base, ours, theirs, "fork", "mainline");
+        let result = acyclic_fs::text_merge::merge_text(base, ours, theirs, "fork", "mainline");
         assert!(!result.clean);
         assert_eq!(conflict_hunks(&result.content), 1);
     }

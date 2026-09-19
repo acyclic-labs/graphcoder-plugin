@@ -8,14 +8,14 @@
 //! API, so they get `acyclic mcp` (see `crate::mcp`) registered as an MCP
 //! server in whatever config file that host reads — project-scoped and
 //! checked in where the host supports it, the user's global config where
-//! it doesn't. agents-md is the fallback for anything shell-capable: a
-//! cheatsheet block in AGENTS.md and no hooks at all.
+//! it doesn't. The agents-md adapter gives shell-capable hosts a cheatsheet
+//! block in AGENTS.md and no hooks.
 //!
 //! Each `HostAdapter` below documents exactly what its host gets. The
 //! README's per-host table is the user-facing version of the same list,
 //! with how far each adapter has been verified.
 
-use acyclic_engine::product::{self, NAME, NPM_PACKAGE, PYPI_PACKAGE};
+use acyclic::product::{self, NAME, NPM_PACKAGE, PYPI_PACKAGE};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -238,9 +238,6 @@ fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
     let root_map = root
         .as_object_mut()
         .ok_or_else(|| format!("{} is not an object", path.display()))?;
-    if host == "codex" {
-        remove_flat_codex_hooks(root_map);
-    }
     let hooks = root_map.entry("hooks").or_insert(json!({}));
     let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
     merge_event_hooks(hooks, "hooks", host)?;
@@ -248,22 +245,6 @@ fn merge_hooks(path: &Path, host: &str) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&root).map_err(stringify)?;
     write_atomic(path, &(text + "\n"))?;
     Ok(())
-}
-
-/// Earlier releases wrote Codex's events at the top level of `hooks.json`
-/// (`{"PreToolUse": [...]}`), a shape Codex 0.154 silently ignores. Drop
-/// our entries from that layout so a re-install moves them under `hooks`;
-/// anything a user put there is left alone.
-fn remove_flat_codex_hooks(root: &mut serde_json::Map<String, Value>) {
-    for (event, _, _) in hook_events("codex") {
-        let Some(entries) = root.get_mut(event).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        entries.retain(|entry| !is_ours(entry));
-        if entries.is_empty() {
-            root.remove(event);
-        }
-    }
 }
 
 /// Merges our entries into a map keyed by event name (the value under
@@ -326,7 +307,7 @@ fn is_our_command(command: &str) -> bool {
 /// `~/.codex/config.toml` / `.codex/config.toml`. If that also means they
 /// share whatever fires `.codex/hooks.json`'s lifecycle events, this
 /// adapter may already cover the desktop app and IDE extension too, with no
-/// new code — verify that first. The MCP fallback is already known to
+/// new code — verify that first. MCP is already known to
 /// work (docs/manual-testing.md): `[mcp_servers.<name>]` with `command`,
 /// `args` and `default_tools_approval_mode = "approve"` (without it a
 /// non-interactive session rejects every call). It is TOML, so a writer
@@ -349,7 +330,7 @@ fn codex(repo: &Path) -> Result<(), String> {
 /// and `type` directly rather than Claude/Codex's nested `hooks` array),
 /// plus an always-applied project rule so the model has the CLI verbs in
 /// context. Cursor's hook events and payload shape differ from Claude
-/// Code/Codex (see `hook::Payload`'s `conversation_id`/`command` fallbacks
+/// Code/Codex (see `hook::Payload`'s host-specific fields
 /// and `hook::run`'s Cursor-only `{"permission":"allow"}` reply), so this
 /// writes Cursor's own event names rather than reusing `hook_events()`.
 fn cursor(repo: &Path) -> Result<(), String> {
@@ -714,7 +695,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     file.write_all(text.as_bytes()).map_err(stringify)?;
     file.sync_all().map_err(stringify)?;
     drop(file);
-    std::fs::rename(&tmp, path).map_err(stringify)
+    acyclic_fs::durable_rename(&tmp, path, acyclic_fs::RenameMode::Replace).map_err(stringify)
 }
 
 /// Where a host reads its MCP config. This decides both the path and the
@@ -1462,9 +1443,7 @@ effective values in ONE line before the first fork, e.g.
 Depth starts at 1 and increases by one per round.
 
 1. `{{name}} fork -n <fan_out>`. It records the fork base as a checkpoint
-   itself, so do not checkpoint first. Note each id and path and whether
-   it says `(mount)` or `(copy)`. Copy forks cost time proportional to
-   the tree: keep them few and short-lived.
+   itself, so do not checkpoint first. Note each id and mounted path.
 2. Dispatch ALL subagents in one turn, one per fork, using the CHILD
    PROMPT below. Do not keep one approach for yourself.
 3. **Freeze.** Make NO edits to the real tree while forks are live. A
@@ -1551,7 +1530,7 @@ After the final round: `{{name}} diff <first checkpoint> <latest>` and
 summarise the blast radius, ignoring `m` (metadata-only) lines. Mention
 anything a script or generator wrote.
 
-## 6. Failure and fallback
+## 6. Failure handling
 
 - A promote that reports `N file(s) conflict` has written conflict
   markers into THAT FORK (the mainline is untouched) and moved the fork
@@ -1824,44 +1803,6 @@ mod tests {
         assert_eq!(
             agents_md.matches(&format!("## {NAME} checkpoints")).count(),
             1
-        );
-    }
-
-    #[test]
-    fn codex_reinstall_migrates_the_legacy_flat_layout() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let hooks_path = dir.path().join(".codex/hooks.json");
-        std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir");
-        let legacy = json!({
-            "PreToolUse": [
-                { "hooks": [{ "type": "command", "command": "echo user-hook" }] },
-                { "hooks": [{ "type": "command",
-                              "command": format!("ACYCLIC_HOST=codex {NAME} hook pre-tool") }] }
-            ],
-            "SessionEnd": [
-                { "hooks": [{ "type": "command",
-                              "command": format!("ACYCLIC_HOST=codex {NAME} hook session-end") }] }
-            ]
-        });
-        std::fs::write(&hooks_path, legacy.to_string()).expect("seed");
-
-        codex(dir.path()).expect("install");
-        let value: Value =
-            serde_json::from_str(&std::fs::read_to_string(&hooks_path).expect("read"))
-                .expect("json");
-        assert_eq!(
-            value["PreToolUse"].as_array().map(Vec::len),
-            Some(1),
-            "user hook kept"
-        );
-        assert!(
-            value.get("SessionEnd").is_none(),
-            "emptied legacy key removed"
-        );
-        assert_eq!(
-            value["hooks"]["PreToolUse"].as_array().map(Vec::len),
-            Some(1),
-            "ours lives under hooks now"
         );
     }
 
