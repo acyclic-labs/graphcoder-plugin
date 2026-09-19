@@ -2218,8 +2218,9 @@ impl Pipeline {
 #[cfg(test)]
 mod root_hint_tests {
     use super::*;
-    use acyclic_fs::kernel::{LogicalName, NamespacePath};
+    use acyclic_fs::kernel::NamespacePath;
     use acyclic_fs::{WatchEpoch, WatchSequence};
+    use std::path::Path;
 
     fn root() -> NamespacePath {
         NamespacePath::new(Vec::new(), VolumeLimits::default()).unwrap()
@@ -2227,13 +2228,8 @@ mod root_hint_tests {
 
     fn file(name: &str) -> NamespacePath {
         let limits = VolumeLimits::default();
-        let name = LogicalName::new(
-            crate::names::encoding(),
-            crate::names::str_to_bytes(name),
-            limits.maximum_component_bytes,
-        )
-        .unwrap();
-        NamespacePath::new(vec![name], limits).unwrap()
+        acyclic_fs::host_path_to_namespace(Path::new(name), crate::store::host_profile(), limits)
+            .unwrap()
     }
 
     fn batch(changes: Vec<WatchChange>) -> WatchBatch {

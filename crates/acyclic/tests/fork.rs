@@ -19,8 +19,7 @@ use acyclic::fork::PromoteOutcome;
 use acyclic::index::{Attribution, CheckpointKind, Index};
 use acyclic::pipeline::{self, PipelineHandle, State};
 use acyclic::store::{Store, StorePaths};
-use acyclic_fs::kernel::{LogicalName, NamespacePath};
-use acyclic_fs::model::VolumeLimits;
+use acyclic_fs::kernel::NamespacePath;
 use acyclic_fs::{CancellationToken, WorkCounters};
 
 fn fast_config() -> Config {
@@ -85,21 +84,13 @@ impl Rig {
 /// Built in the host's encoding rather than as a portable path: these names
 /// stand in for what the mount layer writes, and a diff decodes them with
 /// the same encoding on the way back out.
-fn namespace(path: &str) -> NamespacePath {
-    let limits = VolumeLimits::default();
-    let names = path
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            LogicalName::new(
-                acyclic::names::encoding(),
-                acyclic::names::str_to_bytes(part),
-                limits.maximum_component_bytes,
-            )
-            .expect("name")
-        })
-        .collect();
-    NamespacePath::new(names, limits).expect("namespace path")
+fn namespace(path: &str, config: acyclic_fs::model::VolumeConfig) -> NamespacePath {
+    acyclic_fs::host_path_to_namespace(
+        Path::new(path.trim_start_matches('/')),
+        config.profile,
+        config.limits,
+    )
+    .expect("namespace path")
 }
 
 /// Writes into a fork's overlay exactly as a mount callback would: through
@@ -107,9 +98,10 @@ fn namespace(path: &str) -> NamespacePath {
 async fn write_in_fork(seed: &acyclic::fork::ForkSeed, path: &str, bytes: &[u8]) {
     let cancel = CancellationToken::new();
     let mut guard = seed.shared.lock().await;
+    let config = guard.volume_config();
     guard
         .create_file(
-            namespace(path),
+            namespace(path, config),
             bytes::Bytes::copy_from_slice(bytes),
             WorkCounters::UNBOUNDED,
             &cancel,

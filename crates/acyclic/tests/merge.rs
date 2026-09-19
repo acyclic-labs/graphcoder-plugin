@@ -22,8 +22,7 @@ use acyclic::merge::{self, ConflictKind, Entry, Reason};
 use acyclic::pipeline::{self, PipelineHandle};
 use acyclic::store::{Store, StorePaths};
 use acyclic::GenerationId;
-use acyclic_fs::kernel::{LogicalName, NamespacePath};
-use acyclic_fs::model::VolumeLimits;
+use acyclic_fs::kernel::NamespacePath;
 use acyclic_fs::{CancellationToken, WorkCounters};
 
 fn fast_config() -> Config {
@@ -117,27 +116,19 @@ impl Rig {
 
 /// Native capture stores names as POSIX bytes; lookups must use the same
 /// encoding or they miss (a portable-encoded name is a different key).
-fn namespace(path: &str) -> NamespacePath {
-    let limits = VolumeLimits::default();
-    let names = path
-        .trim_start_matches('/')
-        .split('/')
-        .map(|component| {
-            LogicalName::new(
-                acyclic::names::encoding(),
-                acyclic::names::str_to_bytes(component),
-                limits.maximum_component_bytes,
-            )
-            .expect("logical name")
-        })
-        .collect();
-    NamespacePath::new(names, limits).expect("namespace path")
+fn namespace(path: &str, config: acyclic_fs::model::VolumeConfig) -> NamespacePath {
+    acyclic_fs::host_path_to_namespace(
+        Path::new(path.trim_start_matches('/')),
+        config.profile,
+        config.limits,
+    )
+    .expect("namespace path")
 }
 
 async fn fork_write(seed: &ForkSeed, path: &str, bytes: &[u8]) {
     let cancel = CancellationToken::new();
     let mut guard = seed.shared.lock().await;
-    let ns = namespace(path);
+    let ns = namespace(path, guard.volume_config());
     let existing = guard
         .lookup_no_follow(&ns, WorkCounters::UNBOUNDED, &cancel)
         .await
@@ -163,8 +154,14 @@ async fn fork_write(seed: &ForkSeed, path: &str, bytes: &[u8]) {
 async fn fork_remove(seed: &ForkSeed, path: &str) {
     let cancel = CancellationToken::new();
     let mut guard = seed.shared.lock().await;
+    let config = guard.volume_config();
     guard
-        .remove(namespace(path), None, WorkCounters::UNBOUNDED, &cancel)
+        .remove(
+            namespace(path, config),
+            None,
+            WorkCounters::UNBOUNDED,
+            &cancel,
+        )
         .await
         .expect("remove in fork overlay");
 }
@@ -460,9 +457,10 @@ fn refusals_name_paths_and_reasons() {
         {
             let cancel = CancellationToken::new();
             let mut guard = seed.shared.lock().await;
+            let config = guard.volume_config();
             guard
                 .remove(
-                    namespace("/src/same.txt"),
+                    namespace("/src/same.txt", config),
                     None,
                     WorkCounters::UNBOUNDED,
                     &cancel,
@@ -471,7 +469,7 @@ fn refusals_name_paths_and_reasons() {
                 .expect("rm");
             guard
                 .create_symbolic_link(
-                    namespace("/src/same.txt"),
+                    namespace("/src/same.txt", config),
                     bytes::Bytes::from_static(b"shared.txt"),
                     WorkCounters::UNBOUNDED,
                     &cancel,
@@ -578,16 +576,25 @@ fn nested_directory_subtree_copies_into_merge_generation() {
         {
             let cancel = CancellationToken::new();
             let mut guard = seed.shared.lock().await;
+            let config = guard.volume_config();
             guard
-                .create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel)
+                .create_directory(namespace("/docs", config), WorkCounters::UNBOUNDED, &cancel)
                 .await
                 .expect("mkdir");
             guard
-                .create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel)
+                .create_directory(
+                    namespace("/docs/deep", config),
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
                 .await
                 .expect("mkdir");
             guard
-                .create_directory(namespace("/docs/deep/er"), WorkCounters::UNBOUNDED, &cancel)
+                .create_directory(
+                    namespace("/docs/deep/er", config),
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
                 .await
                 .expect("mkdir");
         }
@@ -634,12 +641,17 @@ fn materialize_paths_writes_a_generation_into_a_directory() {
         {
             let cancel = CancellationToken::new();
             let mut guard = seed.shared.lock().await;
+            let config = guard.volume_config();
             guard
-                .create_directory(namespace("/docs"), WorkCounters::UNBOUNDED, &cancel)
+                .create_directory(namespace("/docs", config), WorkCounters::UNBOUNDED, &cancel)
                 .await
                 .expect("mkdir");
             guard
-                .create_directory(namespace("/docs/deep"), WorkCounters::UNBOUNDED, &cancel)
+                .create_directory(
+                    namespace("/docs/deep", config),
+                    WorkCounters::UNBOUNDED,
+                    &cancel,
+                )
                 .await
                 .expect("mkdir");
         }

@@ -1047,9 +1047,10 @@ impl Server {
             )
         })?;
         let mut mount = self.fork_mount.lock().await;
+        let route = route_name(id)?;
         mount
             .router
-            .add_route(route_name(id), source)
+            .add_route(route.clone(), source)
             .map_err(|error| format!("route: {error:?}"))?;
         // The ONE session, mounted lazily on the first fork. A route
         // insert is all later forks pay.
@@ -1073,7 +1074,7 @@ impl Server {
             match session {
                 Ok(session) => mount.session = Some(session),
                 Err(error) => {
-                    tokio::task::block_in_place(|| mount.router.remove_route(&route_name(id)));
+                    tokio::task::block_in_place(|| mount.router.remove_route(&route));
                     return Err(error);
                 }
             }
@@ -1438,7 +1439,7 @@ impl Server {
     /// disappears) when the last route goes, freeing the FUSE-T pool slot.
     async fn detach_route(&self, id: &str) -> Result<(), String> {
         let mut mount = self.fork_mount.lock().await;
-        let route = route_name(id);
+        let route = route_name(id)?;
         let last_route = mount.router.route_count() == 1;
         if last_route {
             if let Some(session) = mount.session.as_mut() {
@@ -1876,8 +1877,14 @@ fn err(message: String) -> proto::Payload {
 /// the `ProjFS` provider decodes every entry name it is handed as UTF-16LE,
 /// and hands an id passed as raw ASCII back to the user as mojibake. Ids are
 /// hex, so this is a widening on Windows and a copy everywhere else.
-fn route_name(id: &str) -> Vec<u8> {
-    acyclic::names::str_to_bytes(id)
+fn route_name(id: &str) -> Result<Vec<u8>, String> {
+    let config = acyclic::store::volume_config();
+    acyclic_fs::host_path_to_namespace(Path::new(id), config.profile, config.limits)
+        .map_err(|error| format!("route name: {error}"))?
+        .components()
+        .first()
+        .map(|name| name.as_bytes().to_vec())
+        .ok_or_else(|| "route name is empty".to_owned())
 }
 
 fn short_id() -> String {

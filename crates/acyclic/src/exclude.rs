@@ -18,8 +18,7 @@
 //! release a retained generation, so nothing can be physically removed from
 //! history. That gap is documented in docs/design/implementation-rewind.md.
 
-use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use acyclic_fs::kernel::{FileKind, LogicalName, NamespacePath};
 use acyclic_fs::model::VolumeLimits;
@@ -35,7 +34,7 @@ const PAGE_ENTRIES: u32 = 1_024;
 /// same rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Exclusions {
-    prefixes: Vec<Vec<Vec<u8>>>,
+    prefixes: Vec<NamespacePath>,
 }
 
 impl Exclusions {
@@ -43,28 +42,22 @@ impl Exclusions {
     /// repo; an empty rule or one naming the repo root is refused, since
     /// excluding everything is the same as not running the engine.
     pub fn parse(patterns: &[String]) -> Result<Self> {
-        let mut prefixes: Vec<Vec<Vec<u8>>> = Vec::new();
+        let config = crate::store::volume_config();
+        let mut prefixes = Vec::new();
         for pattern in patterns {
             let trimmed = pattern.trim().trim_end_matches('/');
-            let mut components = Vec::new();
-            for component in Path::new(trimmed).components() {
-                match component {
-                    Component::Normal(name) => components.push(os_to_bytes(name)),
-                    Component::CurDir => {}
-                    _ => {
-                        return Err(EngineError::Config(format!(
-                            "exclude rule {pattern:?} must be a relative path inside the repo"
-                        )))
-                    }
-                }
-            }
-            if components.is_empty() {
-                return Err(EngineError::Config(format!(
-                    "exclude rule {pattern:?} would exclude the whole repo"
-                )));
-            }
-            if !prefixes.contains(&components) {
-                prefixes.push(components);
+            let prefix = acyclic_fs::host_path_to_namespace(
+                Path::new(trimmed),
+                config.profile,
+                config.limits,
+            )
+            .map_err(|_| {
+                EngineError::Config(format!(
+                    "exclude rule {pattern:?} must be a non-empty relative path inside the repo"
+                ))
+            })?;
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
             }
         }
         Ok(Self { prefixes })
@@ -78,51 +71,29 @@ impl Exclusions {
     pub fn host_paths(&self) -> Vec<PathBuf> {
         self.prefixes
             .iter()
-            .map(|prefix| host_path(prefix))
+            .filter_map(|prefix| acyclic_fs::namespace_to_host_path(prefix).ok())
             .collect()
     }
 
     /// True when `relative` is an excluded path or lies under one.
     pub fn covers_host(&self, relative: &Path) -> bool {
-        let mut components = Vec::new();
-        for component in relative.components() {
-            match component {
-                Component::Normal(name) => components.push(os_to_bytes(name)),
-                Component::CurDir => {}
-                _ => return false,
-            }
-        }
-        self.covers_bytes(&components)
+        let config = crate::store::volume_config();
+        acyclic_fs::host_path_to_namespace(relative, config.profile, config.limits)
+            .is_ok_and(|path| self.covers(&path))
     }
 
     /// True when `path` is an excluded path or lies under one.
     pub fn covers(&self, path: &NamespacePath) -> bool {
-        let components: Vec<Vec<u8>> = path
-            .components()
-            .iter()
-            .map(|name| name.as_bytes().to_vec())
-            .collect();
-        self.covers_bytes(&components)
-    }
-
-    fn covers_bytes(&self, components: &[Vec<u8>]) -> bool {
-        self.prefixes
-            .iter()
-            .any(|prefix| components.starts_with(prefix))
+        self.prefixes.iter().any(|prefix| path.is_within(prefix))
     }
 
     /// True when `path` is a strict ancestor of an excluded path (the repo
     /// root included). A capture hinted at such a path may re-walk the
     /// excluded subtree, so the checkout needs a scrub afterwards.
     fn is_ancestor(&self, path: &NamespacePath) -> bool {
-        let components = path.components();
-        self.prefixes.iter().any(|prefix| {
-            components.len() < prefix.len()
-                && components
-                    .iter()
-                    .zip(prefix.iter())
-                    .all(|(name, want)| name.as_bytes() == want.as_slice())
-        })
+        self.prefixes
+            .iter()
+            .any(|prefix| path.depth() < prefix.depth() && prefix.is_within(path))
     }
 
     /// Drops hints the capture must not read and rewrites renames that
@@ -189,14 +160,14 @@ impl Exclusions {
         if self.is_empty() {
             return Ok(0);
         }
-        let limits = checkout.volume_config().limits;
+        let config = checkout.volume_config();
+        let limits = config.limits;
         let cancel = CancellationToken::new();
         let mut removed = 0;
-        for prefix in &self.prefixes {
-            let names = logical_names(prefix, limits)?;
-            let path = namespace(names.clone(), limits)?;
+        for path in &self.prefixes {
+            let names = path.components().to_vec();
             let lookup = checkout
-                .lookup_no_follow(&path, WorkCounters::UNBOUNDED, &cancel)
+                .lookup_no_follow(path, WorkCounters::UNBOUNDED, &cancel)
                 .await
                 .map_err(EngineError::fs("exclusion lookup"))?
                 .value;
@@ -207,7 +178,7 @@ impl Exclusions {
                 remove_subtree(checkout, names, limits, &cancel).await?;
             }
             checkout
-                .remove(path, None, WorkCounters::UNBOUNDED, &cancel)
+                .remove(path.clone(), None, WorkCounters::UNBOUNDED, &cancel)
                 .await
                 .map_err(EngineError::fs("exclusion remove"))?;
             removed += 1;
@@ -264,39 +235,9 @@ fn remove_subtree<'a>(
     })
 }
 
-fn logical_names(components: &[Vec<u8>], limits: VolumeLimits) -> Result<Vec<LogicalName>> {
-    components
-        .iter()
-        .map(|bytes| {
-            LogicalName::new(
-                crate::names::encoding(),
-                bytes.clone(),
-                limits.maximum_component_bytes,
-            )
-            .map_err(|error| EngineError::Config(format!("exclude rule component: {error:?}")))
-        })
-        .collect()
-}
-
 fn namespace(names: Vec<LogicalName>, limits: VolumeLimits) -> Result<NamespacePath> {
     NamespacePath::new(names, limits)
         .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
-}
-
-fn host_path(components: &[Vec<u8>]) -> PathBuf {
-    let mut path = PathBuf::new();
-    for component in components {
-        path.push(bytes_to_os(component));
-    }
-    path
-}
-
-fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
-    crate::names::os_to_bytes(name)
-}
-
-fn bytes_to_os(bytes: &[u8]) -> OsString {
-    crate::names::bytes_to_os(bytes)
 }
 
 #[cfg(test)]
@@ -314,12 +255,13 @@ mod tests {
             .split('/')
             .filter(|part| !part.is_empty())
             .map(|part| {
-                LogicalName::new(
-                    crate::names::encoding(),
-                    crate::names::str_to_bytes(part),
-                    limits.maximum_component_bytes,
+                let namespace = acyclic_fs::host_path_to_namespace(
+                    Path::new(part),
+                    crate::store::host_profile(),
+                    limits,
                 )
-                .expect("name")
+                .expect("name");
+                namespace.components()[0].clone()
             })
             .collect();
         NamespacePath::new(names, limits).expect("path")

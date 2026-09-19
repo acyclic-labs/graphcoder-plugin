@@ -48,7 +48,6 @@ pub mod fork;
 pub mod guard;
 pub mod index;
 pub mod merge;
-pub mod names;
 pub mod pipeline;
 pub mod product;
 pub mod rewind;

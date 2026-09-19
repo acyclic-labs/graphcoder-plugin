@@ -190,19 +190,27 @@ pub struct Store {
 /// The volume every store opens with.
 ///
 /// The profile is per-platform and decides how names are encoded on the way
-/// in and out — see [`crate::names`], which every caller that mints a name
-/// must go through. It is fixed for the life of a volume: a store created
+/// in and out. It is fixed for the life of a volume: a store created
 /// under one profile cannot be reopened under another, so this must never
 /// become a runtime choice.
-pub(crate) fn volume_config() -> VolumeConfig {
+pub fn volume_config() -> VolumeConfig {
     let mut config = VolumeConfig {
-        profile: crate::names::profile(),
+        profile: host_profile(),
         ..VolumeConfig::portable(Lifecycle::Durable)
     };
     config.limits.maximum_mutations_per_batch = MUTATIONS_PER_BATCH;
     config.limits.maximum_paths_per_batch = MUTATIONS_PER_BATCH;
-    config.limits.maximum_component_bytes = crate::names::maximum_component_bytes();
+    config.limits.maximum_component_bytes = if cfg!(windows) { 510 } else { 255 };
     config
+}
+
+pub(crate) const fn host_profile() -> acyclic_fs::model::FilesystemProfile {
+    #[cfg(windows)]
+    return acyclic_fs::model::FilesystemProfile::Windows;
+    #[cfg(unix)]
+    return acyclic_fs::model::FilesystemProfile::Posix;
+    #[cfg(not(any(unix, windows)))]
+    acyclic_fs::model::FilesystemProfile::Portable
 }
 
 pub(crate) fn writable_head() -> CheckoutMode {

@@ -25,7 +25,7 @@ use acyclic_fs::{ByteRange, CancellationToken, GenerationId, WorkCounters};
 use bytes::Bytes;
 
 use crate::diff;
-use crate::rewind::{namespace_path, validate_relative};
+use crate::rewind::validate_relative;
 use crate::store::{LocalCheckout, Store};
 use crate::{EngineError, Result};
 
@@ -523,8 +523,10 @@ fn merged_mode(base: Option<u32>, ours: Option<u32>, theirs: Option<u32>) -> Opt
 }
 
 pub(crate) fn namespace_of(path: &Path) -> Result<NamespacePath> {
-    let components = validate_relative(path)?;
-    namespace_path(&components, acyclic_fs::model::VolumeLimits::default())
+    validate_relative(path)?;
+    let config = crate::store::volume_config();
+    acyclic_fs::host_path_to_namespace(path, config.profile, config.limits)
+        .map_err(EngineError::fs("host path to namespace"))
 }
 
 /// Whole content of a regular file at `path` in `checkout`.

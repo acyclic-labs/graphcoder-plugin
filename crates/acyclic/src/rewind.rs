@@ -6,7 +6,6 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use acyclic_fs::kernel::{LogicalName, NamespacePath};
 use acyclic_fs::{
     exchange_native_entries, materialize_checkout, materialize_checkout_host_path,
     publish_native_exchange, MaterializeError, MaterializeOptions,
@@ -246,26 +245,19 @@ fn create_restore_stage(parent: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn validate_relative(relative: &Path) -> Result<Vec<Vec<u8>>> {
-    let mut components = Vec::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(name) => components.push(os_to_bytes(name)),
-            Component::CurDir => {}
-            _ => {
-                return Err(EngineError::Restore(format!(
-                    "{}: path must be relative to the repo root and stay inside it",
-                    relative.display()
-                )))
-            }
-        }
-    }
-    if components.is_empty() {
-        return Err(EngineError::Restore(format!(
-            "restoring the whole tree is `{} rewind`, not a path restore",
-            crate::product::NAME
-        )));
-    }
-    Ok(components)
+    let config = crate::store::volume_config();
+    let namespace = acyclic_fs::host_path_to_namespace(relative, config.profile, config.limits)
+        .map_err(|_| {
+            EngineError::Restore(format!(
+                "{}: path must be relative to the repo root and stay inside it",
+                relative.display()
+            ))
+        })?;
+    Ok(namespace
+        .components()
+        .iter()
+        .map(|name| name.as_bytes().to_vec())
+        .collect())
 }
 
 /// Create missing ancestors one component at a time, refusing symlinks and
@@ -310,25 +302,6 @@ fn ensure_real_parents(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn namespace_path(
-    components: &[Vec<u8>],
-    limits: acyclic_fs::model::VolumeLimits,
-) -> Result<NamespacePath> {
-    let names = components
-        .iter()
-        .map(|bytes| {
-            LogicalName::new(
-                crate::names::encoding(),
-                bytes.clone(),
-                limits.maximum_component_bytes,
-            )
-            .map_err(|error| EngineError::Restore(format!("bad path component: {error:?}")))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    NamespacePath::new(names, limits)
-        .map_err(|error| EngineError::Fs(format!("namespace path: {error:?}")))
-}
-
 pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
@@ -336,10 +309,6 @@ pub(crate) fn remove_any(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-fn os_to_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
-    crate::names::os_to_bytes(name)
 }
 
 /// Crash-recovery journal. Present on disk only while a swap is in flight.
