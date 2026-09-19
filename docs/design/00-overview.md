@@ -48,7 +48,7 @@ Second load-bearing constraint, from compliance: **purge-through-history and sna
 
 ## Settled since this was written
 
-1. **Fork engine mechanism** — decided the opposite way to the lean recorded here. Mounts shipped; there is no reflink or `clonefile` path in the codebase, and the fallback when no mount provider is available is a **full copy**, not a reflink. Forks are routes inside one kernel mount rather than N mounts. See `implementation-forks.md`.
+1. **Fork engine mechanism** — mounts shipped. Forks require the native provider and are routes inside one kernel mount rather than N mounts. See `implementation-forks.md`.
 2. **Checkpoint alignment in hosts without lifecycle hooks** — resolved by the MCP adapter plus the `auto_checkpoint_idle_ms` timer. MCP is a second adapter shape this doc's thesis line does not yet mention.
 
 ## Open questions (not yet settled)

@@ -154,7 +154,6 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
         );
         phase = std::time::Instant::now();
     };
-    fork::reap_legacy_shadow(repo_root);
     let repo_root =
         rewind::recover_before_repo_open(repo_root).map_err(|error| error.to_string())?;
     lap("rewind recovery before repo open");

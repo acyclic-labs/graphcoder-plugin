@@ -22,7 +22,7 @@ lint job cannot see.
 | `crates/acyclic-engine/src/rewind.rs` | Windows directory exchange; journal write fixed; staging is retry-safe. |
 | `crates/acyclic-engine/src/guard.rs` | Guarded prefixes and `AppleDouble` matching in the host encoding. |
 | `crates/acyclic-engine/src/{diff,exclude}.rs` | Name decoding via `names` instead of per-file UTF-8 fallbacks. |
-| `crates/acyclic-engine/src/fork.rs` | Windows is held to copy forks (see below). |
+| `crates/acyclic/src/fork.rs` | Windows forks require Projected File System. |
 | `crates/acyclic/src/main.rs` | The client steps out of the tree before asking for a whole-tree swap. |
 | `.github/workflows/{ci,release}.yml` | A `windows` CI job; `win32/x64` release matrix entry. |
 | `packaging/npm/*.sh`, `deny.toml` | `win32` platform package; MSVC target in the license set. |

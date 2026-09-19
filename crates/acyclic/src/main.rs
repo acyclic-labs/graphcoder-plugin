@@ -61,9 +61,6 @@ enum Command {
         /// a queued snapshot can include edits made before it runs.
         #[arg(long, conflicts_with = "durable")]
         no_wait: bool,
-        /// Accepted for compatibility: waiting is now the default.
-        #[arg(long, hide = true)]
-        wait: bool,
         /// Also publish to the durable authority (coarse boundary).
         #[arg(long)]
         durable: bool,
@@ -243,7 +240,6 @@ fn main() {
         std::process::exit(run(cli, Path::new(".")));
     }
     let repo_arg = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    acyclic::fork::reap_legacy_shadow(&repo_arg);
     let repo_arg = acyclic::rewind::recover_before_repo_open(&repo_arg).unwrap_or_else(|error| {
         eprintln!("{}: rewind recovery: {error}", product::NAME);
         std::process::exit(1);
@@ -580,7 +576,6 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
         Command::Checkpoint {
             message,
             no_wait,
-            wait: _,
             durable,
             kind,
             session_id,
@@ -878,12 +873,6 @@ fn execute(client: &mut Client, command: Command, repo: &Path) -> Result<(), Str
                 "{} fork(s) ready — work in them freely; `{NAME} promote <id>` keeps a winner",
                 entries.len()
             );
-            if entries.iter().any(|entry| entry.mode == "copy") {
-                println!(
-                    "note: no mount provider on this host, so these are full copies \
-                     (`{NAME} status` explains; promote works the same)"
-                );
-            }
             Ok(())
         }
         Command::Forks => {

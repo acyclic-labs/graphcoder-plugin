@@ -131,10 +131,8 @@ When at least one file is `Conflicted` and nothing is refused:
 
 1. Build **R** = M with the conflicted files replaced by their
    marker-bearing content. R is F rebased onto H.
-2. Write R's differences from F into the fork: for a mount fork, through
-   the fork's `SharedLocalCheckout` (the mount serves it live); for a
-   copy fork, into the copy directory as well. `capture_copy` already
-   handles copy → overlay at promote.
+2. Write R's differences from F through the mounted workspace so the mount
+   and kernel caches observe every change.
 3. Set `fork.base = H`. Record R as `fork <id> rebased onto <H-hex>
    (N conflict(s))`.
 4. Record the open conflict on the fork: `{ base: B, ours: F, theirs: H,
@@ -309,10 +307,9 @@ Acceptance (`merge.sh`, each from a fresh fork set):
 
 ## Risks and open questions
 
-- **Writing into a live mount fork.** R−F goes through the fork's shared
-  checkout while the agent may hold the mount open. Serialize under the
-  checkout lock like `capture_copy` does; document that an editor with
-  the file open sees the markers on next read.
+- **Writing into a live mount fork.** R−F goes through the mounted path while
+  the agent may hold it open. The driver serializes the resulting overlay
+  mutations; an editor with the file open sees markers on its next read.
 - **Fork base mutation.** `ForkSeed.base` is immutable today and the
   daemon's fork table copies it. Both must update atomically with the
   rebase record; a daemon restart already loses forks, so no persistence
@@ -376,13 +373,10 @@ Deliberate divergences:
   drain), recorded as the single landed row. The `before promote …`
   row records the published head without another drain. R is built
   from M with the marker files on top. A rebase writes R − F into the
-  fork: through the shared checkout for a mount fork (route detached
-  during promote, re-attached after), via `restore_path_into` for a copy
-  fork.
-- **Rebased forks land through the copy-fork snapshot/apply path.** A rebased
-  mount fork's checkout still sits on the head it was cut from, so an optimistic
-  commit against the new head would conflict. `ForkState.rebased` routes
-  such forks through the same snapshot/apply path copy forks use.
+  fork through its mounted path so driver and kernel caches remain coherent.
+- **Rebased forks land through snapshot/apply.** A rebased fork's checkout
+  still sits on the head it was cut from, so an optimistic commit against the
+  new head would conflict.
 - **Subtree copy and removal are iterative.** The fs facade's futures
   are large enough that three nested levels overflowed the pipeline
   thread's 2 MiB stack in a debug build. Both walks use an explicit work
@@ -390,8 +384,6 @@ Deliberate divergences:
 - **`rewind --last` is not the undo.** It targets the latest real
   checkpoint, which after a merge is the landed row. The undo is the
   `before promote <id> (merge)` safety row, exactly as for a replay.
-- **`ACYCLIC_FORCE_COPY_FORKS`** makes a mount-capable host use copy
-  forks so `merge.sh` runs both modes on one machine.
 - **Wire.** `PromoteInfo` gained `merged_files`, `conflicts`, and
   `fork_path`; `ForkEntry` gained `conflict_paths` and `conflict`
   (base/ours/theirs). A conflicting promote returns a non-zero exit
@@ -433,8 +425,8 @@ Deliberate divergences:
   `invalidate` returned Ok, and the FUSE transport (Linux, FUSE-T on the
   macOS runner) has no invalidation at all. The daemon now writes the
   rebase into `<mount root>/<id>/…` with plain filesystem operations
-  (`merge::materialize_paths`), the same way copy forks get theirs, so
-  every cache saw the operation. Promote also no longer detaches the
+  (`merge::materialize_paths`), so every cache saw the operation. Promote
+  also no longer detaches the
   route before working; it snapshots under the checkout lock and drops
   the route only after the fork lands, which removed the negative-entry
   window that hid re-attached forks on Linux.

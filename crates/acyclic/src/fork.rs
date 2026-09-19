@@ -150,43 +150,6 @@ pub fn sweep_stale_forks(repo_root: &Path) {
     let _ = std::fs::remove_dir(&root);
 }
 
-/// Recovers a repository still covered by a shadow mount from a legacy
-/// `dry_run` daemon. New versions no longer create these mounts, but upgrade
-/// must remain able to expose the real repository before opening it.
-pub fn reap_legacy_shadow(repo: &Path) {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use std::time::Duration;
-        let target = match (repo.parent(), repo.file_name()) {
-            (Some(parent), Some(name)) => parent
-                .canonicalize()
-                .map_or_else(|_| repo.to_path_buf(), |parent| parent.join(name)),
-            _ => repo.to_path_buf(),
-        };
-        let probe = target.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || drop(sender.send(std::fs::metadata(probe).is_ok())));
-        if !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true)) {
-            #[cfg(target_os = "macos")]
-            drop(
-                std::process::Command::new("umount")
-                    .arg("-f")
-                    .arg(target)
-                    .status(),
-            );
-            #[cfg(target_os = "linux")]
-            drop(
-                std::process::Command::new("fusermount")
-                    .arg("-u")
-                    .arg(target)
-                    .status(),
-            );
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = repo;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
