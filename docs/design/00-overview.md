@@ -1,7 +1,5 @@
 # Overview
 
-> Source of truth for product framing: the [Acyclic plugins docs page](https://acyclic.dev/docs/plugins). This directory is the engineering-facing expansion of that spec.
-
 ## Thesis
 
 **A local product with plugin distribution.** The product is an agent-native state engine that runs on the dev's machine — snapshots, forks, and indexing over the working tree. The plugins are thin adapters that deliver it through Claude Code, Codex, OpenCode, and any agent that can run a shell command. The engine is the moat; the plugins are the channel.
